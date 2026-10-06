@@ -1026,7 +1026,11 @@ print("GENIOSA PART 1/10 LOADED")# =============================================
 
 # ============================================================
 
-def save_message(chat_id, role, text):
+def save_message(chat_id, role, text=None, content=None):
+
+    if content is not None:
+
+        text = content
 
     conn = None
 
