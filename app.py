@@ -6,7 +6,7 @@ import requests
 
 from fastapi import FastAPI
 
-from openai import OpenAI
+from google import genai
 
 logging.basicConfig(level=logging.INFO)
 
@@ -14,17 +14,17 @@ app = FastAPI()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN:
 
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-if not OPENAI_API_KEY:
+if not GEMINI_API_KEY:
 
-    raise RuntimeError("OPENAI_API_KEY is not set")
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -54,37 +54,39 @@ def send_message(chat_id, text):
 
     response.raise_for_status()
 
-def ask_openai(user_text):
+def ask_gemini(user_text):
 
-    response = client.responses.create(
+    response = client.models.generate_content(
 
-        model="gpt-4o-mini",
+        model="gemini-2.5-flash",
 
-        input=[
-
-            {
-
-                "role": "system",
-
-                "content": (
-
-                    "You are Geniosa, a professional private business advisor. "
-
-                    "Give practical, clear and concise business advice. "
-
-                    "You can help with investments, construction, real estate, "
-
-                    "business strategy, financial analysis and negotiations."
-
-                )
-
-            },
+        contents=[
 
             {
 
                 "role": "user",
 
-                "content": user_text
+                "parts": [
+
+                    {
+
+                        "text": (
+
+                            "You are Geniosa, a professional private business advisor. "
+
+                            "Give practical, clear and concise business advice. "
+
+                            "You can help with investments, construction, real estate, "
+
+                            "business strategy, financial analysis and negotiations.\n\n"
+
+                            f"User message:\n{user_text}"
+
+                        )
+
+                    }
+
+                ]
 
             }
 
@@ -92,7 +94,7 @@ def ask_openai(user_text):
 
     )
 
-    return response.output_text
+    return response.text
 
 def telegram_polling():
 
@@ -180,19 +182,25 @@ def telegram_polling():
 
                 try:
 
-                    answer = ask_openai(text)
+                    answer = ask_gemini(text)
 
                     send_message(chat_id, answer)
 
                 except Exception:
 
-                    logging.exception("OpenAI/message processing error")
+                    logging.exception(
+
+                        "Gemini/message processing error"
+
+                    )
 
                     send_message(
 
                         chat_id,
 
-                        "ბოდიში, ტექნიკური პრობლემა მოხდა. გთხოვთ, სცადოთ თავიდან."
+                        "ბოდიში, ტექნიკური პრობლემა მოხდა. "
+
+                        "გთხოვთ, სცადოთ თავიდან."
 
                     )
 
