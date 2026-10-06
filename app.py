@@ -1,8 +1,12 @@
 import os
 
+import time
+
 import logging
 
 import requests
+
+import psycopg2
 
 from fastapi import FastAPI
 
@@ -14,6 +18,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not TELEGRAM_BOT_TOKEN:
 
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -21,6 +27,10 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
 
     raise RuntimeError("GEMINI_API_KEY is not set")
+
+if not DATABASE_URL:
+
+    raise RuntimeError("DATABASE_URL is not set")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -32,11 +42,241 @@ GEMINI_API = (
 
 )
 
-@app.get("/")
+# =========================================================
 
-def home():
+# DATABASE
 
-    return {"status": "Geniosa is running"}
+# =========================================================
+
+def get_db_connection():
+
+    return psycopg2.connect(DATABASE_URL)
+
+def init_database():
+
+    connection = None
+
+    try:
+
+        connection = get_db_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute("""
+
+            CREATE TABLE IF NOT EXISTS messages (
+
+                id SERIAL PRIMARY KEY,
+
+                chat_id BIGINT NOT NULL,
+
+                role VARCHAR(20) NOT NULL,
+
+                message TEXT NOT NULL,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+            )
+
+        """)
+
+        connection.commit()
+
+        cursor.close()
+
+        logging.info("PostgreSQL database initialized successfully.")
+
+    except Exception:
+
+        logging.exception("Database initialization error")
+
+    finally:
+
+        if connection:
+
+            connection.close()
+
+def save_message(chat_id, role, message):
+
+    connection = None
+
+    try:
+
+        connection = get_db_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+
+            """
+
+            INSERT INTO messages (chat_id, role, message)
+
+            VALUES (%s, %s, %s)
+
+            """,
+
+            (chat_id, role, message)
+
+        )
+
+        connection.commit()
+
+        cursor.close()
+
+    except Exception:
+
+        logging.exception("Could not save message to database")
+
+    finally:
+
+        if connection:
+
+            connection.close()
+
+def get_recent_messages(chat_id, limit=20):
+
+    connection = None
+
+    try:
+
+        connection = get_db_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+
+            """
+
+            SELECT role, message
+
+            FROM messages
+
+            WHERE chat_id = %s
+
+            ORDER BY id DESC
+
+            LIMIT %s
+
+            """,
+
+            (chat_id, limit)
+
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        rows.reverse()
+
+        return rows
+
+    except Exception:
+
+        logging.exception("Could not read messages from database")
+
+        return []
+
+    finally:
+
+        if connection:
+
+            connection.close()
+
+def count_messages(chat_id):
+
+    connection = None
+
+    try:
+
+        connection = get_db_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+
+            """
+
+            SELECT COUNT(*)
+
+            FROM messages
+
+            WHERE chat_id = %s
+
+            """,
+
+            (chat_id,)
+
+        )
+
+        count = cursor.fetchone()[0]
+
+        cursor.close()
+
+        return count
+
+    except Exception:
+
+        logging.exception("Could not count messages")
+
+        return 0
+
+    finally:
+
+        if connection:
+
+            connection.close()
+
+def delete_memory(chat_id):
+
+    connection = None
+
+    try:
+
+        connection = get_db_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+
+            """
+
+            DELETE FROM messages
+
+            WHERE chat_id = %s
+
+            """,
+
+            (chat_id,)
+
+        )
+
+        deleted = cursor.rowcount
+
+        connection.commit()
+
+        cursor.close()
+
+        return deleted
+
+    except Exception:
+
+        logging.exception("Could not delete memory")
+
+        return 0
+
+    finally:
+
+        if connection:
+
+            connection.close()
+
+# =========================================================
+
+# TELEGRAM
+
+# =========================================================
 
 def send_message(chat_id, text):
 
@@ -58,15 +298,37 @@ def send_message(chat_id, text):
 
     response.raise_for_status()
 
-def ask_gemini(user_text):
+# =========================================================
 
-    headers = {
+# GEMINI
 
-        "Content-Type": "application/json",
+# =========================================================
 
-        "x-goog-api-key": GEMINI_API_KEY
+def ask_gemini(user_text, chat_id):
 
-    }
+    recent_messages = get_recent_messages(chat_id, limit=20)
+
+    conversation_parts = []
+
+    for role, message in recent_messages:
+
+        if role == "user":
+
+            conversation_parts.append(
+
+                f"User: {message}"
+
+            )
+
+        elif role == "assistant":
+
+            conversation_parts.append(
+
+                f"Geniosa: {message}"
+
+            )
+
+    conversation_context = "\n".join(conversation_parts)
 
     system_instruction = """
 
@@ -128,11 +390,39 @@ IMPORTANT RULES:
 
 - If the user writes in English, answer in English.
 
-The user is building a professional business assistant called Geniosa.
+You are not simply a chatbot.
 
-Geniosa should behave as a long-term business advisor rather than a simple chatbot.
+You are a long-term business advisor.
+
+Use the conversation history provided to maintain continuity.
+
+Important:
+
+The conversation history may contain assumptions or old information.
+
+Do not blindly treat old assumptions as current facts if the user changes them.
 
 """
+
+    full_prompt = f"""
+
+Previous conversation:
+
+{conversation_context}
+
+Current user message:
+
+{user_text}
+
+"""
+
+    headers = {
+
+        "Content-Type": "application/json",
+
+        "x-goog-api-key": GEMINI_API_KEY
+
+    }
 
     data = {
 
@@ -160,7 +450,7 @@ Geniosa should behave as a long-term business advisor rather than a simple chatb
 
                     {
 
-                        "text": user_text
+                        "text": full_prompt
 
                     }
 
@@ -204,24 +494,55 @@ Geniosa should behave as a long-term business advisor rather than a simple chatb
 
     if not candidates:
 
-        raise RuntimeError("Gemini returned no candidates")
+        raise RuntimeError(
 
-    parts = candidates[0].get("content", {}).get("parts", [])
+            "Gemini returned no candidates"
+
+        )
+
+    parts = candidates[0].get(
+
+        "content",
+
+        {}
+
+    ).get(
+
+        "parts",
+
+        []
+
+    )
 
     if not parts:
 
-        raise RuntimeError("Gemini returned no text")
+        raise RuntimeError(
+
+            "Gemini returned no text"
+
+        )
 
     return parts[0].get(
 
         "text",
 
         "ბოდიში, პასუხი ვერ მივიღე."
+
     )
+
+# =========================================================
+
+# TELEGRAM POLLING
+
+# =========================================================
 
 def telegram_polling():
 
-    logging.info("Starting Telegram polling...")
+    logging.info(
+
+        "Starting Telegram polling..."
+
+    )
 
     me = requests.get(
 
@@ -269,23 +590,59 @@ def telegram_polling():
 
             )
 
+            # Telegram 409 means another polling connection
+
+            # temporarily exists.
+
+            if response.status_code == 409:
+
+                logging.warning(
+
+                    "Telegram polling conflict (409). "
+
+                    "Waiting 10 seconds..."
+
+                )
+
+                time.sleep(10)
+
+                continue
+
             response.raise_for_status()
 
             data = response.json()
 
-            for update in data.get("result", []):
+            for update in data.get(
+
+                "result",
+
+                []
+
+            ):
 
                 offset = update["update_id"] + 1
 
-                message = update.get("message")
+                message = update.get(
+
+                    "message"
+
+                )
 
                 if not message:
 
                     continue
 
-                chat = message.get("chat")
+                chat = message.get(
 
-                text = message.get("text")
+                    "chat"
+
+                )
+
+                text = message.get(
+
+                    "text"
+
+                )
 
                 if not chat or not text:
 
@@ -303,11 +660,101 @@ def telegram_polling():
 
                 )
 
+                # -------------------------
+
+                # MEMORY COMMAND
+
+                # -------------------------
+
+                if text.strip().lower() == "/memory":
+
+                    count = count_messages(
+
+                        chat_id
+
+                    )
+
+                    send_message(
+
+                        chat_id,
+
+                        f"🧠 Geniosa-ს მეხსიერებაში "
+
+                        f"შენახულია {count} შეტყობინება."
+
+                    )
+
+                    continue
+
+                # -------------------------
+
+                # FORGET COMMAND
+
+                # -------------------------
+
+                if text.strip().lower() == "/forget":
+
+                    deleted = delete_memory(
+
+                        chat_id
+
+                    )
+
+                    send_message(
+
+                        chat_id,
+
+                        f"🗑 მეხსიერება გასუფთავებულია.\n"
+
+                        f"წაიშალა {deleted} შეტყობინება."
+
+                    )
+
+                    continue
+
+                # -------------------------
+
+                # SAVE USER MESSAGE
+
+                # -------------------------
+
+                save_message(
+
+                    chat_id,
+
+                    "user",
+
+                    text
+
+                )
+
                 try:
 
-                    answer = ask_gemini(text)
+                    answer = ask_gemini(
 
-                    send_message(chat_id, answer)
+                        text,
+
+                        chat_id
+
+                    )
+
+                    save_message(
+
+                        chat_id,
+
+                        "assistant",
+
+                        answer
+
+                    )
+
+                    send_message(
+
+                        chat_id,
+
+                        answer
+
+                    )
 
                 except Exception:
 
@@ -329,11 +776,41 @@ def telegram_polling():
 
         except Exception:
 
-            logging.exception("Telegram polling error")
+            logging.exception(
+
+                "Telegram polling error"
+
+            )
+
+            time.sleep(5)
+
+# =========================================================
+
+# FASTAPI
+
+# =========================================================
+
+@app.get("/")
+
+def home():
+
+    return {
+
+        "status": "Geniosa is running",
+
+        "memory": "PostgreSQL enabled"
+
+    }
 
 @app.on_event("startup")
 
 def startup_event():
+
+    # Create database table
+
+    init_database()
+
+    # Start Telegram polling
 
     import threading
 
