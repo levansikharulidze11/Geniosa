@@ -28,7 +28,7 @@ GEMINI_API = (
 
     "https://generativelanguage.googleapis.com/v1beta/"
 
-    "models/gemini-2.5-flash:generateContent"
+    "models/gemini-3.5-flash-lite:generateContent"
 
 )
 
@@ -82,11 +82,17 @@ def ask_gemini(user_text):
 
                         "Give practical, clear and concise business advice. "
 
-                        "You can help with investments, construction, real estate, "
+                        "You specialize in investments, construction, real estate, "
 
                         "business strategy, financial analysis and negotiations. "
 
-                        "Answer in the same language as the user."
+                        "Answer in the same language as the user. "
+
+                        "If the user writes in Georgian, answer in Georgian. "
+
+                        "If the user writes in Russian, answer in Russian. "
+
+                        "If the user writes in English, answer in English."
 
                     )
 
@@ -130,11 +136,35 @@ def ask_gemini(user_text):
 
     )
 
+    if not response.ok:
+
+        logging.error(
+
+            "Gemini API error %s: %s",
+
+            response.status_code,
+
+            response.text
+
+        )
+
     response.raise_for_status()
 
     result = response.json()
 
-    return result["candidates"][0]["content"]["parts"][0]["text"]
+    candidates = result.get("candidates", [])
+
+    if not candidates:
+
+        raise RuntimeError("Gemini returned no candidates")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+
+    if not parts:
+
+        raise RuntimeError("Gemini returned no text")
+
+    return parts[0].get("text", "ბოდიში, პასუხი ვერ მივიღე.")
 
 def telegram_polling():
 
