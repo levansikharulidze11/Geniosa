@@ -217,6 +217,7 @@ Geniosa should behave as a long-term business advisor rather than a simple chatb
         "text",
 
         "ბოდიში, პასუხი ვერ მივიღე."
+    )
 
 def telegram_polling():
 
