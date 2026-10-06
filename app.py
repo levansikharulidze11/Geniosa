@@ -105,7 +105,9 @@ GEMINI_URL = (
     f"v1beta/models/{GEMINI_MODEL}:generateContent"
 
 )
+def telegram_url(method):
 
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 # ============================================================
 
 # APPLICATION
