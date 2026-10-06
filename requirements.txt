@@ -4,4 +4,4 @@ uvicorn[standard]
 
 requests
 
-openai
+psycopg2-binary
