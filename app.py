@@ -109,7 +109,33 @@ def telegram_url(method):
 
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 # ============================================================
+def send_message(chat_id, text):
 
+    try:
+
+        response = requests.post(
+
+            telegram_url("sendMessage"),
+
+            json={
+
+                "chat_id": chat_id,
+
+                "text": text
+
+            },
+
+            timeout=30
+
+        )
+
+        return response.json()
+
+    except Exception:
+
+        logging.exception("send_message error")
+
+        return None
 # APPLICATION
 
 # ============================================================
