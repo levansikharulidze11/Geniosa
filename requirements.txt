@@ -5,3 +5,11 @@ uvicorn[standard]
 requests
 
 psycopg2-binary
+
+openpyxl
+
+python-pptx
+
+pypdf
+
+python-docx
