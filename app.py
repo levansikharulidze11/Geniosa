@@ -6,8 +6,6 @@ import requests
 
 from fastapi import FastAPI
 
-from google import genai
-
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
@@ -24,9 +22,15 @@ if not GEMINI_API_KEY:
 
     raise RuntimeError("GEMINI_API_KEY is not set")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+GEMINI_API = (
+
+    "https://generativelanguage.googleapis.com/v1beta/"
+
+    "models/gemini-2.5-flash:generateContent"
+
+)
 
 @app.get("/")
 
@@ -56,11 +60,43 @@ def send_message(chat_id, text):
 
 def ask_gemini(user_text):
 
-    response = client.models.generate_content(
+    headers = {
 
-        model="gemini-2.5-flash",
+        "Content-Type": "application/json",
 
-        contents=[
+        "x-goog-api-key": GEMINI_API_KEY
+
+    }
+
+    data = {
+
+        "system_instruction": {
+
+            "parts": [
+
+                {
+
+                    "text": (
+
+                        "You are Geniosa, a professional private business advisor. "
+
+                        "Give practical, clear and concise business advice. "
+
+                        "You can help with investments, construction, real estate, "
+
+                        "business strategy, financial analysis and negotiations. "
+
+                        "Answer in the same language as the user."
+
+                    )
+
+                }
+
+            ]
+
+        },
+
+        "contents": [
 
             {
 
@@ -70,19 +106,7 @@ def ask_gemini(user_text):
 
                     {
 
-                        "text": (
-
-                            "You are Geniosa, a professional private business advisor. "
-
-                            "Give practical, clear and concise business advice. "
-
-                            "You can help with investments, construction, real estate, "
-
-                            "business strategy, financial analysis and negotiations.\n\n"
-
-                            f"User message:\n{user_text}"
-
-                        )
+                        "text": user_text
 
                     }
 
@@ -92,9 +116,25 @@ def ask_gemini(user_text):
 
         ]
 
+    }
+
+    response = requests.post(
+
+        GEMINI_API,
+
+        headers=headers,
+
+        json=data,
+
+        timeout=60
+
     )
 
-    return response.text
+    response.raise_for_status()
+
+    result = response.json()
+
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 def telegram_polling():
 
