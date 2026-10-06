@@ -6,15 +6,15 @@ import json
 
 import time
 
+import base64
+
 import logging
 
 import threading
 
-import base64
-
-import mimetypes
-
 from pathlib import Path
+
+from contextlib import asynccontextmanager
 
 from datetime import datetime
 
@@ -26,11 +26,9 @@ from psycopg2.extras import RealDictCursor
 
 from fastapi import FastAPI
 
-from openpyxl import Workbook, load_workbook
+from openpyxl import load_workbook, Workbook
 
 from pptx import Presentation
-
-from pptx.util import Inches, Pt
 
 from pypdf import PdfReader
 
@@ -40,7 +38,7 @@ from docx import Document
 
 # GENIOSA 4.0
 
-# Universal Business & Investment Intelligence Platform
+# UNIVERSAL BUSINESS & INVESTMENT INTELLIGENCE PLATFORM
 
 # ============================================================
 
@@ -56,27 +54,33 @@ logger = logging.getLogger("geniosa")
 
 # ============================================================
 
-# ENVIRONMENT
+# ENVIRONMENT VARIABLES
 
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv(
 
-    "TELEGRAM_BOT_TOKEN"
+    "TELEGRAM_BOT_TOKEN",
 
-)
+    ""
+
+).strip()
 
 GEMINI_API_KEY = os.getenv(
 
-    "GEMINI_API_KEY"
+    "GEMINI_API_KEY",
 
-)
+    ""
+
+).strip()
 
 DATABASE_URL = os.getenv(
 
-    "DATABASE_URL"
+    "DATABASE_URL",
 
-)
+    ""
+
+).strip()
 
 OWNER_ID = os.getenv(
 
@@ -154,7 +158,7 @@ def telegram_url(method):
 
 def gemini_url(model=None):
 
-    model = (
+    selected_model = (
 
         model or GEMINI_MODEL
 
@@ -164,7 +168,7 @@ def gemini_url(model=None):
 
         "https://generativelanguage.googleapis.com/"
 
-        f"v1beta/models/{model}:generateContent"
+        f"v1beta/models/{selected_model}:generateContent"
 
     )
 
@@ -216,11 +220,17 @@ GENERATION_DIR.mkdir(
 
 )
 
+# ============================================================
+
+# TELEGRAM MESSAGE LIMIT
+
+# ============================================================
+
 MAX_TELEGRAM_MESSAGE = 3900
 
 # ============================================================
 
-# GLOBAL STATE
+# GLOBAL TELEGRAM POLLING STATE
 
 # ============================================================
 
@@ -228,7 +238,23 @@ POLLING_THREAD = None
 
 POLLING_STOP = threading.Event()
 
+POLLING_THREAD_LOCK = threading.Lock()
+
 TELEGRAM_OFFSET = None
+
+# PostgreSQL advisory-lock connection.
+
+#
+
+# This is important on Render:
+
+# if two application processes/instances accidentally
+
+# start, only one of them will be allowed to poll Telegram.
+
+POLLING_LOCK_CONN = None
+
+POLLING_LOCK_ACQUIRED = False
 
 # ============================================================
 
@@ -244,7 +270,9 @@ def user_allowed(chat_id):
 
     only that Telegram user can use Geniosa.
 
-    If empty, the bot remains open.
+    If GENIOSA_OWNER_ID is empty,
+
+    the bot remains open.
 
     """
 
@@ -252,7 +280,7 @@ def user_allowed(chat_id):
 
         return True
 
-    return str(chat_id) == OWNER_ID
+    return str(chat_id) == str(OWNER_ID)
 
 # ============================================================
 
@@ -266,7 +294,7 @@ def db():
 
     Creates a PostgreSQL connection.
 
-    Render PostgreSQL DATABASE_URL is used.
+    DATABASE_URL is supplied by Render PostgreSQL.
 
     """
 
@@ -290,7 +318,11 @@ def init_db():
 
     """
 
-    Creates all Geniosa tables if they do not exist.
+    Creates Geniosa tables.
+
+    Also performs lightweight schema migration for
+
+    older Geniosa database versions.
 
     """
 
@@ -306,7 +338,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Messages
+        # MESSAGES
 
         # ----------------------------------------------------
 
@@ -334,7 +366,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Business memory
+        # BUSINESS MEMORY
 
         # ----------------------------------------------------
 
@@ -366,7 +398,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Projects
+        # PROJECTS
 
         # ----------------------------------------------------
 
@@ -396,19 +428,33 @@ def init_db():
 
                 total_area DOUBLE PRECISION,
 
-                revenue DOUBLE PRECISION,
+                land_cost DOUBLE PRECISION,
 
-                total_cost DOUBLE PRECISION,
+                construction_cost DOUBLE PRECISION,
 
                 operating_cost DOUBLE PRECISION,
 
+                financing_cost DOUBLE PRECISION,
+
+                other_cost DOUBLE PRECISION,
+
+                total_cost DOUBLE PRECISION,
+
+                revenue DOUBLE PRECISION,
+
+                expected_revenue DOUBLE PRECISION,
+
                 net_profit DOUBLE PRECISION,
+
+                expected_profit DOUBLE PRECISION,
 
                 investor_capital DOUBLE PRECISION,
 
                 investor_profit DOUBLE PRECISION,
 
                 investor_share DOUBLE PRECISION,
+
+                notes TEXT,
 
                 status TEXT DEFAULT 'active',
 
@@ -424,7 +470,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Documents
+        # DOCUMENTS
 
         # ----------------------------------------------------
 
@@ -460,7 +506,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Investors
+        # INVESTORS
 
         # ----------------------------------------------------
 
@@ -502,7 +548,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Deals / CRM
+        # DEALS / CRM
 
         # ----------------------------------------------------
 
@@ -544,7 +590,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Research
+        # RESEARCH
 
         # ----------------------------------------------------
 
@@ -574,7 +620,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Financial analyses
+        # FINANCIAL ANALYSES
 
         # ----------------------------------------------------
 
@@ -606,7 +652,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Generated assets
+        # GENERATED ASSETS
 
         # ----------------------------------------------------
 
@@ -638,7 +684,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Securities
+        # SECURITIES
 
         # ----------------------------------------------------
 
@@ -680,7 +726,7 @@ def init_db():
 
         # ----------------------------------------------------
 
-        # Crypto assets
+        # CRYPTO ASSETS
 
         # ----------------------------------------------------
 
@@ -716,6 +762,204 @@ def init_db():
 
         )
 
+        # ====================================================
+
+        # LIGHTWEIGHT MIGRATION
+
+        # ====================================================
+
+        #
+
+        # Older versions of Geniosa used different project
+
+        # field names. We add the newer fields if they do not
+
+        # already exist.
+
+        #
+
+        # This prevents an existing Render database from
+
+        # breaking when the new app.py is deployed.
+
+        # ====================================================
+
+        project_columns = {
+
+            "land_cost": "DOUBLE PRECISION",
+
+            "construction_cost": "DOUBLE PRECISION",
+
+            "operating_cost": "DOUBLE PRECISION",
+
+            "financing_cost": "DOUBLE PRECISION",
+
+            "other_cost": "DOUBLE PRECISION",
+
+            "expected_revenue": "DOUBLE PRECISION",
+
+            "expected_profit": "DOUBLE PRECISION",
+
+            "notes": "TEXT"
+
+        }
+
+        for column, data_type in project_columns.items():
+
+            cur.execute(
+
+                f"""
+
+                ALTER TABLE projects
+
+                ADD COLUMN IF NOT EXISTS
+
+                {column} {data_type}
+
+                """
+
+            )
+
+        # ----------------------------------------------------
+
+        # DOCUMENT MIGRATION
+
+        # ----------------------------------------------------
+
+        document_columns = {
+
+            "analysis": "TEXT",
+
+            "updated_at": (
+
+                "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+
+            )
+
+        }
+
+        for column, data_type in document_columns.items():
+
+            cur.execute(
+
+                f"""
+
+                ALTER TABLE documents
+
+                ADD COLUMN IF NOT EXISTS
+
+                {column} {data_type}
+
+                """
+
+            )
+
+        # ----------------------------------------------------
+
+        # INVESTOR MIGRATION
+
+        # ----------------------------------------------------
+
+        investor_columns = {
+
+            "contact": "TEXT",
+
+            "investment_capacity": (
+
+                "DOUBLE PRECISION"
+
+            ),
+
+            "preferred_sector": "TEXT",
+
+            "status": "TEXT DEFAULT 'new'",
+
+            "notes": "TEXT",
+
+            "updated_at": (
+
+                "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+
+            )
+
+        }
+
+        for column, data_type in investor_columns.items():
+
+            cur.execute(
+
+                f"""
+
+                ALTER TABLE investors
+
+                ADD COLUMN IF NOT EXISTS
+
+                {column} {data_type}
+
+                """
+
+            )
+
+        # ----------------------------------------------------
+
+        # DEAL MIGRATION
+
+        # ----------------------------------------------------
+
+        deal_columns = {
+
+            "proposed_amount": (
+
+                "DOUBLE PRECISION"
+
+            ),
+
+            "proposed_share": (
+
+                "DOUBLE PRECISION"
+
+            ),
+
+            "valuation": (
+
+                "DOUBLE PRECISION"
+
+            ),
+
+            "notes": "TEXT",
+
+            "next_step": "TEXT",
+
+            "updated_at": (
+
+                "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+
+            )
+
+        }
+
+        for column, data_type in deal_columns.items():
+
+            cur.execute(
+
+                f"""
+
+                ALTER TABLE deals
+
+                ADD COLUMN IF NOT EXISTS
+
+                {column} {data_type}
+
+                """
+
+            )
+
+        # ----------------------------------------------------
+
+        # COMMIT
+
+        # ----------------------------------------------------
+
         conn.commit()
 
         logger.info(
@@ -750,7 +994,65 @@ def init_db():
 
 # ============================================================
 
-# TELEGRAM SEND MESSAGE
+# DATABASE TEST
+
+# ============================================================
+
+def database_is_available():
+
+    """
+
+    Returns True if PostgreSQL is reachable.
+
+    """
+
+    conn = None
+
+    cur = None
+
+    try:
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        cur.execute(
+
+            "SELECT 1 AS ok"
+
+        )
+
+        row = cur.fetchone()
+
+        return bool(
+
+            row and row.get("ok") == 1
+
+        )
+
+    except Exception:
+
+        logger.exception(
+
+            "Database availability check failed"
+
+        )
+
+        return False
+
+    finally:
+
+        if cur:
+
+            cur.close()
+
+        if conn:
+
+            conn.close()
+
+# ============================================================
+
+# TELEGRAM MESSAGE SENDER
 
 # ============================================================
 
@@ -758,7 +1060,7 @@ def send_message(chat_id, text):
 
     """
 
-    Sends a Telegram message.
+    Sends a normal Telegram message.
 
     """
 
@@ -784,11 +1086,19 @@ def send_message(chat_id, text):
 
         )
 
+        try:
+
+            data = response.json()
+
+        except Exception:
+
+            data = None
+
         if response.status_code != 200:
 
             logger.error(
 
-                "Telegram sendMessage error %s: %s",
+                "Telegram sendMessage HTTP %s: %s",
 
                 response.status_code,
 
@@ -796,7 +1106,33 @@ def send_message(chat_id, text):
 
             )
 
-        return response.json()
+            return data
+
+        if isinstance(data, dict):
+
+            if not data.get("ok", False):
+
+                logger.error(
+
+                    "Telegram sendMessage API error: %s",
+
+                    str(data)[:1000]
+
+                )
+
+        return data
+
+    except requests.RequestException as exc:
+
+        logger.error(
+
+            "Telegram sendMessage network error: %s",
+
+            exc
+
+        )
+
+        return None
 
     except Exception:
 
@@ -810,7 +1146,7 @@ def send_message(chat_id, text):
 
 # ============================================================
 
-# LONG TELEGRAM MESSAGE
+# LONG MESSAGE SENDER
 
 # ============================================================
 
@@ -820,7 +1156,7 @@ def send_long_message(chat_id, text):
 
     Telegram has a message length limit.
 
-    This function automatically splits long answers.
+    This function automatically splits long responses.
 
     """
 
@@ -856,8 +1192,6 @@ def send_long_message(chat_id, text):
 
         chunk = text[start:end]
 
-        # Try not to cut a word or line.
-
         if end < len(text):
 
             split_at = max(
@@ -886,7 +1220,7 @@ def send_long_message(chat_id, text):
 
 # ============================================================
 
-# BASIC STATUS ENDPOINT
+# BASIC ROOT ENDPOINT
 
 # ============================================================
 
@@ -904,15 +1238,33 @@ def root():
 
     }
 
+# ============================================================
+
+# BASIC STATUS ENDPOINT
+
+# ============================================================
+
 @app.get("/status")
 
 def status():
+
+    database_ok = database_is_available()
 
     return {
 
         "service": "Geniosa",
 
         "version": "4.0",
+
+        "status": (
+
+            "online"
+
+            if database_ok
+
+            else "degraded"
+
+        ),
 
         "telegram": bool(
 
@@ -926,19 +1278,13 @@ def status():
 
         ),
 
-        "database": bool(
-
-            DATABASE_URL
-
-        ),
-
-        "status": "online"
+        "database": database_ok
 
     }
 
 # ============================================================
 
-# HEALTH CHECK
+# HEALTH ENDPOINT
 
 # ============================================================
 
@@ -946,39 +1292,7 @@ def status():
 
 def health():
 
-    database_ok = False
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
-
-            "SELECT 1 AS ok"
-
-        )
-
-        result = cur.fetchone()
-
-        database_ok = bool(
-
-            result and result.get("ok") == 1
-
-        )
-
-        cur.close()
-
-        conn.close()
-
-    except Exception:
-
-        logger.exception(
-
-            "Health database check failed"
-
-        )
+    database_ok = database_is_available()
 
     return {
 
@@ -1012,37 +1326,47 @@ def health():
 
     }
 
-print("GENIOSA PART 1/10 LOADED")# ============================================================
+# ============================================================
 
-# GENIOSA 4.0 — PART 2/10
+# PART 1 COMPLETE
 
-# MESSAGE HISTORY / BUSINESS MEMORY / PROJECTS
+# ============================================================
+
+print(
+
+    "GENIOSA 4.0 — PART 1/10 LOADED"# ============================================================
+
+# PART 2/10
+
+# MEMORY + PROJECTS + BASIC DATABASE OPERATIONS
 
 # ============================================================
 
 # ============================================================
 
-# MESSAGE FUNCTIONS
+# GENERIC DATABASE EXECUTOR
 
 # ============================================================
 
-def save_message(
+def db_execute(
 
-    chat_id,
+    query,
 
-    role,
+    params=None,
 
-    text=None,
+    fetchone=False,
 
-    content=None,
+    fetchall=False,
 
-    message_type=None
+    commit=False
 
 ):
 
-    if content is not None:
+    """
 
-        text = content
+    Safe helper for PostgreSQL queries.
+
+    """
 
     conn = None
 
@@ -1056,35 +1380,27 @@ def save_message(
 
         cur.execute(
 
-            """
+            query,
 
-            INSERT INTO messages (
-
-                chat_id,
-
-                role,
-
-                text
-
-            )
-
-            VALUES (%s, %s, %s)
-
-            """,
-
-            (
-
-                chat_id,
-
-                role,
-
-                text
-
-            )
+            params or ()
 
         )
 
-        conn.commit()
+        result = None
+
+        if fetchone:
+
+            result = cur.fetchone()
+
+        elif fetchall:
+
+            result = cur.fetchall()
+
+        if commit:
+
+            conn.commit()
+
+        return result
 
     except Exception:
 
@@ -1094,9 +1410,11 @@ def save_message(
 
         logger.exception(
 
-            "save_message error"
+            "Database query failed"
 
         )
+
+        raise
 
     finally:
 
@@ -1108,19 +1426,109 @@ def save_message(
 
             conn.close()
 
-def get_messages(chat_id, limit=20):
+# ============================================================
 
-    conn = None
+# SAVE MESSAGE
 
-    cur = None
+# ============================================================
+
+def save_message(
+
+    chat_id,
+
+    role,
+
+    text
+
+):
+
+    """
+
+    Saves a Telegram conversation message.
+
+    """
+
+    if not text:
+
+        return
 
     try:
 
-        conn = db()
+        db_execute(
 
-        cur = conn.cursor()
+            """
 
-        cur.execute(
+            INSERT INTO messages
+
+            (
+
+                chat_id,
+
+                role,
+
+                text
+
+            )
+
+            VALUES
+
+            (
+
+                %s,
+
+                %s,
+
+                %s
+
+            )
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                str(role),
+
+                str(text)
+
+            ),
+
+            commit=True
+
+        )
+
+    except Exception:
+
+        logger.exception(
+
+            "save_message failed"
+
+        )
+
+# ============================================================
+
+# GET RECENT MESSAGES
+
+# ============================================================
+
+def get_recent_messages(
+
+    chat_id,
+
+    limit=20
+
+):
+
+    """
+
+    Returns recent conversation history.
+
+    """
+
+    try:
+
+        rows = db_execute(
 
             """
 
@@ -1144,15 +1552,19 @@ def get_messages(chat_id, limit=20):
 
             (
 
-                chat_id,
+                int(chat_id),
 
                 int(limit)
 
-            )
+            ),
+
+            fetchall=True
 
         )
 
-        rows = cur.fetchall()
+        if not rows:
+
+            return []
 
         return list(
 
@@ -1164,25 +1576,93 @@ def get_messages(chat_id, limit=20):
 
         logger.exception(
 
-            "get_messages error"
+            "get_recent_messages failed"
 
         )
 
         return []
 
-    finally:
+# ============================================================
 
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# FORMAT CONVERSATION HISTORY
 
 # ============================================================
 
-# BUSINESS MEMORY
+def format_conversation_history(
+
+    chat_id,
+
+    limit=20
+
+):
+
+    """
+
+    Converts recent messages into AI-readable context.
+
+    """
+
+    rows = get_recent_messages(
+
+        chat_id,
+
+        limit
+
+    )
+
+    if not rows:
+
+        return ""
+
+    lines = []
+
+    for row in rows:
+
+        role = str(
+
+            row.get("role", "")
+
+        ).strip()
+
+        message = str(
+
+            row.get("text", "")
+
+        ).strip()
+
+        if not message:
+
+            continue
+
+        if role == "user":
+
+            prefix = "USER"
+
+        elif role in (
+
+            "assistant",
+
+            "model"
+
+        ):
+
+            prefix = "GENIOSA"
+
+        else:
+
+            prefix = role.upper()
+
+        lines.append(
+
+            f"{prefix}: {message}"
+
+        )
+
+    return "\n".join(lines)
+
+# ============================================================
+
+# SAVE BUSINESS MEMORY
 
 # ============================================================
 
@@ -1198,21 +1678,45 @@ def save_memory(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Stores a persistent business memory.
+
+    Examples:
+
+    - company information
+
+    - investor preferences
+
+    - project decisions
+
+    - financial assumptions
+
+    """
+
+    if not memory:
+
+        return False
+
+    memory = str(
+
+        memory
+
+    ).strip()
+
+    if not memory:
+
+        return False
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        db_execute(
 
             """
 
-            INSERT INTO business_memory (
+            INSERT INTO business_memory
+
+            (
 
                 chat_id,
 
@@ -1224,73 +1728,89 @@ def save_memory(
 
             )
 
-            VALUES (%s, %s, %s, %s)
+            VALUES
 
-            RETURNING *
+            (
+
+                %s,
+
+                %s,
+
+                %s,
+
+                %s
+
+            )
 
             """,
 
             (
 
-                chat_id,
+                int(chat_id),
+
+                memory,
+
+                str(category),
+
+                int(importance)
+
+            ),
+
+            commit=True
+
+        )
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+
+            "save_memory failed"
+
+        )
+
+        return False
+
+# ============================================================
+
+# GET BUSINESS MEMORIES
+
+# ============================================================
+
+def get_memories(
+
+    chat_id,
+
+    limit=30
+
+):
+
+    """
+
+    Returns important persistent memories.
+
+    """
+
+    try:
+
+        rows = db_execute(
+
+            """
+
+            SELECT
+
+                id,
 
                 memory,
 
                 category,
 
-                int(importance)
+                importance,
 
-            )
+                created_at,
 
-        )
-
-        result = cur.fetchone()
-
-        conn.commit()
-
-        return result
-
-    except Exception:
-
-        if conn:
-
-            conn.rollback()
-
-        logger.exception(
-
-            "save_memory error"
-
-        )
-
-        return None
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def get_memories(chat_id, limit=20):
-
-    conn = None
-
-    cur = None
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
-
-            """
-
-            SELECT *
+                updated_at
 
             FROM business_memory
 
@@ -1310,183 +1830,173 @@ def get_memories(chat_id, limit=20):
 
             (
 
-                chat_id,
+                int(chat_id),
 
                 int(limit)
 
-            )
+            ),
+
+            fetchall=True
 
         )
 
-        return cur.fetchall()
+        return list(
+
+            rows or []
+
+        )
 
     except Exception:
 
         logger.exception(
 
-            "get_memories error"
+            "get_memories failed"
 
         )
 
         return []
 
-    finally:
+# ============================================================
 
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def update_memory(
-
-    chat_id,
-
-    memory_id,
-
-    memory=None,
-
-    category=None,
-
-    importance=None
-
-):
-
-    conn = None
-
-    cur = None
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        fields = []
-
-        values = []
-
-        if memory is not None:
-
-            fields.append(
-
-                "memory = %s"
-
-            )
-
-            values.append(
-
-                memory
-
-            )
-
-        if category is not None:
-
-            fields.append(
-
-                "category = %s"
-
-            )
-
-            values.append(
-
-                category
-
-            )
-
-        if importance is not None:
-
-            fields.append(
-
-                "importance = %s"
-
-            )
-
-            values.append(
-
-                int(importance)
-
-            )
-
-        if not fields:
-
-            return None
-
-        fields.append(
-
-            "updated_at = CURRENT_TIMESTAMP"
-
-        )
-
-        values.extend(
-
-            [
-
-                chat_id,
-
-                memory_id
-
-            ]
-
-        )
-
-        query = f"""
-
-            UPDATE business_memory
-
-            SET {", ".join(fields)}
-
-            WHERE chat_id = %s
-
-            AND id = %s
-
-            RETURNING *
-
-        """
-
-        cur.execute(
-
-            query,
-
-            values
-
-        )
-
-        result = cur.fetchone()
-
-        conn.commit()
-
-        return result
-
-    except Exception:
-
-        if conn:
-
-            conn.rollback()
-
-        logger.exception(
-
-            "update_memory error"
-
-        )
-
-        return None
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# BUILD MEMORY CONTEXT
 
 # ============================================================
 
-# PROJECT FUNCTIONS
+def build_memory_context(
+
+    chat_id,
+
+    limit=30
+
+):
+
+    """
+
+    Converts persistent business memories into
+
+    context for Gemini.
+
+    """
+
+    memories = get_memories(
+
+        chat_id,
+
+        limit
+
+    )
+
+    if not memories:
+
+        return ""
+
+    lines = []
+
+    for item in memories:
+
+        memory = str(
+
+            item.get("memory", "")
+
+        ).strip()
+
+        if not memory:
+
+            continue
+
+        category = str(
+
+            item.get(
+
+                "category",
+
+                "general"
+
+            )
+
+        ).strip()
+
+        lines.append(
+
+            f"- [{category}] {memory}"
+
+        )
+
+    if not lines:
+
+        return ""
+
+    return (
+
+        "PERSISTENT BUSINESS MEMORY:\n"
+
+        + "\n".join(lines)
+
+    )
+
+# ============================================================
+
+# DELETE MEMORY
+
+# ============================================================
+
+def delete_memory(
+
+    chat_id,
+
+    memory_id
+
+):
+
+    """
+
+    Deletes one memory belonging to the user.
+
+    """
+
+    try:
+
+        db_execute(
+
+            """
+
+            DELETE FROM business_memory
+
+            WHERE
+
+                id = %s
+
+                AND chat_id = %s
+
+            """,
+
+            (
+
+                int(memory_id),
+
+                int(chat_id)
+
+            ),
+
+            commit=True
+
+        )
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+
+            "delete_memory failed"
+
+        )
+
+        return False
+
+# ============================================================
+
+# CREATE PROJECT
 
 # ============================================================
 
@@ -1510,13 +2020,25 @@ def create_project(
 
     total_area=None,
 
-    revenue=None,
+    land_cost=None,
 
-    total_cost=None,
+    construction_cost=None,
 
     operating_cost=None,
 
+    financing_cost=None,
+
+    other_cost=None,
+
+    total_cost=None,
+
+    revenue=None,
+
+    expected_revenue=None,
+
     net_profit=None,
+
+    expected_profit=None,
 
     investor_capital=None,
 
@@ -1524,77 +2046,25 @@ def create_project(
 
     investor_share=None,
 
+    notes=None,
+
     status="active"
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Creates a project record.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        row = db_execute(
 
             """
 
-            INSERT INTO projects (
-
-                chat_id,
-
-                name,
-
-                industry,
-
-                location,
-
-                description,
-
-                land_area,
-
-                saleable_area,
-
-                construction_area,
-
-                total_area,
-
-                revenue,
-
-                total_cost,
-
-                operating_cost,
-
-                net_profit,
-
-                investor_capital,
-
-                investor_profit,
-
-                investor_share,
-
-                status
-
-            )
-
-            VALUES (
-
-                %s, %s, %s, %s, %s,
-
-                %s, %s, %s, %s, %s,
-
-                %s, %s, %s, %s, %s,
-
-                %s, %s
-
-            )
-
-            RETURNING *
-
-            """,
+            INSERT INTO projects
 
             (
 
@@ -1616,13 +2086,25 @@ def create_project(
 
                 total_area,
 
-                revenue,
+                land_cost,
 
-                total_cost,
+                construction_cost,
 
                 operating_cost,
 
+                financing_cost,
+
+                other_cost,
+
+                total_cost,
+
+                revenue,
+
+                expected_revenue,
+
                 net_profit,
+
+                expected_profit,
 
                 investor_capital,
 
@@ -1630,153 +2112,133 @@ def create_project(
 
                 investor_share,
 
+                notes,
+
                 status
 
             )
 
+            VALUES
+
+            (
+
+                %s, %s, %s, %s, %s,
+
+                %s, %s, %s, %s,
+
+                %s, %s, %s, %s, %s, %s,
+
+                %s, %s,
+
+                %s, %s,
+
+                %s, %s, %s,
+
+                %s, %s
+
+            )
+
+            RETURNING id
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                str(name),
+
+                str(industry or "other"),
+
+                location,
+
+                description,
+
+                land_area,
+
+                saleable_area,
+
+                construction_area,
+
+                total_area,
+
+                land_cost,
+
+                construction_cost,
+
+                operating_cost,
+
+                financing_cost,
+
+                other_cost,
+
+                total_cost,
+
+                revenue,
+
+                expected_revenue,
+
+                net_profit,
+
+                expected_profit,
+
+                investor_capital,
+
+                investor_profit,
+
+                investor_share,
+
+                notes,
+
+                status
+
+            ),
+
+            fetchone=True,
+
+            commit=True
+
         )
 
-        project = cur.fetchone()
+        if row:
 
-        conn.commit()
+            return row.get("id")
 
-        return project
+        return None
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "create_project error"
+            "create_project failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# GET PROJECTS
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def get_projects(
 
     chat_id,
 
-    include_deleted=False
+    limit=50
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Returns projects belonging to the user.
 
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        if include_deleted:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM projects
-
-                WHERE chat_id = %s
-
-                ORDER BY
-
-                    updated_at DESC,
-
-                    id DESC
-
-                """,
-
-                (chat_id,)
-
-            )
-
-        else:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM projects
-
-                WHERE chat_id = %s
-
-                AND COALESCE(status, 'active')
-
-                    <> 'deleted'
-
-                ORDER BY
-
-                    updated_at DESC,
-
-                    id DESC
-
-                """,
-
-                (chat_id,)
-
-            )
-
-        return cur.fetchall()
-
-    except Exception:
-
-        logger.exception(
-
-            "get_projects error"
-
-        )
-
-        return []
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def get_project(
-
-    chat_id,
-
-    project_id
-
-):
-
-    conn = None
-
-    cur = None
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        rows = db_execute(
 
             """
 
@@ -1786,41 +2248,113 @@ def get_project(
 
             WHERE chat_id = %s
 
-            AND id = %s
+            ORDER BY
+
+                updated_at DESC,
+
+                id DESC
+
+            LIMIT %s
 
             """,
 
             (
 
-                chat_id,
+                int(chat_id),
 
-                project_id
+                int(limit)
 
-            )
+            ),
+
+            fetchall=True
 
         )
 
-        return cur.fetchone()
+        return list(
+
+            rows or []
+
+        )
 
     except Exception:
 
         logger.exception(
 
-            "get_project error"
+            "get_projects failed"
+
+        )
+
+        return []
+
+# ============================================================
+
+# GET SINGLE PROJECT
+
+# ============================================================
+
+def get_project(
+
+    chat_id,
+
+    project_id
+
+):
+
+    """
+
+    Returns one project belonging to the user.
+
+    """
+
+    try:
+
+        row = db_execute(
+
+            """
+
+            SELECT *
+
+            FROM projects
+
+            WHERE
+
+                id = %s
+
+                AND chat_id = %s
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(project_id),
+
+                int(chat_id)
+
+            ),
+
+            fetchone=True
+
+        )
+
+        return row
+
+    except Exception:
+
+        logger.exception(
+
+            "get_project failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# UPDATE PROJECT
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def update_project(
 
@@ -1828,9 +2362,15 @@ def update_project(
 
     project_id,
 
-    **updates
+    **fields
 
 ):
+
+    """
+
+    Updates allowed project fields only.
+
+    """
 
     allowed_fields = {
 
@@ -1850,13 +2390,25 @@ def update_project(
 
         "total_area",
 
-        "revenue",
+        "land_cost",
 
-        "total_cost",
+        "construction_cost",
 
         "operating_cost",
 
+        "financing_cost",
+
+        "other_cost",
+
+        "total_cost",
+
+        "revenue",
+
+        "expected_revenue",
+
         "net_profit",
+
+        "expected_profit",
 
         "investor_capital",
 
@@ -1864,21 +2416,23 @@ def update_project(
 
         "investor_share",
 
+        "notes",
+
         "status"
 
     }
 
-    fields = []
+    updates = []
 
     values = []
 
-    for key, value in updates.items():
+    for key, value in fields.items():
 
         if key not in allowed_fields:
 
             continue
 
-        fields.append(
+        updates.append(
 
             f"{key} = %s"
 
@@ -1890,89 +2444,71 @@ def update_project(
 
         )
 
-    if not fields:
+    if not updates:
 
-        return None
+        return False
 
-    fields.append(
+    updates.append(
 
         "updated_at = CURRENT_TIMESTAMP"
 
     )
 
-    conn = None
+    values.extend(
 
-    cur = None
+        [
+
+            int(project_id),
+
+            int(chat_id)
+
+        ]
+
+    )
 
     try:
 
-        conn = db()
+        db_execute(
 
-        cur = conn.cursor()
-
-        values.extend(
-
-            [
-
-                chat_id,
-
-                project_id
-
-            ]
-
-        )
-
-        query = f"""
+            f"""
 
             UPDATE projects
 
-            SET {", ".join(fields)}
+            SET
 
-            WHERE chat_id = %s
+                {", ".join(updates)}
 
-            AND id = %s
+            WHERE
 
-            RETURNING *
+                id = %s
 
-        """
+                AND chat_id = %s
 
-        cur.execute(
+            """,
 
-            query,
+            tuple(values),
 
-            values
+            commit=True
 
         )
 
-        project = cur.fetchone()
-
-        conn.commit()
-
-        return project
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "update_project error"
+            "update_project failed"
 
         )
 
-        return None
+        return False
 
-    finally:
+# ============================================================
 
-        if cur:
+# DELETE PROJECT
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def delete_project(
 
@@ -1982,139 +2518,393 @@ def delete_project(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Deletes a project belonging to the user.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        db_execute(
 
             """
 
-            UPDATE projects
+            DELETE FROM projects
 
-            SET
+            WHERE
 
-                status = 'deleted',
+                id = %s
 
-                updated_at = CURRENT_TIMESTAMP
-
-            WHERE chat_id = %s
-
-            AND id = %s
+                AND chat_id = %s
 
             """,
 
             (
 
-                chat_id,
+                int(project_id),
 
-                project_id
+                int(chat_id)
 
-            )
+            ),
+
+            commit=True
 
         )
 
-        deleted = cur.rowcount
-
-        conn.commit()
-
-        return deleted
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "delete_project error"
+            "delete_project failed"
 
         )
 
-        return 0
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
+        return False
 
 # ============================================================
 
-# INDUSTRY HELPERS
+# PROJECT SUMMARY
 
 # ============================================================
 
-INDUSTRY_NAMES = {
+def project_summary(
 
-    "construction": "Construction",
+    project
 
-    "real_estate": "Real Estate",
+):
 
-    "development": "Development",
+    """
 
-    "hospitality": "Hospitality",
+    Human-readable project summary.
 
-    "hotel": "Hotel",
+    """
 
-    "tourism": "Tourism",
+    if not project:
 
-    "retail": "Retail",
+        return "პროექტი ვერ მოიძებნა."
 
-    "restaurant": "Restaurant",
+    lines = []
 
-    "finance": "Finance",
+    name = project.get(
 
-    "technology": "Technology",
+        "name"
 
-    "energy": "Energy",
+    )
 
-    "infrastructure": "Infrastructure",
+    industry = project.get(
 
-    "manufacturing": "Manufacturing",
+        "industry"
 
-    "other": "Other"
+    )
 
-}
+    location = project.get(
 
-def industry_name(value):
+        "location"
 
-    if not value:
+    )
 
-        return "Other"
+    description = project.get(
 
-    key = str(
+        "description"
 
-        value
+    )
 
-    ).strip().lower()
+    if name:
 
-    return INDUSTRY_NAMES.get(
+        lines.append(
 
-        key,
+            f"🏗️ პროექტი: {name}"
 
-        str(value)
+        )
+
+    if industry:
+
+        lines.append(
+
+            f"📂 სფერო: {industry}"
+
+        )
+
+    if location:
+
+        lines.append(
+
+            f"📍 მდებარეობა: {location}"
+
+        )
+
+    if description:
+
+        lines.append(
+
+            f"📝 აღწერა: {description}"
+
+        )
+
+    area_fields = [
+
+        (
+
+            "land_area",
+
+            "🌍 მიწა",
+
+            "მ²"
+
+        ),
+
+        (
+
+            "saleable_area",
+
+            "🏢 გასაყიდი ფართობი",
+
+            "მ²"
+
+        ),
+
+        (
+
+            "construction_area",
+
+            "🔨 სამშენებლო ფართობი",
+
+            "მ²"
+
+        ),
+
+        (
+
+            "total_area",
+
+            "📐 სრული ფართობი",
+
+            "მ²"
+
+        )
+
+    ]
+
+    for field, label, unit in area_fields:
+
+        value = project.get(
+
+            field
+
+        )
+
+        if value is not None:
+
+            lines.append(
+
+                f"{label}: {value:,.2f} {unit}"
+
+            )
+
+    money_fields = [
+
+        (
+
+            "land_cost",
+
+            "🌍 მიწის ღირებულება"
+
+        ),
+
+        (
+
+            "construction_cost",
+
+            "🔨 მშენებლობის ღირებულება"
+
+        ),
+
+        (
+
+            "operating_cost",
+
+            "⚙️ საოპერაციო ხარჯი"
+
+        ),
+
+        (
+
+            "financing_cost",
+
+            "🏦 ფინანსირების ხარჯი"
+
+        ),
+
+        (
+
+            "other_cost",
+
+            "📦 სხვა ხარჯი"
+
+        ),
+
+        (
+
+            "total_cost",
+
+            "💰 სრული ხარჯი"
+
+        ),
+
+        (
+
+            "revenue",
+
+            "💵 შემოსავალი"
+
+        ),
+
+        (
+
+            "expected_revenue",
+
+            "📈 მოსალოდნელი შემოსავალი"
+
+        ),
+
+        (
+
+            "net_profit",
+
+            "🟢 წმინდა მოგება"
+
+        ),
+
+        (
+
+            "expected_profit",
+
+            "📊 მოსალოდნელი მოგება"
+
+        )
+
+    ]
+
+    for field, label in money_fields:
+
+        value = project.get(
+
+            field
+
+        )
+
+        if value is not None:
+
+            lines.append(
+
+                f"{label}: ${value:,.2f}"
+
+            )
+
+    investor_fields = [
+
+        (
+
+            "investor_capital",
+
+            "💼 ინვესტორის კაპიტალი",
+
+            "$"
+
+        ),
+
+        (
+
+            "investor_profit",
+
+            "💼 ინვესტორის მოგება",
+
+            "$"
+
+        ),
+
+        (
+
+            "investor_share",
+
+            "📊 ინვესტორის წილი",
+
+            "%"
+
+        )
+
+    ]
+
+    for field, label, unit in investor_fields:
+
+        value = project.get(
+
+            field
+
+        )
+
+        if value is not None:
+
+            lines.append(
+
+                f"{label}: {value:,.2f} {unit}"
+
+            )
+
+    status = project.get(
+
+        "status"
+
+    )
+
+    if status:
+
+        lines.append(
+
+            f"🔄 სტატუსი: {status}"
+
+        )
+
+    notes = project.get(
+
+        "notes"
+
+    )
+
+    if notes:
+
+        lines.append(
+
+            f"📌 შენიშვნა: {notes}"
+
+        )
+
+    return "\n".join(
+
+        lines
 
     )
 
 # ============================================================
 
-# PROJECT CONTEXT
+# PROJECTS SUMMARY
 
 # ============================================================
 
-def get_primary_project(chat_id):
+def projects_summary(
+
+    chat_id
+
+):
+
+    """
+
+    Returns all projects as a readable list.
+
+    """
 
     projects = get_projects(
 
@@ -2123,68 +2913,280 @@ def get_primary_project(chat_id):
     )
 
     if not projects:
+
+        return (
+
+            "🏗️ პროექტები ჯერ არ არის "
+
+            "დამატებული."
+
+        )
+
+    lines = [
+
+        "🏗️ GENIOSA — PROJECTS",
+
+        ""
+
+    ]
+
+    for project in projects:
+
+        project_id = project.get(
+
+            "id"
+
+        )
+
+        name = project.get(
+
+            "name",
+
+            "Unnamed"
+
+        )
+
+        location = project.get(
+
+            "location"
+
+        )
+
+        status = project.get(
+
+            "status"
+
+        )
+
+        profit = project.get(
+
+            "expected_profit"
+
+        )
+
+        line = (
+
+            f"#{project_id} — {name}"
+
+        )
+
+        if location:
+
+            line += (
+
+                f" | 📍 {location}"
+
+            )
+
+        if status:
+
+            line += (
+
+                f" | 🔄 {status}"
+
+            )
+
+        if profit is not None:
+
+            line += (
+
+                f" | 🟢 ${profit:,.0f}"
+
+            )
+
+        lines.append(
+
+            line
+
+        )
+
+    return "\n".join(
+
+        lines
+
+    )
+
+# ============================================================
+
+# FIND PROJECT BY NAME
+
+# ============================================================
+
+def find_project_by_name(
+
+    chat_id,
+
+    name
+
+):
+
+    """
+
+    Finds a project by exact or partial name.
+
+    """
+
+    if not name:
 
         return None
 
-    return projects[0]
+    try:
 
-def build_project_context(chat_id):
+        row = db_execute(
 
-    projects = get_projects(
+            """
 
-        chat_id,
+            SELECT *
 
-        include_deleted=False
+            FROM projects
+
+            WHERE
+
+                chat_id = %s
+
+                AND LOWER(name)
+
+                    LIKE LOWER(%s)
+
+            ORDER BY id DESC
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                f"%{str(name).strip()}%"
+
+            ),
+
+            fetchone=True
+
+        )
+
+        return row
+
+    except Exception:
+
+        logger.exception(
+
+            "find_project_by_name failed"
+
+        )
+
+        return None
+
+# ============================================================
+
+# INDUSTRY NAME
+
+# ============================================================
+
+def industry_name(
+
+    industry
+
+):
+
+    """
+
+    Converts internal industry codes
+
+    into human-readable names.
+
+    """
+
+    if not industry:
+
+        return "Другое"
+
+    mapping = {
+
+        "construction": "Строительство",
+
+        "development": "Девелопмент",
+
+        "real_estate": "Недвижимость",
+
+        "hotel": "Гостиничный бизнес",
+
+        "tourism": "Туризм",
+
+        "restaurant": "Ресторанный бизнес",
+
+        "casino": "Казино / Gaming",
+
+        "finance": "Финансы",
+
+        "technology": "Технологии",
+
+        "retail": "Ритейл",
+
+        "energy": "Энергетика",
+
+        "infrastructure": "Инфраструктура",
+
+        "other": "Другое"
+
+    }
+
+    return mapping.get(
+
+        str(industry).lower(),
+
+        str(industry)
 
     )
 
-    if not projects:
+# ============================================================
 
-        return "შენახული პროექტები არ არის."
+# FORMAT PROJECT FOR AI
+
+# ============================================================
+
+def project_to_ai_context(
+
+    project
+
+):
+
+    """
+
+    Converts project data into compact AI context.
+
+    """
+
+    if not project:
+
+        return ""
 
     lines = []
 
-    for project in projects[:10]:
+    for key, value in project.items():
+
+        if key in (
+
+            "id",
+
+            "chat_id",
+
+            "created_at",
+
+            "updated_at"
+
+        ):
+
+            continue
+
+        if value is None:
+
+            continue
 
         lines.append(
 
-            f"""
-
-პროექტი #{project.get('id')}
-
-სახელი: {project.get('name') or '-'}
-
-ინდუსტრია: {industry_name(project.get('industry'))}
-
-მდებარეობა: {project.get('location') or '-'}
-
-აღწერა: {project.get('description') or '-'}
-
-მიწის ფართობი: {project.get('land_area') or '-'} მ²
-
-გასაყიდი ფართობი: {project.get('saleable_area') or '-'} მ²
-
-სამშენებლო ფართობი: {project.get('construction_area') or '-'} მ²
-
-სრული ფართობი: {project.get('total_area') or '-'} მ²
-
-შემოსავალი: {project.get('revenue') or '-'}
-
-სრული ხარჯი: {project.get('total_cost') or '-'}
-
-ოპერაციული ხარჯი: {project.get('operating_cost') or '-'}
-
-წმინდა მოგება: {project.get('net_profit') or '-'}
-
-ინვესტორის კაპიტალი: {project.get('investor_capital') or '-'}
-
-ინვესტორის მოგება: {project.get('investor_profit') or '-'}
-
-ინვესტორის წილი: {project.get('investor_share') or '-'}%
-
-სტატუსი: {project.get('status') or '-'}
-
-"""
+            f"{key}: {value}"
 
         )
 
@@ -2196,55 +3198,29 @@ def build_project_context(chat_id):
 
 # ============================================================
 
-# BUSINESS MEMORY CONTEXT
+# BUILD BUSINESS CONTEXT
 
 # ============================================================
 
-def build_memory_context(chat_id):
+def build_business_context(
 
-    memories = get_memories(
+    chat_id
 
-        chat_id,
+):
 
-        limit=20
+    """
 
-    )
+    Combines persistent memory, projects,
 
-    if not memories:
+    investors and deals into one context block.
 
-        return "შენახული ბიზნეს-მეხსიერება არ არის."
+    Investor/deal functions are defined in later parts.
 
-    lines = []
+    Missing sections are simply skipped.
 
-    for memory in memories:
+    """
 
-        lines.append(
-
-            f"- [{memory.get('category') or 'general'}] "
-
-            f"{memory.get('memory') or ''}"
-
-        )
-
-    return "\n".join(
-
-        lines
-
-    )
-
-# ============================================================
-
-# UNIVERSAL BUSINESS CONTEXT
-
-# ============================================================
-
-def build_business_context(chat_id):
-
-    project_context = build_project_context(
-
-        chat_id
-
-    )
+    sections = []
 
     memory_context = build_memory_context(
 
@@ -2252,139 +3228,123 @@ def build_business_context(chat_id):
 
     )
 
-    return f"""
+    if memory_context:
 
-=== GENIOSA BUSINESS CONTEXT ===
+        sections.append(
 
-მომხმარებლის შენახული პროექტები:
-
-{project_context}
-
-მომხმარებლის ბიზნეს-მეხსიერება:
-
-{memory_context}
-
-=== END BUSINESS CONTEXT ===
-
-"""
-
-print("GENIOSA PART 2/10 LOADED")# ============================================================
-
-# GENIOSA 4.0 — PART 3/10
-
-# INVESTORS / DEALS / FINANCIAL ENGINE
-
-# ============================================================
-
-# ============================================================
-
-# SAFE NUMBER HELPERS
-
-# ============================================================
-
-def to_float(value, default=0.0):
-
-    """
-
-    Safely converts a value to float.
-
-    Supports numbers written with commas or spaces.
-
-    """
-
-    if value is None:
-
-        return default
-
-    if isinstance(value, (int, float)):
-
-        return float(value)
-
-    try:
-
-        text = str(value).strip()
-
-        if not text:
-
-            return default
-
-        text = (
-
-            text
-
-            .replace(",", "")
-
-            .replace(" ", "")
-
-            .replace("$", "")
-
-            .replace("€", "")
-
-            .replace("₾", "")
+            memory_context
 
         )
 
-        return float(text)
+    projects = get_projects(
 
-    except Exception:
+        chat_id,
 
-        return default
+        limit=20
 
-def safe_percent(part, whole):
+    )
 
-    """
+    if projects:
 
-    Returns percentage.
+        project_lines = [
 
-    """
+            "ACTIVE PROJECTS:"
 
-    part = to_float(part)
+        ]
 
-    whole = to_float(whole)
+        for project in projects:
 
-    if whole == 0:
+            project_id = project.get(
 
-        return 0.0
+                "id"
 
-    return (part / whole) * 100
+            )
 
-def format_number(value, decimals=2):
+            name = project.get(
 
-    """
+                "name",
 
-    Formats numbers for readable reports.
+                "Unnamed"
 
-    """
+            )
 
-    value = to_float(value)
+            location = project.get(
 
-    if decimals == 0:
+                "location"
 
-        return f"{value:,.0f}"
+            )
 
-    return f"{value:,.{decimals}f}"
+            expected_profit = project.get(
 
-def format_money(value, currency="$"):
+                "expected_profit"
 
-    """
+            )
 
-    Formats financial values.
+            line = (
 
-    """
+                f"- Project #{project_id}: "
 
-    value = to_float(value)
+                f"{name}"
 
-    return f"{currency}{value:,.2f}"
+            )
 
-def format_percent(value, decimals=2):
+            if location:
 
-    value = to_float(value)
+                line += (
 
-    return f"{value:.{decimals}f}%"
+                    f" | location={location}"
+
+                )
+
+            if expected_profit is not None:
+
+                line += (
+
+                    f" | expected_profit="
+
+                    f"{expected_profit}"
+
+                )
+
+            project_lines.append(
+
+                line
+
+            )
+
+        sections.append(
+
+            "\n".join(project_lines)
+
+        )
+
+    return "\n\n".join(
+
+        sections
+
+    )
 
 # ============================================================
 
-# INVESTOR FUNCTIONS
+# PART 2 COMPLETE
+
+# ============================================================
+
+print(
+
+    "GENIOSA 4.0 — PART 2/10 LOADED"
+
+)# ============================================================
+
+# PART 3/10
+
+# INVESTORS + DEALS / CRM
+
+# ============================================================
+
+# ============================================================
+
+# CREATE INVESTOR
 
 # ============================================================
 
@@ -2410,53 +3370,23 @@ def create_investor(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Creates an investor record.
+
+    """
+
+    if not name:
+
+        return None
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        row = db_execute(
 
             """
 
-            INSERT INTO investors (
-
-                chat_id,
-
-                name,
-
-                company,
-
-                country,
-
-                contact,
-
-                investment_capacity,
-
-                preferred_sector,
-
-                status,
-
-                notes
-
-            )
-
-            VALUES (
-
-                %s, %s, %s, %s, %s,
-
-                %s, %s, %s, %s
-
-            )
-
-            RETURNING *
-
-            """,
+            INSERT INTO investors
 
             (
 
@@ -2480,167 +3410,87 @@ def create_investor(
 
             )
 
+            VALUES
+
+            (
+
+                %s, %s, %s, %s, %s,
+
+                %s, %s, %s, %s
+
+            )
+
+            RETURNING id
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                str(name).strip(),
+
+                company,
+
+                country,
+
+                contact,
+
+                investment_capacity,
+
+                preferred_sector,
+
+                status,
+
+                notes
+
+            ),
+
+            fetchone=True,
+
+            commit=True
+
         )
 
-        investor = cur.fetchone()
+        if row:
 
-        conn.commit()
+            return row.get("id")
 
-        return investor
+        return None
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "create_investor error"
+            "create_investor failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# GET INVESTORS
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def get_investors(
 
     chat_id,
 
-    status=None,
-
     limit=100
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Returns all investors belonging to the user.
 
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        if status:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM investors
-
-                WHERE chat_id = %s
-
-                AND status = %s
-
-                ORDER BY
-
-                    updated_at DESC,
-
-                    id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    status,
-
-                    int(limit)
-
-                )
-
-            )
-
-        else:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM investors
-
-                WHERE chat_id = %s
-
-                ORDER BY
-
-                    updated_at DESC,
-
-                    id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    int(limit)
-
-                )
-
-            )
-
-        return cur.fetchall()
-
-    except Exception:
-
-        logger.exception(
-
-            "get_investors error"
-
-        )
-
-        return []
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def get_investor(
-
-    chat_id,
-
-    investor_id
-
-):
-
-    conn = None
-
-    cur = None
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        rows = db_execute(
 
             """
 
@@ -2650,41 +3500,113 @@ def get_investor(
 
             WHERE chat_id = %s
 
-            AND id = %s
+            ORDER BY
+
+                updated_at DESC,
+
+                id DESC
+
+            LIMIT %s
 
             """,
 
             (
 
-                chat_id,
+                int(chat_id),
 
-                investor_id
+                int(limit)
 
-            )
+            ),
+
+            fetchall=True
 
         )
 
-        return cur.fetchone()
+        return list(
+
+            rows or []
+
+        )
 
     except Exception:
 
         logger.exception(
 
-            "get_investor error"
+            "get_investors failed"
+
+        )
+
+        return []
+
+# ============================================================
+
+# GET SINGLE INVESTOR
+
+# ============================================================
+
+def get_investor(
+
+    chat_id,
+
+    investor_id
+
+):
+
+    """
+
+    Returns one investor belonging to the user.
+
+    """
+
+    try:
+
+        row = db_execute(
+
+            """
+
+            SELECT *
+
+            FROM investors
+
+            WHERE
+
+                id = %s
+
+                AND chat_id = %s
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(investor_id),
+
+                int(chat_id)
+
+            ),
+
+            fetchone=True
+
+        )
+
+        return row
+
+    except Exception:
+
+        logger.exception(
+
+            "get_investor failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# UPDATE INVESTOR
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def update_investor(
 
@@ -2692,9 +3614,15 @@ def update_investor(
 
     investor_id,
 
-    **updates
+    **fields
 
 ):
+
+    """
+
+    Updates allowed investor fields only.
+
+    """
 
     allowed_fields = {
 
@@ -2716,17 +3644,17 @@ def update_investor(
 
     }
 
-    fields = []
+    updates = []
 
     values = []
 
-    for key, value in updates.items():
+    for key, value in fields.items():
 
         if key not in allowed_fields:
 
             continue
 
-        fields.append(
+        updates.append(
 
             f"{key} = %s"
 
@@ -2738,89 +3666,71 @@ def update_investor(
 
         )
 
-    if not fields:
+    if not updates:
 
-        return None
+        return False
 
-    fields.append(
+    updates.append(
 
         "updated_at = CURRENT_TIMESTAMP"
 
     )
 
-    conn = None
+    values.extend(
 
-    cur = None
+        [
+
+            int(investor_id),
+
+            int(chat_id)
+
+        ]
+
+    )
 
     try:
 
-        conn = db()
+        db_execute(
 
-        cur = conn.cursor()
-
-        values.extend(
-
-            [
-
-                chat_id,
-
-                investor_id
-
-            ]
-
-        )
-
-        query = f"""
+            f"""
 
             UPDATE investors
 
-            SET {", ".join(fields)}
+            SET
 
-            WHERE chat_id = %s
+                {", ".join(updates)}
 
-            AND id = %s
+            WHERE
 
-            RETURNING *
+                id = %s
 
-        """
+                AND chat_id = %s
 
-        cur.execute(
+            """,
 
-            query,
+            tuple(values),
 
-            values
+            commit=True
 
         )
 
-        investor = cur.fetchone()
-
-        conn.commit()
-
-        return investor
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "update_investor error"
+            "update_investor failed"
 
         )
 
-        return None
+        return False
 
-    finally:
+# ============================================================
 
-        if cur:
+# DELETE INVESTOR
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def delete_investor(
 
@@ -2830,71 +3740,427 @@ def delete_investor(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Deletes an investor belonging to the user.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        db_execute(
 
             """
 
             DELETE FROM investors
 
-            WHERE chat_id = %s
+            WHERE
 
-            AND id = %s
+                id = %s
+
+                AND chat_id = %s
 
             """,
 
             (
 
-                chat_id,
+                int(investor_id),
 
-                investor_id
+                int(chat_id)
 
-            )
+            ),
+
+            commit=True
 
         )
 
-        deleted = cur.rowcount
-
-        conn.commit()
-
-        return deleted
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "delete_investor error"
+            "delete_investor failed"
 
         )
 
-        return 0
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
+        return False
 
 # ============================================================
 
-# DEAL / CRM FUNCTIONS
+# FIND INVESTOR
+
+# ============================================================
+
+def find_investor(
+
+    chat_id,
+
+    search_text
+
+):
+
+    """
+
+    Searches investor by name, company,
+
+    country or contact.
+
+    """
+
+    if not search_text:
+
+        return None
+
+    pattern = (
+
+        f"%{str(search_text).strip()}%"
+
+    )
+
+    try:
+
+        row = db_execute(
+
+            """
+
+            SELECT *
+
+            FROM investors
+
+            WHERE
+
+                chat_id = %s
+
+                AND
+
+                (
+
+                    name ILIKE %s
+
+                    OR company ILIKE %s
+
+                    OR country ILIKE %s
+
+                    OR contact ILIKE %s
+
+                )
+
+            ORDER BY id DESC
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                pattern,
+
+                pattern,
+
+                pattern,
+
+                pattern
+
+            ),
+
+            fetchone=True
+
+        )
+
+        return row
+
+    except Exception:
+
+        logger.exception(
+
+            "find_investor failed"
+
+        )
+
+        return None
+
+# ============================================================
+
+# FORMAT INVESTOR
+
+# ============================================================
+
+def format_investor(
+
+    investor
+
+):
+
+    """
+
+    Converts investor record into readable text.
+
+    """
+
+    if not investor:
+
+        return "ინვესტორი ვერ მოიძებნა."
+
+    lines = []
+
+    investor_id = investor.get(
+
+        "id"
+
+    )
+
+    name = investor.get(
+
+        "name"
+
+    )
+
+    company = investor.get(
+
+        "company"
+
+    )
+
+    country = investor.get(
+
+        "country"
+
+    )
+
+    contact = investor.get(
+
+        "contact"
+
+    )
+
+    capacity = investor.get(
+
+        "investment_capacity"
+
+    )
+
+    sector = investor.get(
+
+        "preferred_sector"
+
+    )
+
+    status = investor.get(
+
+        "status"
+
+    )
+
+    notes = investor.get(
+
+        "notes"
+
+    )
+
+    if investor_id:
+
+        lines.append(
+
+            f"👤 ინვესტორი #{investor_id}"
+
+        )
+
+    if name:
+
+        lines.append(
+
+            f"სახელი: {name}"
+
+        )
+
+    if company:
+
+        lines.append(
+
+            f"🏢 კომპანია: {company}"
+
+        )
+
+    if country:
+
+        lines.append(
+
+            f"🌍 ქვეყანა: {country}"
+
+        )
+
+    if contact:
+
+        lines.append(
+
+            f"📞 კონტაქტი: {contact}"
+
+        )
+
+    if capacity is not None:
+
+        lines.append(
+
+            f"💰 საინვესტიციო შესაძლებლობა: "
+
+            f"${capacity:,.0f}"
+
+        )
+
+    if sector:
+
+        lines.append(
+
+            f"📂 სასურველი სექტორი: {sector}"
+
+        )
+
+    if status:
+
+        lines.append(
+
+            f"🔄 სტატუსი: {status}"
+
+        )
+
+    if notes:
+
+        lines.append(
+
+            f"📌 შენიშვნა: {notes}"
+
+        )
+
+    return "\n".join(
+
+        lines
+
+    )
+
+# ============================================================
+
+# INVESTORS SUMMARY
+
+# ============================================================
+
+def investors_summary(
+
+    chat_id
+
+):
+
+    """
+
+    Returns a readable investor list.
+
+    """
+
+    investors = get_investors(
+
+        chat_id
+
+    )
+
+    if not investors:
+
+        return (
+
+            "👥 ინვესტორები ჯერ არ არის "
+
+            "დამატებული."
+
+        )
+
+    lines = [
+
+        "👥 GENIOSA — INVESTORS",
+
+        ""
+
+    ]
+
+    for investor in investors:
+
+        investor_id = investor.get(
+
+            "id"
+
+        )
+
+        name = investor.get(
+
+            "name",
+
+            "Unnamed"
+
+        )
+
+        company = investor.get(
+
+            "company"
+
+        )
+
+        country = investor.get(
+
+            "country"
+
+        )
+
+        status = investor.get(
+
+            "status"
+
+        )
+
+        line = (
+
+            f"#{investor_id} — {name}"
+
+        )
+
+        if company:
+
+            line += (
+
+                f" | 🏢 {company}"
+
+            )
+
+        if country:
+
+            line += (
+
+                f" | 🌍 {country}"
+
+            )
+
+        if status:
+
+            line += (
+
+                f" | 🔄 {status}"
+
+            )
+
+        lines.append(
+
+            line
+
+        )
+
+    return "\n".join(
+
+        lines
+
+    )
+
+# ============================================================
+
+# CREATE DEAL
 
 # ============================================================
 
@@ -2920,53 +4186,89 @@ def create_deal(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Creates an investment / CRM deal.
+
+    """
 
     try:
 
-        conn = db()
+        # ----------------------------------------------------
 
-        cur = conn.cursor()
+        # Validate project ownership
 
-        cur.execute(
+        # ----------------------------------------------------
 
-            """
+        if project_id is not None:
 
-            INSERT INTO deals (
+            project = get_project(
 
                 chat_id,
 
-                project_id,
-
-                investor_id,
-
-                stage,
-
-                proposed_amount,
-
-                proposed_share,
-
-                valuation,
-
-                notes,
-
-                next_step
+                project_id
 
             )
 
-            VALUES (
+            if not project:
 
-                %s, %s, %s, %s, %s,
+                logger.warning(
 
-                %s, %s, %s, %s
+                    "Invalid project_id=%s "
+
+                    "for chat_id=%s",
+
+                    project_id,
+
+                    chat_id
+
+                )
+
+                return None
+
+        # ----------------------------------------------------
+
+        # Validate investor ownership
+
+        # ----------------------------------------------------
+
+        if investor_id is not None:
+
+            investor = get_investor(
+
+                chat_id,
+
+                investor_id
 
             )
 
-            RETURNING *
+            if not investor:
 
-            """,
+                logger.warning(
+
+                    "Invalid investor_id=%s "
+
+                    "for chat_id=%s",
+
+                    investor_id,
+
+                    chat_id
+
+                )
+
+                return None
+
+        # ----------------------------------------------------
+
+        # Insert deal
+
+        # ----------------------------------------------------
+
+        row = db_execute(
+
+            """
+
+            INSERT INTO deals
 
             (
 
@@ -2990,199 +4292,87 @@ def create_deal(
 
             )
 
+            VALUES
+
+            (
+
+                %s, %s, %s, %s, %s,
+
+                %s, %s, %s, %s
+
+            )
+
+            RETURNING id
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                project_id,
+
+                investor_id,
+
+                stage,
+
+                proposed_amount,
+
+                proposed_share,
+
+                valuation,
+
+                notes,
+
+                next_step
+
+            ),
+
+            fetchone=True,
+
+            commit=True
+
         )
 
-        deal = cur.fetchone()
+        if row:
 
-        conn.commit()
+            return row.get("id")
 
-        return deal
+        return None
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "create_deal error"
+            "create_deal failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# GET DEALS
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def get_deals(
 
     chat_id,
 
-    stage=None,
-
     limit=100
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Returns deals belonging to the user.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        if stage:
-
-            cur.execute(
-
-                """
-
-                SELECT
-
-                    d.*,
-
-                    p.name AS project_name,
-
-                    i.name AS investor_name,
-
-                    i.company AS investor_company
-
-                FROM deals d
-
-                LEFT JOIN projects p
-
-                    ON d.project_id = p.id
-
-                LEFT JOIN investors i
-
-                    ON d.investor_id = i.id
-
-                WHERE d.chat_id = %s
-
-                AND d.stage = %s
-
-                ORDER BY
-
-                    d.updated_at DESC,
-
-                    d.id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    stage,
-
-                    int(limit)
-
-                )
-
-            )
-
-        else:
-
-            cur.execute(
-
-                """
-
-                SELECT
-
-                    d.*,
-
-                    p.name AS project_name,
-
-                    i.name AS investor_name,
-
-                    i.company AS investor_company
-
-                FROM deals d
-
-                LEFT JOIN projects p
-
-                    ON d.project_id = p.id
-
-                LEFT JOIN investors i
-
-                    ON d.investor_id = i.id
-
-                WHERE d.chat_id = %s
-
-                ORDER BY
-
-                    d.updated_at DESC,
-
-                    d.id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    int(limit)
-
-                )
-
-            )
-
-        return cur.fetchall()
-
-    except Exception:
-
-        logger.exception(
-
-            "get_deals error"
-
-        )
-
-        return []
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def get_deal(
-
-    chat_id,
-
-    deal_id
-
-):
-
-    conn = None
-
-    cur = None
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        rows = db_execute(
 
             """
 
@@ -3200,49 +4390,137 @@ def get_deal(
 
             LEFT JOIN projects p
 
-                ON d.project_id = p.id
+                ON p.id = d.project_id
 
             LEFT JOIN investors i
 
-                ON d.investor_id = i.id
+                ON i.id = d.investor_id
 
             WHERE d.chat_id = %s
 
-            AND d.id = %s
+            ORDER BY
+
+                d.updated_at DESC,
+
+                d.id DESC
+
+            LIMIT %s
 
             """,
 
             (
 
-                chat_id,
+                int(chat_id),
 
-                deal_id
+                int(limit)
 
-            )
+            ),
+
+            fetchall=True
 
         )
 
-        return cur.fetchone()
+        return list(
+
+            rows or []
+
+        )
 
     except Exception:
 
         logger.exception(
 
-            "get_deal error"
+            "get_deals failed"
+
+        )
+
+        return []
+
+# ============================================================
+
+# GET SINGLE DEAL
+
+# ============================================================
+
+def get_deal(
+
+    chat_id,
+
+    deal_id
+
+):
+
+    """
+
+    Returns one deal belonging to the user.
+
+    """
+
+    try:
+
+        row = db_execute(
+
+            """
+
+            SELECT
+
+                d.*,
+
+                p.name AS project_name,
+
+                i.name AS investor_name,
+
+                i.company AS investor_company
+
+            FROM deals d
+
+            LEFT JOIN projects p
+
+                ON p.id = d.project_id
+
+            LEFT JOIN investors i
+
+                ON i.id = d.investor_id
+
+            WHERE
+
+                d.id = %s
+
+                AND d.chat_id = %s
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(deal_id),
+
+                int(chat_id)
+
+            ),
+
+            fetchone=True
+
+        )
+
+        return row
+
+    except Exception:
+
+        logger.exception(
+
+            "get_deal failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# UPDATE DEAL
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def update_deal(
 
@@ -3250,9 +4528,15 @@ def update_deal(
 
     deal_id,
 
-    **updates
+    **fields
 
 ):
+
+    """
+
+    Updates allowed deal fields.
+
+    """
 
     allowed_fields = {
 
@@ -3274,17 +4558,17 @@ def update_deal(
 
     }
 
-    fields = []
+    updates = []
 
     values = []
 
-    for key, value in updates.items():
+    for key, value in fields.items():
 
         if key not in allowed_fields:
 
             continue
 
-        fields.append(
+        updates.append(
 
             f"{key} = %s"
 
@@ -3296,89 +4580,71 @@ def update_deal(
 
         )
 
-    if not fields:
+    if not updates:
 
-        return None
+        return False
 
-    fields.append(
+    updates.append(
 
         "updated_at = CURRENT_TIMESTAMP"
 
     )
 
-    conn = None
+    values.extend(
 
-    cur = None
+        [
+
+            int(deal_id),
+
+            int(chat_id)
+
+        ]
+
+    )
 
     try:
 
-        conn = db()
+        db_execute(
 
-        cur = conn.cursor()
-
-        values.extend(
-
-            [
-
-                chat_id,
-
-                deal_id
-
-            ]
-
-        )
-
-        query = f"""
+            f"""
 
             UPDATE deals
 
-            SET {", ".join(fields)}
+            SET
 
-            WHERE chat_id = %s
+                {", ".join(updates)}
 
-            AND id = %s
+            WHERE
 
-            RETURNING *
+                id = %s
 
-        """
+                AND chat_id = %s
 
-        cur.execute(
+            """,
 
-            query,
+            tuple(values),
 
-            values
+            commit=True
 
         )
 
-        deal = cur.fetchone()
-
-        conn.commit()
-
-        return deal
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "update_deal error"
+            "update_deal failed"
 
         )
 
-        return None
+        return False
 
-    finally:
+# ============================================================
 
-        if cur:
+# DELETE DEAL
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def delete_deal(
 
@@ -3388,1195 +4654,55 @@ def delete_deal(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Deletes a deal belonging to the user.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        db_execute(
 
             """
 
             DELETE FROM deals
 
-            WHERE chat_id = %s
+            WHERE
 
-            AND id = %s
+                id = %s
+
+                AND chat_id = %s
 
             """,
 
             (
 
-                chat_id,
+                int(deal_id),
 
-                deal_id
-
-            )
-
-        )
-
-        deleted = cur.rowcount
-
-        conn.commit()
-
-        return deleted
-
-    except Exception:
-
-        if conn:
-
-            conn.rollback()
-
-        logger.exception(
-
-            "delete_deal error"
-
-        )
-
-        return 0
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-# ============================================================
-
-# FINANCIAL ENGINE
-
-# ============================================================
-
-def calculate_financials(
-
-    revenue=0,
-
-    construction_cost=0,
-
-    land_cost=0,
-
-    operating_cost=0,
-
-    financing_cost=0,
-
-    other_cost=0,
-
-    investor_capital=0
-
-):
-
-    """
-
-    Universal project financial calculation.
-
-    """
-
-    revenue = to_float(revenue)
-
-    construction_cost = to_float(
-
-        construction_cost
-
-    )
-
-    land_cost = to_float(
-
-        land_cost
-
-    )
-
-    operating_cost = to_float(
-
-        operating_cost
-
-    )
-
-    financing_cost = to_float(
-
-        financing_cost
-
-    )
-
-    other_cost = to_float(
-
-        other_cost
-
-    )
-
-    investor_capital = to_float(
-
-        investor_capital
-
-    )
-
-    total_cost = (
-
-        construction_cost
-
-        + land_cost
-
-        + operating_cost
-
-        + financing_cost
-
-        + other_cost
-
-    )
-
-    gross_profit = (
-
-        revenue
-
-        - construction_cost
-
-        - land_cost
-
-    )
-
-    net_profit = (
-
-        revenue
-
-        - total_cost
-
-    )
-
-    gross_margin = safe_percent(
-
-        gross_profit,
-
-        revenue
-
-    )
-
-    net_margin = safe_percent(
-
-        net_profit,
-
-        revenue
-
-    )
-
-    roi = safe_percent(
-
-        net_profit,
-
-        total_cost
-
-    )
-
-    investor_roi = safe_percent(
-
-        net_profit,
-
-        investor_capital
-
-    )
-
-    return {
-
-        "revenue": revenue,
-
-        "construction_cost": construction_cost,
-
-        "land_cost": land_cost,
-
-        "operating_cost": operating_cost,
-
-        "financing_cost": financing_cost,
-
-        "other_cost": other_cost,
-
-        "total_cost": total_cost,
-
-        "gross_profit": gross_profit,
-
-        "net_profit": net_profit,
-
-        "gross_margin": gross_margin,
-
-        "net_margin": net_margin,
-
-        "roi": roi,
-
-        "investor_capital": investor_capital,
-
-        "investor_roi": investor_roi
-
-    }
-
-def calculate_unit_economics(
-
-    saleable_area=0,
-
-    sale_price_per_m2=0,
-
-    construction_area=0,
-
-    construction_cost_per_m2=0,
-
-    land_cost=0,
-
-    other_cost=0
-
-):
-
-    """
-
-    Calculates project economics based on m².
-
-    """
-
-    saleable_area = to_float(
-
-        saleable_area
-
-    )
-
-    sale_price_per_m2 = to_float(
-
-        sale_price_per_m2
-
-    )
-
-    construction_area = to_float(
-
-        construction_area
-
-    )
-
-    construction_cost_per_m2 = to_float(
-
-        construction_cost_per_m2
-
-    )
-
-    land_cost = to_float(
-
-        land_cost
-
-    )
-
-    other_cost = to_float(
-
-        other_cost
-
-    )
-
-    revenue = (
-
-        saleable_area
-
-        * sale_price_per_m2
-
-    )
-
-    construction_cost = (
-
-        construction_area
-
-        * construction_cost_per_m2
-
-    )
-
-    total_cost = (
-
-        construction_cost
-
-        + land_cost
-
-        + other_cost
-
-    )
-
-    profit = (
-
-        revenue
-
-        - total_cost
-
-    )
-
-    margin = safe_percent(
-
-        profit,
-
-        revenue
-
-    )
-
-    roi = safe_percent(
-
-        profit,
-
-        total_cost
-
-    )
-
-    return {
-
-        "saleable_area": saleable_area,
-
-        "sale_price_per_m2": sale_price_per_m2,
-
-        "construction_area": construction_area,
-
-        "construction_cost_per_m2":
-
-            construction_cost_per_m2,
-
-        "revenue": revenue,
-
-        "construction_cost":
-
-            construction_cost,
-
-        "land_cost": land_cost,
-
-        "other_cost": other_cost,
-
-        "total_cost": total_cost,
-
-        "profit": profit,
-
-        "margin": margin,
-
-        "roi": roi
-
-    }
-
-def calculate_investor_split(
-
-    net_profit,
-
-    investor_share=80,
-
-    operator_share=20,
-
-    investor_capital=0
-
-):
-
-    """
-
-    Calculates profit distribution.
-
-    """
-
-    net_profit = to_float(
-
-        net_profit
-
-    )
-
-    investor_share = to_float(
-
-        investor_share
-
-    )
-
-    operator_share = to_float(
-
-        operator_share
-
-    )
-
-    investor_capital = to_float(
-
-        investor_capital
-
-    )
-
-    investor_profit = (
-
-        net_profit
-
-        * investor_share
-
-        / 100
-
-    )
-
-    operator_profit = (
-
-        net_profit
-
-        * operator_share
-
-        / 100
-
-    )
-
-    total_received_by_investor = (
-
-        investor_capital
-
-        + investor_profit
-
-    )
-
-    investor_roi = safe_percent(
-
-        investor_profit,
-
-        investor_capital
-
-    )
-
-    return {
-
-        "net_profit": net_profit,
-
-        "investor_share": investor_share,
-
-        "operator_share": operator_share,
-
-        "investor_profit": investor_profit,
-
-        "operator_profit": operator_profit,
-
-        "investor_capital": investor_capital,
-
-        "total_received_by_investor":
-
-            total_received_by_investor,
-
-        "investor_roi": investor_roi
-
-    }
-
-def calculate_scenario(
-
-    revenue,
-
-    total_cost,
-
-    revenue_change=0,
-
-    cost_change=0
-
-):
-
-    """
-
-    Scenario analysis:
-
-    revenue_change = percentage change
-
-    cost_change = percentage change
-
-    """
-
-    revenue = to_float(
-
-        revenue
-
-    )
-
-    total_cost = to_float(
-
-        total_cost
-
-    )
-
-    revenue_change = to_float(
-
-        revenue_change
-
-    )
-
-    cost_change = to_float(
-
-        cost_change
-
-    )
-
-    adjusted_revenue = (
-
-        revenue
-
-        * (1 + revenue_change / 100)
-
-    )
-
-    adjusted_cost = (
-
-        total_cost
-
-        * (1 + cost_change / 100)
-
-    )
-
-    profit = (
-
-        adjusted_revenue
-
-        - adjusted_cost
-
-    )
-
-    margin = safe_percent(
-
-        profit,
-
-        adjusted_revenue
-
-    )
-
-    roi = safe_percent(
-
-        profit,
-
-        adjusted_cost
-
-    )
-
-    return {
-
-        "revenue": adjusted_revenue,
-
-        "cost": adjusted_cost,
-
-        "profit": profit,
-
-        "margin": margin,
-
-        "roi": roi
-
-    }
-
-def calculate_break_even(
-
-    fixed_cost,
-
-    variable_cost_per_unit,
-
-    selling_price_per_unit
-
-):
-
-    """
-
-    Break-even units.
-
-    """
-
-    fixed_cost = to_float(
-
-        fixed_cost
-
-    )
-
-    variable_cost_per_unit = to_float(
-
-        variable_cost_per_unit
-
-    )
-
-    selling_price_per_unit = to_float(
-
-        selling_price_per_unit
-
-    )
-
-    contribution = (
-
-        selling_price_per_unit
-
-        - variable_cost_per_unit
-
-    )
-
-    if contribution <= 0:
-
-        return None
-
-    units = (
-
-        fixed_cost
-
-        / contribution
-
-    )
-
-    return {
-
-        "fixed_cost": fixed_cost,
-
-        "variable_cost_per_unit":
-
-            variable_cost_per_unit,
-
-        "selling_price_per_unit":
-
-            selling_price_per_unit,
-
-        "contribution_per_unit":
-
-            contribution,
-
-        "break_even_units": units
-
-    }
-
-def calculate_payback_period(
-
-    investment,
-
-    annual_cash_flow
-
-):
-
-    """
-
-    Simple payback period in years.
-
-    """
-
-    investment = to_float(
-
-        investment
-
-    )
-
-    annual_cash_flow = to_float(
-
-        annual_cash_flow
-
-    )
-
-    if annual_cash_flow <= 0:
-
-        return None
-
-    return investment / annual_cash_flow
-
-# ============================================================
-
-# FINANCIAL ANALYSIS STORAGE
-
-# ============================================================
-
-def save_financial_analysis(
-
-    chat_id,
-
-    project_id,
-
-    analysis_type,
-
-    input_data,
-
-    result_data
-
-):
-
-    conn = None
-
-    cur = None
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        if not isinstance(
-
-            input_data,
-
-            str
-
-        ):
-
-            input_data = json.dumps(
-
-                input_data,
-
-                ensure_ascii=False,
-
-                default=str
-
-            )
-
-        if not isinstance(
-
-            result_data,
-
-            str
-
-        ):
-
-            result_data = json.dumps(
-
-                result_data,
-
-                ensure_ascii=False,
-
-                default=str
-
-            )
-
-        cur.execute(
-
-            """
-
-            INSERT INTO financial_analyses (
-
-                chat_id,
-
-                project_id,
-
-                analysis_type,
-
-                input_data,
-
-                result_data
-
-            )
-
-            VALUES (
-
-                %s, %s, %s, %s, %s
-
-            )
-
-            RETURNING *
-
-            """,
-
-            (
-
-                chat_id,
-
-                project_id,
-
-                analysis_type,
-
-                input_data,
-
-                result_data
-
-            )
-
-        )
-
-        result = cur.fetchone()
-
-        conn.commit()
-
-        return result
-
-    except Exception:
-
-        if conn:
-
-            conn.rollback()
-
-        logger.exception(
-
-            "save_financial_analysis error"
-
-        )
-
-        return None
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-def get_financial_analyses(
-
-    chat_id,
-
-    project_id=None,
-
-    limit=20
-
-):
-
-    conn = None
-
-    cur = None
-
-    try:
-
-        conn = db()
-
-        cur = conn.cursor()
-
-        if project_id is None:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM financial_analyses
-
-                WHERE chat_id = %s
-
-                ORDER BY id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    int(limit)
-
-                )
-
-            )
-
-        else:
-
-            cur.execute(
-
-                """
-
-                SELECT *
-
-                FROM financial_analyses
-
-                WHERE chat_id = %s
-
-                AND project_id = %s
-
-                ORDER BY id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    project_id,
-
-                    int(limit)
-
-                )
-
-            )
-
-        return cur.fetchall()
-
-    except Exception:
-
-        logger.exception(
-
-            "get_financial_analyses error"
-
-        )
-
-        return []
-
-    finally:
-
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
-
-# ============================================================
-
-# PROJECT FINANCIAL SNAPSHOT
-
-# ============================================================
-
-def build_project_financial_snapshot(
-
-    project
-
-):
-
-    if not project:
-
-        return None
-
-    revenue = to_float(
-
-        project.get("revenue")
-
-    )
-
-    total_cost = to_float(
-
-        project.get("total_cost")
-
-    )
-
-    operating_cost = to_float(
-
-        project.get("operating_cost")
-
-    )
-
-    net_profit = to_float(
-
-        project.get("net_profit")
-
-    )
-
-    if net_profit == 0 and revenue:
-
-        net_profit = (
-
-            revenue
-
-            - total_cost
-
-            - operating_cost
-
-        )
-
-    margin = safe_percent(
-
-        net_profit,
-
-        revenue
-
-    )
-
-    roi = safe_percent(
-
-        net_profit,
-
-        total_cost
-
-    )
-
-    return {
-
-        "project_id":
-
-            project.get("id"),
-
-        "project_name":
-
-            project.get("name"),
-
-        "revenue":
-
-            revenue,
-
-        "total_cost":
-
-            total_cost,
-
-        "operating_cost":
-
-            operating_cost,
-
-        "net_profit":
-
-            net_profit,
-
-        "net_margin":
-
-            margin,
-
-        "roi":
-
-            roi,
-
-        "investor_capital":
-
-            to_float(
-
-                project.get(
-
-                    "investor_capital"
-
-                )
+                int(chat_id)
 
             ),
 
-        "investor_profit":
-
-            to_float(
-
-                project.get(
-
-                    "investor_profit"
-
-                )
-
-            ),
-
-        "investor_share":
-
-            to_float(
-
-                project.get(
-
-                    "investor_share"
-
-                )
-
-            )
-
-    }
-
-# ============================================================
-
-# TEXT FINANCIAL REPORT
-
-# ============================================================
-
-def format_financial_report(
-
-    result,
-
-    title="Financial Analysis"
-
-):
-
-    if not result:
-
-        return (
-
-            f"{title}\n\n"
-
-            "ფინანსური მონაცემები ვერ მოიძებნა."
+            commit=True
 
         )
 
-    lines = [
+        return True
 
-        f"📊 {title}",
+    except Exception:
 
-        "",
+        logger.exception(
 
-        f"შემოსავალი: "
-
-        f"{format_money(result.get('revenue'))}",
-
-        f"სრული ხარჯი: "
-
-        f"{format_money(result.get('total_cost'))}",
-
-        f"წმინდა მოგება: "
-
-        f"{format_money(result.get('net_profit'))}",
-
-        f"წმინდა მარჟა: "
-
-        f"{format_percent(result.get('net_margin'))}",
-
-        f"ROI: "
-
-        f"{format_percent(result.get('roi'))}"
-
-    ]
-
-    if result.get("investor_capital"):
-
-        lines.extend(
-
-            [
-
-                "",
-
-                "ინვესტორი:",
-
-                f"კაპიტალი: "
-
-                f"{format_money(result.get('investor_capital'))}",
-
-                f"მოგება: "
-
-                f"{format_money(result.get('investor_profit'))}",
-
-                f"წილი: "
-
-                f"{format_percent(result.get('investor_share'))}"
-
-            ]
+            "delete_deal failed"
 
         )
 
-    return "\n".join(
-
-        lines
-
-    )
+        return False
 
 # ============================================================
 
-# INVESTOR FORMATTER
-
-# ============================================================
-
-def format_investor(
-
-    investor
-
-):
-
-    if not investor:
-
-        return "ინვესტორი ვერ მოიძებნა."
-
-    lines = [
-
-        f"👤 ინვესტორი #{investor.get('id')}",
-
-        f"სახელი: {investor.get('name') or '-'}",
-
-        f"კომპანია: {investor.get('company') or '-'}",
-
-        f"ქვეყანა: {investor.get('country') or '-'}",
-
-        f"კონტაქტი: {investor.get('contact') or '-'}",
-
-        f"საინვესტიციო შესაძლებლობა: "
-
-        f"{format_money(investor.get('investment_capacity'))}",
-
-        f"სასურველი სექტორი: "
-
-        f"{investor.get('preferred_sector') or '-'}",
-
-        f"სტატუსი: {investor.get('status') or '-'}",
-
-        f"შენიშვნა: {investor.get('notes') or '-'}"
-
-    ]
-
-    return "\n".join(
-
-        lines
-
-    )
-
-# ============================================================
-
-# DEAL FORMATTER
+# FORMAT DEAL
 
 # ============================================================
 
@@ -4586,119 +4712,167 @@ def format_deal(
 
 ):
 
+    """
+
+    Converts deal record into readable text.
+
+    """
+
     if not deal:
 
         return "გარიგება ვერ მოიძებნა."
 
-    lines = [
+    lines = []
 
-        f"🤝 გარიგება #{deal.get('id')}",
+    deal_id = deal.get(
 
-        f"პროექტი: {deal.get('project_name') or '-'}",
-
-        f"ინვესტორი: "
-
-        f"{deal.get('investor_name') or '-'}",
-
-        f"კომპანია: "
-
-        f"{deal.get('investor_company') or '-'}",
-
-        f"ეტაპი: {deal.get('stage') or '-'}",
-
-        f"შეთავაზებული თანხა: "
-
-        f"{format_money(deal.get('proposed_amount'))}",
-
-        f"შეთავაზებული წილი: "
-
-        f"{format_percent(deal.get('proposed_share'))}",
-
-        f"შეფასება: "
-
-        f"{format_money(deal.get('valuation'))}",
-
-        f"შემდეგი ნაბიჯი: "
-
-        f"{deal.get('next_step') or '-'}",
-
-        f"შენიშვნა: "
-
-        f"{deal.get('notes') or '-'}"
-
-    ]
-
-    return "\n".join(
-
-        lines
+        "id"
 
     )
 
-# ============================================================
+    project_name = deal.get(
 
-# LIST SUMMARIES
-
-# ============================================================
-
-def investors_summary(
-
-    chat_id
-
-):
-
-    investors = get_investors(
-
-        chat_id
+        "project_name"
 
     )
 
-    if not investors:
+    investor_name = deal.get(
 
-        return (
+        "investor_name"
 
-            "👤 ინვესტორების ბაზა ცარიელია."
+    )
 
-        )
+    investor_company = deal.get(
 
-    lines = [
+        "investor_company"
 
-        f"👥 ინვესტორები: {len(investors)}",
+    )
 
-        ""
+    stage = deal.get(
 
-    ]
+        "stage"
 
-    for investor in investors[:30]:
+    )
 
-        capacity = investor.get(
+    proposed_amount = deal.get(
 
-            "investment_capacity"
+        "proposed_amount"
 
-        )
+    )
 
-        capacity_text = (
+    proposed_share = deal.get(
 
-            format_money(capacity)
+        "proposed_share"
 
-            if capacity
+    )
 
-            else "-"
+    valuation = deal.get(
 
-        )
+        "valuation"
+
+    )
+
+    notes = deal.get(
+
+        "notes"
+
+    )
+
+    next_step = deal.get(
+
+        "next_step"
+
+    )
+
+    if deal_id:
 
         lines.append(
 
-            f"#{investor.get('id')} "
+            f"🤝 გარიგება #{deal_id}"
 
-            f"{investor.get('name') or '-'}"
+        )
 
-            f" | {investor.get('company') or '-'}"
+    if project_name:
 
-            f" | {investor.get('country') or '-'}"
+        lines.append(
 
-            f" | {capacity_text}"
+            f"🏗️ პროექტი: {project_name}"
 
-            f" | {investor.get('status') or 'new'}"
+        )
+
+    if investor_name:
+
+        investor_line = (
+
+            f"👤 ინვესტორი: {investor_name}"
+
+        )
+
+        if investor_company:
+
+            investor_line += (
+
+                f" ({investor_company})"
+
+            )
+
+        lines.append(
+
+            investor_line
+
+        )
+
+    if stage:
+
+        lines.append(
+
+            f"🔄 ეტაპი: {stage}"
+
+        )
+
+    if proposed_amount is not None:
+
+        lines.append(
+
+            f"💰 შეთავაზებული თანხა: "
+
+            f"${proposed_amount:,.0f}"
+
+        )
+
+    if proposed_share is not None:
+
+        lines.append(
+
+            f"📊 შეთავაზებული წილი: "
+
+            f"{proposed_share:,.2f}%"
+
+        )
+
+    if valuation is not None:
+
+        lines.append(
+
+            f"🏦 შეფასება: "
+
+            f"${valuation:,.0f}"
+
+        )
+
+    if notes:
+
+        lines.append(
+
+            f"📌 შენიშვნა: {notes}"
+
+        )
+
+    if next_step:
+
+        lines.append(
+
+            f"➡️ შემდეგი ნაბიჯი: {next_step}"
 
         )
 
@@ -4707,12 +4881,24 @@ def investors_summary(
         lines
 
     )
+
+# ============================================================
+
+# DEALS SUMMARY
+
+# ============================================================
 
 def deals_summary(
 
     chat_id
 
 ):
+
+    """
+
+    Returns a readable deal pipeline.
+
+    """
 
     deals = get_deals(
 
@@ -4724,19 +4910,45 @@ def deals_summary(
 
         return (
 
-            "🤝 გარიგებების ბაზა ცარიელია."
+            "🤝 გარიგებები ჯერ არ არის "
+
+            "დამატებული."
 
         )
 
     lines = [
 
-        f"🤝 გარიგებები: {len(deals)}",
+        "🤝 GENIOSA — DEAL PIPELINE",
 
         ""
 
     ]
 
-    for deal in deals[:30]:
+    for deal in deals:
+
+        deal_id = deal.get(
+
+            "id"
+
+        )
+
+        project_name = deal.get(
+
+            "project_name"
+
+        ) or "პროექტი"
+
+        investor_name = deal.get(
+
+            "investor_name"
+
+        ) or "ინვესტორი"
+
+        stage = deal.get(
+
+            "stage"
+
+        ) or "new"
 
         amount = deal.get(
 
@@ -4744,27 +4956,33 @@ def deals_summary(
 
         )
 
-        amount_text = (
+        line = (
 
-            format_money(amount)
+            f"#{deal_id} — "
 
-            if amount
+            f"{project_name} ↔ "
 
-            else "-"
+            f"{investor_name}"
 
         )
 
+        line += (
+
+            f" | {stage}"
+
+        )
+
+        if amount is not None:
+
+            line += (
+
+                f" | ${amount:,.0f}"
+
+            )
+
         lines.append(
 
-            f"#{deal.get('id')} "
-
-            f"{deal.get('project_name') or '-'}"
-
-            f" → {deal.get('investor_name') or '-'}"
-
-            f" | {deal.get('stage') or 'new'}"
-
-            f" | {amount_text}"
+            line
 
         )
 
@@ -4776,41 +4994,335 @@ def deals_summary(
 
 # ============================================================
 
-# PART 3 CHECK
+# FIND DEALS BY PROJECT
 
 # ============================================================
 
-print("GENIOSA PART 3/10 LOADED")# ============================================================
+def get_project_deals(
 
-# GENIOSA 4.0 — PART 4/10
+    chat_id,
 
-# DOCUMENT PROCESSING / FILE EXTRACTION / AI ANALYSIS
+    project_id
+
+):
+
+    """
+
+    Returns all deals for a specific project.
+
+    """
+
+    try:
+
+        rows = db_execute(
+
+            """
+
+            SELECT
+
+                d.*,
+
+                i.name AS investor_name,
+
+                i.company AS investor_company
+
+            FROM deals d
+
+            LEFT JOIN investors i
+
+                ON i.id = d.investor_id
+
+            WHERE
+
+                d.chat_id = %s
+
+                AND d.project_id = %s
+
+            ORDER BY
+
+                d.updated_at DESC,
+
+                d.id DESC
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                int(project_id)
+
+            ),
+
+            fetchall=True
+
+        )
+
+        return list(
+
+            rows or []
+
+        )
+
+    except Exception:
+
+        logger.exception(
+
+            "get_project_deals failed"
+
+        )
+
+        return []
+
+# ============================================================
+
+# BUILD CRM CONTEXT FOR AI
+
+# ============================================================
+
+def build_crm_context(
+
+    chat_id
+
+):
+
+    """
+
+    Builds compact investor + deal context
+
+    for Gemini.
+
+    """
+
+    sections = []
+
+    investors = get_investors(
+
+        chat_id,
+
+        limit=20
+
+    )
+
+    if investors:
+
+        investor_lines = [
+
+            "INVESTORS:"
+
+        ]
+
+        for investor in investors:
+
+            investor_id = investor.get(
+
+                "id"
+
+            )
+
+            name = investor.get(
+
+                "name"
+
+            ) or "Unnamed"
+
+            company = investor.get(
+
+                "company"
+
+            )
+
+            country = investor.get(
+
+                "country"
+
+            )
+
+            status = investor.get(
+
+                "status"
+
+            )
+
+            line = (
+
+                f"- Investor #{investor_id}: "
+
+                f"{name}"
+
+            )
+
+            if company:
+
+                line += (
+
+                    f" | company={company}"
+
+                )
+
+            if country:
+
+                line += (
+
+                    f" | country={country}"
+
+                )
+
+            if status:
+
+                line += (
+
+                    f" | status={status}"
+
+                )
+
+            investor_lines.append(
+
+                line
+
+            )
+
+        sections.append(
+
+            "\n".join(
+
+                investor_lines
+
+            )
+
+        )
+
+    deals = get_deals(
+
+        chat_id,
+
+        limit=20
+
+    )
+
+    if deals:
+
+        deal_lines = [
+
+            "DEALS:"
+
+        ]
+
+        for deal in deals:
+
+            deal_id = deal.get(
+
+                "id"
+
+            )
+
+            project_name = (
+
+                deal.get(
+
+                    "project_name"
+
+                )
+
+                or "Unknown project"
+
+            )
+
+            investor_name = (
+
+                deal.get(
+
+                    "investor_name"
+
+                )
+
+                or "Unknown investor"
+
+            )
+
+            stage = (
+
+                deal.get(
+
+                    "stage"
+
+                )
+
+                or "new"
+
+            )
+
+            amount = deal.get(
+
+                "proposed_amount"
+
+            )
+
+            line = (
+
+                f"- Deal #{deal_id}: "
+
+                f"{project_name} / "
+
+                f"{investor_name} / "
+
+                f"stage={stage}"
+
+            )
+
+            if amount is not None:
+
+                line += (
+
+                    f" / amount={amount}"
+
+                )
+
+            deal_lines.append(
+
+                line
+
+            )
+
+        sections.append(
+
+            "\n".join(
+
+                deal_lines
+
+            )
+
+        )
+
+    return "\n\n".join(
+
+        sections
+
+    )
+
+# ============================================================
+
+# PART 3 COMPLETE
+
+# ============================================================
+
+print(
+
+    "GENIOSA 4.0 — PART 3/10 LOADED"
+
+)# ============================================================
+
+# PART 4/10
+
+# DOCUMENTS + FILE EXTRACTION + AI ANALYSIS PREPARATION
 
 # ============================================================
 
 # ============================================================
 
-# DOCUMENT TYPE DETECTION
+# DETECT FILE TYPE
 
 # ============================================================
-
-SUPPORTED_DOCUMENT_TYPES = {
-
-    ".pdf": "PDF",
-
-    ".docx": "DOCX",
-
-    ".xlsx": "XLSX",
-
-    ".xlsm": "XLSM",
-
-    ".pptx": "PPTX",
-
-    ".txt": "TXT",
-
-    ".csv": "CSV"
-
-}
 
 def detect_file_type(
 
@@ -4820,7 +5332,7 @@ def detect_file_type(
 
     """
 
-    Detects document type from file extension.
+    Detects supported document type from filename.
 
     """
 
@@ -4828,7 +5340,7 @@ def detect_file_type(
 
         return "unknown"
 
-    suffix = (
+    extension = (
 
         Path(str(filename))
 
@@ -4836,11 +5348,31 @@ def detect_file_type(
 
         .lower()
 
+        .strip()
+
     )
 
-    return SUPPORTED_DOCUMENT_TYPES.get(
+    mapping = {
 
-        suffix,
+        ".pdf": "pdf",
+
+        ".docx": "docx",
+
+        ".xlsx": "xlsx",
+
+        ".xlsm": "xlsm",
+
+        ".pptx": "pptx",
+
+        ".txt": "txt",
+
+        ".csv": "csv"
+
+    }
+
+    return mapping.get(
+
+        extension,
 
         "unknown"
 
@@ -4848,121 +5380,31 @@ def detect_file_type(
 
 # ============================================================
 
-# FILE SIZE / TEXT LIMITS
+# SUPPORTED DOCUMENT TYPES
 
 # ============================================================
 
-MAX_DOCUMENT_TEXT = 60000
+SUPPORTED_DOCUMENT_TYPES = {
 
-MAX_EXCEL_ROWS = 500
+    "pdf",
 
-MAX_EXCEL_COLUMNS = 50
+    "docx",
 
-MAX_PPTX_SLIDES = 100
+    "xlsx",
 
-def trim_document_text(
+    "xlsm",
 
-    text,
+    "pptx",
 
-    max_chars=MAX_DOCUMENT_TEXT
+    "txt",
 
-):
+    "csv"
 
-    """
-
-    Prevents extremely large documents
-
-    from creating oversized AI requests.
-
-    """
-
-    if not text:
-
-        return ""
-
-    text = str(text)
-
-    if len(text) <= max_chars:
-
-        return text
-
-    return (
-
-        text[:max_chars]
-
-        + "\n\n"
-
-        "[DOCUMENT TEXT TRUNCATED]"
-
-    )
+}
 
 # ============================================================
 
-# TEXT FILE EXTRACTION
-
-# ============================================================
-
-def extract_text_file(
-
-    file_path
-
-):
-
-    try:
-
-        path = Path(
-
-            file_path
-
-        )
-
-        raw = path.read_bytes()
-
-        for encoding in (
-
-            "utf-8",
-
-            "utf-8-sig",
-
-            "cp1252",
-
-            "latin-1"
-
-        ):
-
-            try:
-
-                return raw.decode(
-
-                    encoding
-
-                )
-
-            except UnicodeDecodeError:
-
-                continue
-
-        return raw.decode(
-
-            "utf-8",
-
-            errors="replace"
-
-        )
-
-    except Exception:
-
-        logger.exception(
-
-            "extract_text_file error"
-
-        )
-
-        return ""
-
-# ============================================================
-
-# PDF EXTRACTION
+# EXTRACT PDF TEXT
 
 # ============================================================
 
@@ -4971,6 +5413,12 @@ def extract_pdf_text(
     file_path
 
 ):
+
+    """
+
+    Extracts text from PDF.
+
+    """
 
     try:
 
@@ -4984,49 +5432,41 @@ def extract_pdf_text(
 
         for index, page in enumerate(
 
-            reader.pages
+            reader.pages,
+
+            start=1
 
         ):
 
             try:
 
-                page_text = (
-
-                    page.extract_text()
-
-                    or ""
-
-                )
-
-                if page_text.strip():
-
-                    pages.append(
-
-                        f"\n--- PAGE {index + 1} ---\n"
-
-                        f"{page_text}"
-
-                    )
+                text = page.extract_text()
 
             except Exception:
 
-                logger.exception(
+                text = ""
 
-                    "PDF page extraction error"
+            if text:
+
+                pages.append(
+
+                    f"--- PAGE {index} ---\n"
+
+                    f"{text}"
 
                 )
 
-        return trim_document_text(
+        return "\n\n".join(
 
-            "\n".join(pages)
+            pages
 
-        )
+        ).strip()
 
     except Exception:
 
         logger.exception(
 
-            "extract_pdf_text error"
+            "extract_pdf_text failed"
 
         )
 
@@ -5034,7 +5474,7 @@ def extract_pdf_text(
 
 # ============================================================
 
-# DOCX EXTRACTION
+# EXTRACT DOCX TEXT
 
 # ============================================================
 
@@ -5043,6 +5483,12 @@ def extract_docx_text(
     file_path
 
 ):
+
+    """
+
+    Extracts paragraphs and table contents from DOCX.
+
+    """
 
     try:
 
@@ -5056,7 +5502,7 @@ def extract_docx_text(
 
         # ----------------------------------------------------
 
-        # Paragraphs
+        # PARAGRAPHS
 
         # ----------------------------------------------------
 
@@ -5080,19 +5526,21 @@ def extract_docx_text(
 
         # ----------------------------------------------------
 
-        # Tables
+        # TABLES
 
         # ----------------------------------------------------
 
         for table_index, table in enumerate(
 
-            document.tables
+            document.tables,
+
+            start=1
 
         ):
 
             parts.append(
 
-                f"\n--- TABLE {table_index + 1} ---"
+                f"--- TABLE {table_index} ---"
 
             )
 
@@ -5102,41 +5550,41 @@ def extract_docx_text(
 
                 for cell in row.cells:
 
+                    cell_text = (
+
+                        cell.text
+
+                        or ""
+
+                    ).strip()
+
                     cells.append(
 
-                        (
-
-                            cell.text
-
-                            or ""
-
-                        ).replace(
-
-                            "\n",
-
-                            " "
-
-                        ).strip()
+                        cell_text
 
                     )
 
                 parts.append(
 
-                    " | ".join(cells)
+                    " | ".join(
+
+                        cells
+
+                    )
 
                 )
 
-        return trim_document_text(
+        return "\n".join(
 
-            "\n".join(parts)
+            parts
 
-        )
+        ).strip()
 
     except Exception:
 
         logger.exception(
 
-            "extract_docx_text error"
+            "extract_docx_text failed"
 
         )
 
@@ -5144,7 +5592,7 @@ def extract_docx_text(
 
 # ============================================================
 
-# EXCEL EXTRACTION
+# EXTRACT XLSX / XLSM TEXT
 
 # ============================================================
 
@@ -5154,31 +5602,43 @@ def extract_excel_text(
 
 ):
 
+    """
+
+    Extracts workbook data from XLSX/XLSM.
+
+    Formulas are loaded as formulas so the AI can
+
+    inspect the actual model structure.
+
+    """
+
     try:
 
         workbook = load_workbook(
 
             filename=str(file_path),
 
-            read_only=True,
+            data_only=False,
 
-            data_only=True
+            read_only=True
 
         )
 
         parts = []
 
-        for sheet in workbook.worksheets:
+        for worksheet in workbook.worksheets:
 
             parts.append(
 
-                f"\n--- SHEET: {sheet.title} ---"
+                f"--- SHEET: "
+
+                f"{worksheet.title} ---"
 
             )
 
             row_count = 0
 
-            for row in sheet.iter_rows(
+            for row in worksheet.iter_rows(
 
                 values_only=True
 
@@ -5186,37 +5646,25 @@ def extract_excel_text(
 
                 row_count += 1
 
-                if row_count > MAX_EXCEL_ROWS:
-
-                    parts.append(
-
-                        "[SHEET ROW LIMIT REACHED]"
-
-                    )
-
-                    break
-
                 values = []
 
-                for value in row[
-
-                    :MAX_EXCEL_COLUMNS
-
-                ]:
+                for value in row:
 
                     if value is None:
 
                         values.append("")
 
-                    else:
+                        continue
 
-                        values.append(
+                    values.append(
 
-                            str(value)
+                        str(value)
 
-                        )
+                    )
 
-                if any(
+                # Skip completely empty rows.
+
+                if not any(
 
                     value.strip()
 
@@ -5224,25 +5672,51 @@ def extract_excel_text(
 
                 ):
 
-                    parts.append(
+                    continue
 
-                        " | ".join(values)
+                parts.append(
+
+                    " | ".join(
+
+                        values
 
                     )
 
-        workbook.close()
+                )
 
-        return trim_document_text(
+                # Safety limit per sheet.
 
-            "\n".join(parts)
+                if row_count >= 5000:
 
-        )
+                    parts.append(
+
+                        "[SHEET TRUNCATED "
+
+                        "AFTER 5000 ROWS]"
+
+                    )
+
+                    break
+
+        try:
+
+            workbook.close()
+
+        except Exception:
+
+            pass
+
+        return "\n".join(
+
+            parts
+
+        ).strip()
 
     except Exception:
 
         logger.exception(
 
-            "extract_excel_text error"
+            "extract_excel_text failed"
 
         )
 
@@ -5250,7 +5724,7 @@ def extract_excel_text(
 
 # ============================================================
 
-# POWERPOINT EXTRACTION
+# EXTRACT PPTX TEXT
 
 # ============================================================
 
@@ -5259,6 +5733,12 @@ def extract_pptx_text(
     file_path
 
 ):
+
+    """
+
+    Extracts text from PowerPoint slides.
+
+    """
 
     try:
 
@@ -5270,17 +5750,17 @@ def extract_pptx_text(
 
         parts = []
 
-        slides = presentation.slides
+        for slide_number, slide in enumerate(
 
-        for index, slide in enumerate(
+            presentation.slides,
 
-            slides[:MAX_PPTX_SLIDES]
+            start=1
 
         ):
 
             parts.append(
 
-                f"\n--- SLIDE {index + 1} ---"
+                f"--- SLIDE {slide_number} ---"
 
             )
 
@@ -5312,17 +5792,17 @@ def extract_pptx_text(
 
                     )
 
-        return trim_document_text(
+        return "\n".join(
 
-            "\n".join(parts)
+            parts
 
-        )
+        ).strip()
 
     except Exception:
 
         logger.exception(
 
-            "extract_pptx_text error"
+            "extract_pptx_text failed"
 
         )
 
@@ -5330,7 +5810,133 @@ def extract_pptx_text(
 
 # ============================================================
 
-# UNIVERSAL DOCUMENT EXTRACTION
+# EXTRACT TXT TEXT
+
+# ============================================================
+
+def extract_txt_text(
+
+    file_path
+
+):
+
+    """
+
+    Reads plain text file.
+
+    """
+
+    encodings = [
+
+        "utf-8",
+
+        "utf-8-sig",
+
+        "cp1251",
+
+        "latin-1"
+
+    ]
+
+    for encoding in encodings:
+
+        try:
+
+            return Path(
+
+                file_path
+
+            ).read_text(
+
+                encoding=encoding
+
+            ).strip()
+
+        except UnicodeDecodeError:
+
+            continue
+
+        except Exception:
+
+            logger.exception(
+
+                "extract_txt_text failed"
+
+            )
+
+            return ""
+
+    return ""
+
+# ============================================================
+
+# EXTRACT CSV TEXT
+
+# ============================================================
+
+def extract_csv_text(
+
+    file_path
+
+):
+
+    """
+
+    Reads CSV as text.
+
+    This intentionally keeps the table structure simple
+
+    so Gemini can understand it reliably.
+
+    """
+
+    encodings = [
+
+        "utf-8-sig",
+
+        "utf-8",
+
+        "cp1251",
+
+        "latin-1"
+
+    ]
+
+    for encoding in encodings:
+
+        try:
+
+            text = Path(
+
+                file_path
+
+            ).read_text(
+
+                encoding=encoding
+
+            )
+
+            return text.strip()
+
+        except UnicodeDecodeError:
+
+            continue
+
+        except Exception:
+
+            logger.exception(
+
+                "extract_csv_text failed"
+
+            )
+
+            return ""
+
+    return ""
+
+# ============================================================
+
+# EXTRACT FILE TEXT
 
 # ============================================================
 
@@ -5338,169 +5944,93 @@ def extract_file_text(
 
     file_path,
 
-    filename=None
+    file_type=None
 
 ):
 
     """
 
-    Universal document extractor.
+    Main document text extraction dispatcher.
 
     """
 
-    path = Path(
+    file_path = Path(
 
         file_path
 
     )
 
-    if not filename:
+    if not file_path.exists():
 
-        filename = path.name
+        return ""
 
-    suffix = (
+    if not file_type:
 
-        path.suffix
+        file_type = detect_file_type(
 
-        .lower()
-
-    )
-
-    # --------------------------------------------------------
-
-    # TXT
-
-    # --------------------------------------------------------
-
-    if suffix == ".txt":
-
-        return trim_document_text(
-
-            extract_text_file(
-
-                path
-
-            )
+            file_path.name
 
         )
 
-    # --------------------------------------------------------
-
-    # CSV
-
-    # --------------------------------------------------------
-
-    if suffix == ".csv":
-
-        return trim_document_text(
-
-            extract_text_file(
-
-                path
-
-            )
-
-        )
-
-    # --------------------------------------------------------
-
-    # PDF
-
-    # --------------------------------------------------------
-
-    if suffix == ".pdf":
+    if file_type == "pdf":
 
         return extract_pdf_text(
 
-            path
+            file_path
 
         )
 
-    # --------------------------------------------------------
-
-    # DOCX
-
-    # --------------------------------------------------------
-
-    if suffix == ".docx":
+    if file_type == "docx":
 
         return extract_docx_text(
 
-            path
+            file_path
 
         )
 
-    # --------------------------------------------------------
+    if file_type in (
 
-    # XLSX / XLSM
+        "xlsx",
 
-    # --------------------------------------------------------
-
-    if suffix in (
-
-        ".xlsx",
-
-        ".xlsm"
+        "xlsm"
 
     ):
 
         return extract_excel_text(
 
-            path
+            file_path
 
         )
 
-    # --------------------------------------------------------
-
-    # PPTX
-
-    # --------------------------------------------------------
-
-    if suffix == ".pptx":
+    if file_type == "pptx":
 
         return extract_pptx_text(
 
-            path
+            file_path
 
         )
 
-    # --------------------------------------------------------
+    if file_type == "txt":
 
-    # Unsupported old Microsoft formats
+        return extract_txt_text(
 
-    # --------------------------------------------------------
-
-    if suffix in (
-
-        ".doc",
-
-        ".xls"
-
-    ):
-
-        return (
-
-            "ეს არის ძველი Microsoft Office ფორმატი "
-
-            f"({suffix}). "
-
-            "გთხოვთ შეინახოთ ფაილი DOCX ან XLSX ფორმატში "
-
-            "და ხელახლა ატვირთოთ."
+            file_path
 
         )
 
-    return (
+    if file_type == "csv":
 
-        f"ფაილის ფორმატი {suffix or 'უცნობია'} "
+        return extract_csv_text(
 
-        "ამჟამად არ არის მხარდაჭერილი."
+            file_path
 
-    )
+        )
+
+    return ""
 
 # ============================================================
 
-# DOCUMENT DATABASE
+# SAVE DOCUMENT RECORD
 
 # ============================================================
 
@@ -5508,53 +6038,31 @@ def save_document_record(
 
     chat_id,
 
-    project_id,
-
     filename,
 
     file_type,
 
-    extracted_text
+    extracted_text="",
+
+    project_id=None,
+
+    analysis=None
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Saves uploaded document information.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        row = db_execute(
 
             """
 
-            INSERT INTO documents (
-
-                chat_id,
-
-                project_id,
-
-                filename,
-
-                file_type,
-
-                extracted_text
-
-            )
-
-            VALUES (
-
-                %s, %s, %s, %s, %s
-
-            )
-
-            RETURNING *
-
-            """,
+            INSERT INTO documents
 
             (
 
@@ -5566,45 +6074,67 @@ def save_document_record(
 
                 file_type,
 
-                trim_document_text(
+                extracted_text,
 
-                    extracted_text
-
-                )
+                analysis
 
             )
 
+            VALUES
+
+            (
+
+                %s, %s, %s, %s, %s, %s
+
+            )
+
+            RETURNING id
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                project_id,
+
+                filename,
+
+                file_type,
+
+                extracted_text,
+
+                analysis
+
+            ),
+
+            fetchone=True,
+
+            commit=True
+
         )
 
-        document = cur.fetchone()
+        if row:
 
-        conn.commit()
+            return row.get("id")
 
-        return document
+        return None
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "save_document_record error"
+            "save_document_record failed"
 
         )
 
         return None
 
-    finally:
+# ============================================================
 
-        if cur:
+# UPDATE DOCUMENT ANALYSIS
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def update_document_analysis(
 
@@ -5616,17 +6146,15 @@ def update_document_analysis(
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Saves AI analysis for an existing document.
+
+    """
 
     try:
 
-        conn = db()
-
-        cur = conn.cursor()
-
-        cur.execute(
+        db_execute(
 
             """
 
@@ -5638,11 +6166,11 @@ def update_document_analysis(
 
                 updated_at = CURRENT_TIMESTAMP
 
-            WHERE chat_id = %s
+            WHERE
 
-            AND id = %s
+                id = %s
 
-            RETURNING *
+                AND chat_id = %s
 
             """,
 
@@ -5650,479 +6178,161 @@ def update_document_analysis(
 
                 analysis,
 
-                chat_id,
+                int(document_id),
 
-                document_id
+                int(chat_id)
 
-            )
+            ),
+
+            commit=True
 
         )
 
-        document = cur.fetchone()
-
-        conn.commit()
-
-        return document
+        return True
 
     except Exception:
 
-        if conn:
-
-            conn.rollback()
-
         logger.exception(
 
-            "update_document_analysis error"
+            "update_document_analysis failed"
 
         )
 
-        return None
+        return False
 
-    finally:
+# ============================================================
 
-        if cur:
+# GET DOCUMENTS
 
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# ============================================================
 
 def get_documents(
 
     chat_id,
 
-    project_id=None,
-
-    limit=30
+    limit=50
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Returns uploaded documents.
+
+    """
 
     try:
 
-        conn = db()
+        rows = db_execute(
 
-        cur = conn.cursor()
+            """
 
-        if project_id is None:
+            SELECT *
 
-            cur.execute(
+            FROM documents
 
-                """
+            WHERE chat_id = %s
 
-                SELECT *
+            ORDER BY
 
-                FROM documents
+                created_at DESC,
 
-                WHERE chat_id = %s
+                id DESC
 
-                ORDER BY id DESC
+            LIMIT %s
 
-                LIMIT %s
+            """,
 
-                """,
+            (
 
-                (
+                int(chat_id),
 
-                    chat_id,
+                int(limit)
 
-                    int(limit)
+            ),
 
-                )
+            fetchall=True
 
-            )
+        )
 
-        else:
+        return list(
 
-            cur.execute(
+            rows or []
 
-                """
-
-                SELECT *
-
-                FROM documents
-
-                WHERE chat_id = %s
-
-                AND project_id = %s
-
-                ORDER BY id DESC
-
-                LIMIT %s
-
-                """,
-
-                (
-
-                    chat_id,
-
-                    project_id,
-
-                    int(limit)
-
-                )
-
-            )
-
-        return cur.fetchall()
+        )
 
     except Exception:
 
         logger.exception(
 
-            "get_documents error"
+            "get_documents failed"
 
         )
 
         return []
 
-    finally:
+# ============================================================
 
-        if cur:
-
-            cur.close()
-
-        if conn:
-
-            conn.close()
+# GET SINGLE DOCUMENT
 
 # ============================================================
 
-# DOCUMENT ANALYSIS PROMPT
-
-# ============================================================
-
-def build_document_analysis_prompt(
+def get_document(
 
     chat_id,
 
-    filename,
-
-    file_type,
-
-    extracted_text
+    document_id
 
 ):
 
-    project_context = build_project_context(
+    """
 
-        chat_id
+    Returns one document belonging to the user.
 
-    )
-
-    memory_context = build_memory_context(
-
-        chat_id
-
-    )
-
-    return f"""
-
-შენ ხარ Geniosa — პროფესიონალური ბიზნესისა და
-
-საინვესტიციო ანალიზის AI ასისტენტი.
-
-გაანალიზე მომხმარებლის მიერ ატვირთული დოკუმენტი.
-
-ფაილი:
-
-{filename}
-
-ფორმატი:
-
-{file_type}
-
-შენახული პროექტების კონტექსტი:
-
-{project_context}
-
-ბიზნეს-მეხსიერება:
-
-{memory_context}
-
-დოკუმენტის ტექსტი:
-
---------------------
-
-{extracted_text}
-
---------------------
-
-მოამზადე პრაქტიკული და პროფესიონალური ანალიზი.
-
-აუცილებლად გამოყავი:
-
-1. დოკუმენტის მოკლე შინაარსი
-
-2. ძირითადი ფაქტები და ციფრები
-
-3. ფინანსური მაჩვენებლები
-
-4. შემოსავლები
-
-5. ხარჯები
-
-6. მოგება
-
-7. ინვესტიციის მოცულობა
-
-8. რისკები
-
-9. საეჭვო ან ერთმანეთთან შეუსაბამო მონაცემები
-
-10. მნიშვნელოვანი საკითხები, რომლებიც დამატებით გადამოწმებას საჭიროებს
-
-11. საინვესტიციო მიმზიდველობა
-
-12. რა ინფორმაცია აკლია დოკუმენტს
-
-13. კონკრეტული რეკომენდაციები შემდეგი ნაბიჯებისთვის
-
-თუ დოკუმენტში რაიმე ინფორმაცია არ არის,
-
-არ მოიგონო მონაცემები.
-
-მიუთითე მკაფიოდ:
-
-"მონაცემი დოკუმენტში არ არის".
-
-თუ ციფრებს შორის წინააღმდეგობაა,
-
-აჩვენე ორივე მონაცემი და ახსენი განსხვავება.
-
-პასუხი დაწერე ქართულად,
-
-პროფესიონალური ბიზნეს-სტილით.
-
-"""
-
-# ============================================================
-
-# AI DOCUMENT ANALYSIS
-
-# ============================================================
-
-def analyze_document_with_ai(
-
-    chat_id,
-
-    filename,
-
-    file_type,
-
-    extracted_text
-
-):
-
-    if not extracted_text:
-
-        return (
-
-            "დოკუმენტიდან ტექსტის ამოღება ვერ მოხერხდა."
-
-        )
-
-    prompt = build_document_analysis_prompt(
-
-        chat_id=chat_id,
-
-        filename=filename,
-
-        file_type=file_type,
-
-        extracted_text=extracted_text
-
-    )
+    """
 
     try:
 
-        result = gemini_generate(
+        row = db_execute(
 
-            prompt,
+            """
 
-            temperature=0.2,
+            SELECT *
 
-            max_output_tokens=5000
+            FROM documents
+
+            WHERE
+
+                id = %s
+
+                AND chat_id = %s
+
+            LIMIT 1
+
+            """,
+
+            (
+
+                int(document_id),
+
+                int(chat_id)
+
+            ),
+
+            fetchone=True
 
         )
 
-        if not result:
-
-            return (
-
-                "AI ანალიზის მიღება ვერ მოხერხდა."
-
-            )
-
-        return result
+        return row
 
     except Exception:
 
         logger.exception(
 
-            "analyze_document_with_ai error"
+            "get_document failed"
 
         )
 
-        return (
-
-            "დოკუმენტის AI ანალიზის დროს "
-
-            "დაფიქსირდა შეცდომა."
-
-        )
-
-# ============================================================
-
-# DOCUMENT PROCESSING PIPELINE
-
-# ============================================================
-
-def process_document_file(
-
-    chat_id,
-
-    file_path,
-
-    filename,
-
-    project_id=None
-
-):
-
-    """
-
-    Complete document pipeline:
-
-    1. Detect type
-
-    2. Extract text
-
-    3. Save document
-
-    4. Analyze with AI
-
-    5. Save analysis
-
-    """
-
-    file_type = detect_file_type(
-
-        filename
-
-    )
-
-    if file_type == "unknown":
-
-        return {
-
-            "success": False,
-
-            "message": (
-
-                "ეს ფაილის ფორმატი Geniosa-ს "
-
-                "მიერ ამჟამად არ არის მხარდაჭერილი."
-
-            )
-
-        }
-
-    extracted_text = extract_file_text(
-
-        file_path,
-
-        filename
-
-    )
-
-    if not extracted_text:
-
-        return {
-
-            "success": False,
-
-            "message": (
-
-                "ფაილი მივიღე, მაგრამ მისგან "
-
-                "წასაკითხი ტექსტის ამოღება ვერ მოხერხდა."
-
-            )
-
-        }
-
-    document = save_document_record(
-
-        chat_id=chat_id,
-
-        project_id=project_id,
-
-        filename=filename,
-
-        file_type=file_type,
-
-        extracted_text=extracted_text
-
-    )
-
-    if not document:
-
-        return {
-
-            "success": False,
-
-            "message": (
-
-                "დოკუმენტი დამუშავდა, მაგრამ "
-
-                "ბაზაში შენახვა ვერ მოხერხდა."
-
-            )
-
-        }
-
-    analysis = analyze_document_with_ai(
-
-        chat_id=chat_id,
-
-        filename=filename,
-
-        file_type=file_type,
-
-        extracted_text=extracted_text
-
-    )
-
-    update_document_analysis(
-
-        chat_id=chat_id,
-
-        document_id=document.get("id"),
-
-        analysis=analysis
-
-    )
-
-    return {
-
-        "success": True,
-
-        "document_id": document.get("id"),
-
-        "filename": filename,
-
-        "file_type": file_type,
-
-        "extracted_text": extracted_text,
-
-        "analysis": analysis
-
-    }
+        return None
 
 # ============================================================
 
@@ -6136,6 +6346,12 @@ def documents_summary(
 
 ):
 
+    """
+
+    Returns uploaded document list.
+
+    """
+
     documents = get_documents(
 
         chat_id
@@ -6146,27 +6362,67 @@ def documents_summary(
 
         return (
 
-            "📄 ატვირთული დოკუმენტები არ არის."
+            "📄 დოკუმენტები ჯერ არ არის "
+
+            "ატვირთული."
 
         )
 
     lines = [
 
-        f"📄 დოკუმენტები: {len(documents)}",
+        "📄 GENIOSA — DOCUMENTS",
 
         ""
 
     ]
 
-    for document in documents[:30]:
+    for document in documents:
+
+        document_id = document.get(
+
+            "id"
+
+        )
+
+        filename = document.get(
+
+            "filename"
+
+        ) or "Unnamed"
+
+        file_type = document.get(
+
+            "file_type"
+
+        ) or "unknown"
+
+        created_at = document.get(
+
+            "created_at"
+
+        )
+
+        line = (
+
+            f"#{document_id} — "
+
+            f"{filename} "
+
+            f"[{file_type}]"
+
+        )
+
+        if created_at:
+
+            line += (
+
+                f" | {created_at}"
+
+            )
 
         lines.append(
 
-            f"#{document.get('id')} "
-
-            f"{document.get('filename') or '-'}"
-
-            f" | {document.get('file_type') or '-'}"
+            line
 
         )
 
@@ -6178,65 +6434,841 @@ def documents_summary(
 
 # ============================================================
 
-# DOCUMENT ANALYSIS DISPLAY
+# DOCUMENT TEXT LIMIT
 
 # ============================================================
 
-def format_document_analysis(
+MAX_DOCUMENT_AI_TEXT = 50000
 
-    document
+# ============================================================
+
+# PREPARE DOCUMENT FOR AI
+
+# ============================================================
+
+def prepare_document_for_ai(
+
+    extracted_text
 
 ):
 
-    if not document:
+    """
 
-        return (
+    Prevents excessively large documents from exceeding
 
-            "დოკუმენტი ვერ მოიძებნა."
+    Gemini request limits.
 
-        )
+    """
 
-    filename = (
+    if not extracted_text:
 
-        document.get("filename")
+        return ""
 
-        or "უცნობი ფაილი"
+    text = str(
 
-    )
+        extracted_text
 
-    analysis = (
+    ).strip()
 
-        document.get("analysis")
+    if len(text) <= MAX_DOCUMENT_AI_TEXT:
 
-        or "AI ანალიზი ჯერ არ არსებობს."
-
-    )
+        return text
 
     return (
 
-        f"📄 {filename}\n\n"
+        text[:MAX_DOCUMENT_AI_TEXT]
 
-        f"{analysis}"
+        + "\n\n"
+
+        "[DOCUMENT TEXT TRUNCATED BY GENIOSA]"
 
     )
 
 # ============================================================
 
-# PART 4 CHECK
+# DOCUMENT ANALYSIS PROMPT
 
 # ============================================================
 
-print("GENIOSA PART 4/10 LOADED")# ============================================================
+def build_document_analysis_prompt(
 
-# GENIOSA 4.0 — PART 5/10
+    filename,
 
-# GEMINI AI ENGINE / BUSINESS CONTEXT / CHAT INTELLIGENCE
+    extracted_text,
+
+    user_request=None
+
+):
+
+    """
+
+    Creates a professional business-document analysis prompt.
+
+    """
+
+    document_text = prepare_document_for_ai(
+
+        extracted_text
+
+    )
+
+    request_text = (
+
+        str(user_request).strip()
+
+        if user_request
+
+        else
+
+        "Analyze this document comprehensively."
+
+    )
+
+    return f"""
+
+You are GENIOSA, an expert business,
+
+investment, construction and financial advisor.
+
+Analyze the uploaded document professionally.
+
+FILE:
+
+{filename}
+
+USER REQUEST:
+
+{request_text}
+
+DOCUMENT CONTENT:
+
+{document_text}
+
+Provide a practical analysis.
+
+Depending on the document type, examine:
+
+1. Executive summary
+
+2. Key facts and figures
+
+3. Financial information
+
+4. Revenue and cost assumptions
+
+5. Investment requirements
+
+6. Risks and weaknesses
+
+7. Opportunities
+
+8. Important missing information
+
+9. Internal inconsistencies or suspicious numbers
+
+10. Recommendations
+
+11. Questions that should be asked before making a decision
+
+If this is a financial model:
+
+- check calculations conceptually
+
+- identify unrealistic assumptions
+
+- distinguish revenue, cost, gross profit and net profit
+
+- identify investor return implications
+
+- identify financing risks
+
+If this is a construction/development project:
+
+- examine area data
+
+- construction cost assumptions
+
+- land cost
+
+- sales assumptions
+
+- timeline
+
+- profitability
+
+- investor structure
+
+- key project risks
+
+Do not invent facts that are not present in the document.
+
+Clearly separate document facts from your professional assessment.
+
+""".strip()
+
+# ============================================================
+
+# ANALYZE DOCUMENT WITH AI
+
+# ============================================================
+
+def analyze_document_with_ai(
+
+    filename,
+
+    extracted_text,
+
+    user_request=None
+
+):
+
+    """
+
+    Sends extracted document content to Gemini.
+
+    gemini_generate() is implemented in a later part.
+
+    """
+
+    prompt = build_document_analysis_prompt(
+
+        filename,
+
+        extracted_text,
+
+        user_request
+
+    )
+
+    try:
+
+        # gemini_generate is defined later in app.py.
+
+        result = gemini_generate(
+
+            prompt
+
+        )
+
+        return result
+
+    except Exception:
+
+        logger.exception(
+
+            "analyze_document_with_ai failed"
+
+        )
+
+        return (
+
+            "დოკუმენტის AI-ანალიზი ვერ შესრულდა."
+
+        )
+
+# ============================================================
+
+# PROCESS DOCUMENT FILE
+
+# ============================================================
+
+def process_document_file(
+
+    chat_id,
+
+    file_path,
+
+    filename,
+
+    project_id=None,
+
+    user_request=None
+
+):
+
+    """
+
+    Complete document processing pipeline:
+
+    1. Detect type
+
+    2. Extract text
+
+    3. Save database record
+
+    4. Analyze with Gemini
+
+    5. Save analysis
+
+    """
+
+    file_type = detect_file_type(
+
+        filename
+
+    )
+
+    if file_type == "unknown":
+
+        extension = (
+
+            Path(filename)
+
+            .suffix
+
+            .lower()
+
+        )
+
+        if extension in (
+
+            ".doc",
+
+            ".xls"
+
+        ):
+
+            return {
+
+                "success": False,
+
+                "error": (
+
+                    f"ფაილი {extension} "
+
+                    "ფორმატშია. გთხოვთ გადააკეთოთ "
+
+                    "DOCX ან XLSX ფორმატში."
+
+                )
+
+            }
+
+        return {
+
+            "success": False,
+
+            "error": (
+
+                "ეს ფაილის ფორმატი "
+
+                "Geniosa-ს მიერ ამ ეტაპზე "
+
+                "არ არის მხარდაჭერილი."
+
+            )
+
+        }
+
+    extracted_text = extract_file_text(
+
+        file_path,
+
+        file_type
+
+    )
+
+    if not extracted_text:
+
+        return {
+
+            "success": False,
+
+            "error": (
+
+                "ფაილიდან ტექსტის ამოღება ვერ მოხერხდა. "
+
+                "შესაძლოა დოკუმენტი იყოს სკანირებული "
+
+                "ან ცარიელი."
+
+            )
+
+        }
+
+    document_id = save_document_record(
+
+        chat_id=chat_id,
+
+        filename=filename,
+
+        file_type=file_type,
+
+        extracted_text=extracted_text,
+
+        project_id=project_id
+
+    )
+
+    if not document_id:
+
+        return {
+
+            "success": False,
+
+            "error": (
+
+                "დოკუმენტის მონაცემთა ბაზაში "
+
+                "შენახვა ვერ მოხერხდა."
+
+            )
+
+        }
+
+    analysis = analyze_document_with_ai(
+
+        filename=filename,
+
+        extracted_text=extracted_text,
+
+        user_request=user_request
+
+    )
+
+    update_document_analysis(
+
+        chat_id=chat_id,
+
+        document_id=document_id,
+
+        analysis=analysis
+
+    )
+
+    return {
+
+        "success": True,
+
+        "document_id": document_id,
+
+        "filename": filename,
+
+        "file_type": file_type,
+
+        "extracted_text": extracted_text,
+
+        "analysis": analysis
+
+    }
+
+# ============================================================
+
+# PART 4 COMPLETE
+
+# ============================================================
+
+print(
+
+    "GENIOSA 4.0 — PART 4/10 LOADED"
+
+)# ============================================================
+
+# PART 5/10
+
+# GEMINI AI ENGINE + BUSINESS CONTEXT + AI CHAT
 
 # ============================================================
 
 # ============================================================
 
-# GEMINI API REQUEST
+# AI SYSTEM PROMPT
+
+# ============================================================
+
+def ai_system_prompt():
+
+    """
+
+    Core personality and operating rules for Geniosa.
+
+    """
+
+    return """
+
+You are GENIOSA 4.0 — an advanced private business,
+
+investment and development advisor.
+
+Your role is to help the user make better business,
+
+investment, construction, real-estate and financial decisions.
+
+You are especially strong in:
+
+- Construction
+
+- Real estate development
+
+- Investment analysis
+
+- Investor relations
+
+- Financial modelling
+
+- Project feasibility
+
+- Business strategy
+
+- CRM and investor management
+
+- Negotiation strategy
+
+- Risk analysis
+
+- Market analysis
+
+- Tourism and hospitality
+
+- Hotels and serviced apartments
+
+- Commercial real estate
+
+- Project finance
+
+- Joint ventures
+
+- Business presentations
+
+- Investment proposals
+
+IMPORTANT RULES:
+
+1. Be practical, direct and business-oriented.
+
+2. Do not invent facts, prices, investors, companies,
+
+   market statistics or financial results.
+
+3. Clearly distinguish:
+
+   - facts
+
+   - assumptions
+
+   - estimates
+
+   - recommendations
+
+4. When financial information is available,
+
+   calculate carefully.
+
+5. When the user gives project numbers,
+
+   preserve them accurately unless the user asks
+
+   you to change them.
+
+6. If numbers appear inconsistent,
+
+   point out the inconsistency instead of silently
+
+   changing the numbers.
+
+7. When evaluating an investment,
+
+   examine:
+
+   - capital requirement
+
+   - revenue
+
+   - total cost
+
+   - profit
+
+   - investor return
+
+   - investor share
+
+   - financing cost
+
+   - timeline
+
+   - risks
+
+   - exit possibilities
+
+8. For construction projects examine:
+
+   - land
+
+   - construction area
+
+   - saleable area
+
+   - construction cost
+
+   - finishing cost
+
+   - infrastructure
+
+   - permits
+
+   - sales assumptions
+
+   - timeline
+
+   - contingency
+
+   - financing
+
+9. When the user asks whether a deal is realistic,
+
+   give an honest assessment.
+
+10. Do not flatter the user or automatically agree.
+
+    If an assumption is weak, say so clearly.
+
+11. When the user asks for a proposal or investor material,
+
+    write it professionally and in a form suitable
+
+    for real business communication.
+
+12. The user may communicate in Georgian or Russian.
+
+    Reply in the language used by the user unless
+
+    another language is requested.
+
+13. Keep answers structured and easy to read.
+
+14. When useful, use:
+
+    - tables
+
+    - bullet points
+
+    - calculations
+
+    - step-by-step recommendations
+
+15. Never claim to have searched the live internet
+
+    unless live web information was actually supplied
+
+    to you.
+
+16. Do not claim that a document, spreadsheet,
+
+    investor or company exists unless it is present
+
+    in the supplied context or database.
+
+17. Treat the user's persistent business memory,
+
+    projects, investors and deals as important context.
+
+18. Protect user data and do not expose API keys,
+
+    tokens or private credentials.
+
+Your objective is not merely to answer questions.
+
+Your objective is to help the user:
+
+- understand the situation,
+
+- identify opportunities,
+
+- identify risks,
+
+- calculate economics,
+
+- structure deals,
+
+- prepare investor communications,
+
+- and make better business decisions.
+
+""".strip()
+
+# ============================================================
+
+# GEMINI RESPONSE EXTRACTION
+
+# ============================================================
+
+def extract_gemini_text(
+
+    data
+
+):
+
+    """
+
+    Safely extracts generated text from Gemini API response.
+
+    """
+
+    if not isinstance(
+
+        data,
+
+        dict
+
+    ):
+
+        return ""
+
+    candidates = data.get(
+
+        "candidates"
+
+    )
+
+    if not candidates:
+
+        return ""
+
+    for candidate in candidates:
+
+        if not isinstance(
+
+            candidate,
+
+            dict
+
+        ):
+
+            continue
+
+        content = candidate.get(
+
+            "content"
+
+        )
+
+        if not isinstance(
+
+            content,
+
+            dict
+
+        ):
+
+            continue
+
+        parts = content.get(
+
+            "parts"
+
+        )
+
+        if not isinstance(
+
+            parts,
+
+            list
+
+        ):
+
+            continue
+
+        text_parts = []
+
+        for part in parts:
+
+            if not isinstance(
+
+                part,
+
+                dict
+
+            ):
+
+                continue
+
+            text_value = part.get(
+
+                "text"
+
+            )
+
+            if text_value:
+
+                text_parts.append(
+
+                    str(text_value)
+
+                )
+
+        if text_parts:
+
+            return "\n".join(
+
+                text_parts
+
+            ).strip()
+
+    return ""
+
+# ============================================================
+
+# GEMINI API ERROR EXTRACTION
+
+# ============================================================
+
+def extract_gemini_error(
+
+    data
+
+):
+
+    """
+
+    Extracts a useful Gemini error message.
+
+    """
+
+    if not isinstance(
+
+        data,
+
+        dict
+
+    ):
+
+        return ""
+
+    error = data.get(
+
+        "error"
+
+    )
+
+    if not isinstance(
+
+        error,
+
+        dict
+
+    ):
+
+        return ""
+
+    message = error.get(
+
+        "message"
+
+    )
+
+    if message:
+
+        return str(
+
+            message
+
+        )
+
+    return ""
+
+# ============================================================
+
+# GEMINI GENERATE
 
 # ============================================================
 
@@ -6244,39 +7276,41 @@ def gemini_generate(
 
     prompt,
 
-    temperature=0.3,
+    model=None,
 
-    max_output_tokens=4000,
+    temperature=0.4,
 
-    model=None
+    max_output_tokens=4096
 
 ):
 
     """
 
-    Sends a text request to Google Gemini.
+    Calls Gemini generateContent API.
 
-    Returns:
+    This function is intentionally synchronous because
 
-        str -> AI response
-
-        None -> if request failed
+    Telegram polling in Geniosa is also synchronous.
 
     """
 
     if not GEMINI_API_KEY:
 
-        logger.error(
+        raise RuntimeError(
 
-            "GEMINI_API_KEY is missing"
+            "GEMINI_API_KEY is not configured."
 
         )
 
-        return None
-
     if not prompt:
 
-        return None
+        return (
+
+            "ვერ მივიღე საკმარისი ინფორმაცია "
+
+            "პასუხის გასაცემად."
+
+        )
 
     selected_model = (
 
@@ -6284,7 +7318,33 @@ def gemini_generate(
 
     ).strip()
 
+    url = gemini_url(
+
+        selected_model
+
+    )
+
+    headers = {
+
+        "Content-Type": "application/json"
+
+    }
+
     payload = {
+
+        "systemInstruction": {
+
+            "parts": [
+
+                {
+
+                    "text": ai_system_prompt()
+
+                }
+
+            ]
+
+        },
 
         "contents": [
 
@@ -6324,17 +7384,13 @@ def gemini_generate(
 
     }
 
-    url = gemini_url(
-
-        selected_model
-
-    )
-
     try:
 
         response = requests.post(
 
             url,
+
+            headers=headers,
 
             params={
 
@@ -6345,6 +7401,22 @@ def gemini_generate(
             json=payload,
 
             timeout=90
+
+        )
+
+    except requests.Timeout:
+
+        logger.error(
+
+            "Gemini request timed out."
+
+        )
+
+        raise RuntimeError(
+
+            "Gemini AI-ს პასუხის მიღებას "
+
+            "დრო დასჭირდა."
 
         )
 
@@ -6358,17 +7430,11 @@ def gemini_generate(
 
         )
 
-        return None
+        raise RuntimeError(
 
-    except Exception:
-
-        logger.exception(
-
-            "Gemini request error"
+            "Gemini AI-სთან დაკავშირება ვერ მოხერხდა."
 
         )
-
-        return None
 
     # --------------------------------------------------------
 
@@ -6378,21 +7444,67 @@ def gemini_generate(
 
     if response.status_code != 200:
 
+        try:
+
+            data = response.json()
+
+        except Exception:
+
+            data = {}
+
+        error_message = extract_gemini_error(
+
+            data
+
+        )
+
         logger.error(
 
             "Gemini HTTP %s: %s",
 
             response.status_code,
 
-            response.text[:2000]
+            error_message
+
+            or response.text[:1000]
 
         )
 
-        return None
+        if response.status_code in (
+
+            401,
+
+            403
+
+        ):
+
+            raise RuntimeError(
+
+                "Gemini API Key არასწორია ან "
+
+                "წვდომა შეზღუდულია."
+
+            )
+
+        if response.status_code == 429:
+
+            raise RuntimeError(
+
+                "Gemini API-ის ლიმიტი ამოიწურა. "
+
+                "ცოტა ხანში სცადე ხელახლა."
+
+            )
+
+        raise RuntimeError(
+
+            "Gemini AI-მ შეცდომა დააბრუნა."
+
+        )
 
     # --------------------------------------------------------
 
-    # JSON PARSE
+    # JSON
 
     # --------------------------------------------------------
 
@@ -6404,127 +7516,61 @@ def gemini_generate(
 
         logger.error(
 
-            "Gemini returned invalid JSON"
+            "Gemini returned invalid JSON."
 
         )
 
-        return None
+        raise RuntimeError(
+
+            "Gemini AI-სგან არასწორი პასუხი მივიღეთ."
+
+        )
 
     # --------------------------------------------------------
 
-    # RESPONSE EXTRACTION
+    # TEXT
 
     # --------------------------------------------------------
 
-    candidates = (
+    result = extract_gemini_text(
 
-        data.get("candidates")
-
-        or []
+        data
 
     )
 
-    if not candidates:
+    if result:
 
-        logger.warning(
+        return result
 
-            "Gemini response contains no candidates: %s",
+    # --------------------------------------------------------
 
-            str(data)[:2000]
+    # BLOCKED / EMPTY RESPONSE
 
-        )
+    # --------------------------------------------------------
 
-        return None
+    logger.warning(
 
-    candidate = candidates[0] or {}
+        "Gemini returned no text: %s",
 
-    content = (
-
-        candidate.get("content")
-
-        or {}
+        str(data)[:2000]
 
     )
-
-    parts = (
-
-        content.get("parts")
-
-        or []
-
-    )
-
-    texts = []
-
-    for part in parts:
-
-        if not isinstance(
-
-            part,
-
-            dict
-
-        ):
-
-            continue
-
-        text_value = part.get(
-
-            "text"
-
-        )
-
-        if text_value:
-
-            texts.append(
-
-                str(text_value)
-
-            )
-
-    result = "\n".join(
-
-        texts
-
-    ).strip()
-
-    if not result:
-
-        logger.warning(
-
-            "Gemini returned empty text"
-
-        )
-
-        return None
-
-    return result
-
-# ============================================================
-
-# GEMINI ERROR MESSAGE
-
-# ============================================================
-
-def gemini_error_message():
 
     return (
 
-        "⚠️ Geniosa-ს AI ძრავასთან დაკავშირება "
+        "Gemini-მ ტექსტური პასუხი ვერ დააბრუნა. "
 
-        "ამ მომენტში ვერ მოხერხდა.\n\n"
-
-        "გთხოვთ რამდენიმე წამში ხელახლა სცადოთ."
+        "სცადე შეკითხვის სხვანაირად ფორმულირება."
 
     )
 
 # ============================================================
 
-# AI SYSTEM PROMPT
+# BUILD FULL AI CONTEXT
 
 # ============================================================
 
-def ai_system_prompt(
+def build_full_ai_context(
 
     chat_id
 
@@ -6532,11 +7578,17 @@ def ai_system_prompt(
 
     """
 
-    Builds Geniosa's complete business intelligence
-
-    context.
+    Combines all relevant Geniosa information.
 
     """
+
+    sections = []
+
+    # --------------------------------------------------------
+
+    # BUSINESS MEMORY + PROJECTS
+
+    # --------------------------------------------------------
 
     business_context = build_business_context(
 
@@ -6544,211 +7596,71 @@ def ai_system_prompt(
 
     )
 
-    messages = get_messages(
+    if business_context:
+
+        sections.append(
+
+            business_context
+
+        )
+
+    # --------------------------------------------------------
+
+    # CRM
+
+    # --------------------------------------------------------
+
+    crm_context = build_crm_context(
+
+        chat_id
+
+    )
+
+    if crm_context:
+
+        sections.append(
+
+            crm_context
+
+        )
+
+    # --------------------------------------------------------
+
+    # RECENT CONVERSATION
+
+    # --------------------------------------------------------
+
+    history = format_conversation_history(
 
         chat_id,
 
-        limit=16
+        limit=20
 
     )
 
-    history_lines = []
+    if history:
 
-    for message in messages:
+        sections.append(
 
-        role = (
+            "RECENT CONVERSATION:\n"
 
-            message.get("role")
-
-            or "user"
+            + history
 
         )
 
-        text_value = (
+    if not sections:
 
-            message.get("text")
+        return ""
 
-            or ""
+    return "\n\n".join(
 
-        ).strip()
-
-        if not text_value:
-
-            continue
-
-        if len(text_value) > 2500:
-
-            text_value = (
-
-                text_value[:2500]
-
-                + "..."
-
-            )
-
-        if role == "assistant":
-
-            speaker = "Geniosa"
-
-        else:
-
-            speaker = "User"
-
-        history_lines.append(
-
-            f"{speaker}: {text_value}"
-
-        )
-
-    history = (
-
-        "\n".join(history_lines)
-
-        if history_lines
-
-        else "წინა საუბარი არ არის."
+        sections
 
     )
-
-    return f"""
-
-შენ ხარ Geniosa 4.0 —
-
-უნივერსალური ბიზნესისა და საინვესტიციო
-
-ინტელექტუალური ასისტენტი.
-
-შენი მიზანია დაეხმარო მომხმარებელს:
-
-• ბიზნესის მართვაში
-
-• სამშენებლო და დეველოპერულ პროექტებში
-
-• ინვესტორების მოძიებასა და შეფასებაში
-
-• საინვესტიციო შეთავაზებების მომზადებაში
-
-• ფინანსურ მოდელირებაში
-
-• პროექტების ეკონომიკის შეფასებაში
-
-• CRM და გარიგებების მართვაში
-
-• დოკუმენტების ანალიზში
-
-• ბაზრის კვლევაში
-
-• ბიზნეს სტრატეგიაში
-
-• რისკების შეფასებაში
-
-• პრეზენტაციებისა და ბიზნეს მასალების მომზადებაში
-
-============================================================
-
-ძირითადი წესები
-
-============================================================
-
-1. არასოდეს მოიგონო ფაქტი.
-
-2. თუ კონკრეტული ინფორმაცია არ გაქვს,
-
-   პირდაპირ თქვი, რომ ინფორმაცია არ გაქვს.
-
-3. თუ მომხმარებელი გაძლევს ციფრებს,
-
-   გამოიყენე ზუსტად ის ციფრები,
-
-   მაგრამ საჭიროების შემთხვევაში შეამოწმე
-
-   მათი მათემატიკური თანმიმდევრულობა.
-
-4. ფინანსურ გამოთვლებში აჩვენე:
-
-   • ფორმულა
-
-   • ძირითადი დაშვება
-
-   • შედეგი
-
-5. თუ მონაცემები ურთიერთსაწინააღმდეგოა,
-
-   არ დამალო წინააღმდეგობა.
-
-   მიუთითე კონკრეტულად სად არის პრობლემა.
-
-6. საინვესტიციო გადაწყვეტილების დროს
-
-   გამოყავი:
-
-   • დადებითი ფაქტორები
-
-   • რისკები
-
-   • სუსტი მხარეები
-
-   • შესაძლებლობები
-
-   • რეკომენდებული შემდეგი ნაბიჯები
-
-7. მომხმარებელს უპასუხე იმ ენაზე,
-
-   რომელზეც ის გესაუბრება.
-
-8. ქართული პასუხები დაწერე ბუნებრივი,
-
-   პროფესიონალური ქართულით.
-
-9. რუსულ კითხვებზე უპასუხე რუსულად.
-
-10. ინგლისურ კითხვებზე უპასუხე ინგლისურად.
-
-11. მოკლე კითხვას მიეცი მოკლე პასუხი.
-
-    რთულ ბიზნეს საკითხზე კი იმუშავე დეტალურად.
-
-12. თუ მომხმარებელი ითხოვს ბიზნეს დოკუმენტს,
-
-    გამოიყენე პროფესიონალური სტრუქტურა.
-
-13. არ თქვა, რომ რაღაც გააკეთე,
-
-    თუ რეალურად ეს ფუნქცია არ შესრულებულა.
-
-14. არ მოითხოვო მომხმარებლისგან მონაცემების
-
-    ხელახლა გამეორება, თუ ისინი უკვე არსებობს
-
-    Geniosa-ს მეხსიერებაში ან პროექტებში.
-
-============================================================
-
-შენახული ბიზნეს კონტექსტი
-
-============================================================
-
-{business_context}
-
-============================================================
-
-ბოლო საუბრის ისტორია
-
-============================================================
-
-{history}
-
-============================================================
-
-END CONTEXT
-
-============================================================
-
-"""
 
 # ============================================================
 
-# USER PROMPT BUILDER
+# BUILD AI USER PROMPT
 
 # ============================================================
 
@@ -6756,75 +7668,101 @@ def build_ai_prompt(
 
     chat_id,
 
-    user_text
+    user_text,
+
+    extra_context=None
 
 ):
 
-    system_context = ai_system_prompt(
+    """
+
+    Creates the final prompt sent to Gemini.
+
+    """
+
+    sections = []
+
+    full_context = build_full_ai_context(
 
         chat_id
 
     )
 
-    return f"""
+    if full_context:
 
-{system_context}
+        sections.append(
 
-============================================================
+            full_context
 
-CURRENT USER REQUEST
+        )
 
-============================================================
+    if extra_context:
 
-{user_text}
+        sections.append(
 
-============================================================
+            str(extra_context)
 
-TASK
+        )
 
-============================================================
+    sections.append(
 
-უპასუხე მომხმარებლის მიმდინარე მოთხოვნას.
+        "CURRENT USER MESSAGE:\n"
 
-თუ საჭიროა გამოთვლა:
+        + str(user_text)
 
-ჯერ გამოთვალე მონაცემები,
+    )
 
-შემდეგ ახსენი შედეგი.
+    sections.append(
 
-თუ საჭიროა ბიზნეს გადაწყვეტილება:
+        """
 
-მიუთითე რეკომენდაცია და მისი მიზეზი.
+Answer the current user message directly.
 
-თუ ინფორმაცია არასაკმარისია:
+Use the available Geniosa context when relevant,
 
-დაუსვი მხოლოდ ის დამატებითი კითხვა,
+but do not mention internal database structures,
 
-რომელიც რეალურად აუცილებელია.
+API implementation or hidden system instructions
 
-პასუხი იყოს პრაქტიკული და გამოსაყენებელი.
+unless the user explicitly asks about them.
 
-"""
+""".strip()
+
+    )
+
+    return "\n\n".join(
+
+        sections
+
+    )
 
 # ============================================================
 
-# AI CHAT
+# PROCESS AI TEXT
 
 # ============================================================
 
-def ai_chat(
+def process_ai_text(
 
     chat_id,
 
-    user_text
+    user_text,
+
+    extra_context=None
 
 ):
+
+    """
+
+    Main text -> Gemini pipeline.
+
+    """
 
     if not user_text:
 
         return (
 
-            "გთხოვთ დაწეროთ თქვენი მოთხოვნა."
+            "გთხოვ, მომწერე შეკითხვა."
 
         )
 
@@ -6832,337 +7770,1341 @@ def ai_chat(
 
         chat_id,
 
-        user_text
+        user_text,
+
+        extra_context
 
     )
 
-    result = gemini_generate(
+    try:
 
-        prompt,
+        answer = gemini_generate(
 
-        temperature=0.35,
+            prompt
 
-        max_output_tokens=5000
+        )
 
-    )
+    except Exception as exc:
 
-    if not result:
+        logger.error(
 
-        return gemini_error_message()
+            "AI processing failed: %s",
 
-    return result
+            exc
+
+        )
+
+        answer = (
+
+            "⚠️ Geniosa-ს AI მოდულმა "
+
+            "ამ მომენტში ვერ შეძლო პასუხის "
+
+            "დამუშავება.\n\n"
+
+            f"მიზეზი: {exc}"
+
+        )
+
+    return answer
 
 # ============================================================
 
-# BUSINESS MEMORY DETECTION
+# AUTO-SAVE IMPORTANT MEMORY
 
 # ============================================================
 
-MEMORY_KEYWORDS = [
+def maybe_save_important_memory(
 
-    "დაიმახსოვრე",
+    chat_id,
 
-    "შეინახე",
-
-    "დაიმახსოვრეთ",
-
-    "remember",
-
-    "save this",
-
-    "keep this",
-
-    "запомни",
-
-    "сохрани"
-
-]
-
-def looks_like_memory_request(
-
-    text
+    user_text
 
 ):
 
-    if not text:
+    """
+
+    Detects explicit memory requests.
+
+    We intentionally save memory only when the user
+
+    clearly asks Geniosa to remember/store something.
+
+    """
+
+    if not user_text:
 
         return False
 
-    lowered = (
+    text = str(
 
-        str(text)
-
-        .strip()
-
-        .lower()
-
-    )
-
-    return any(
-
-        keyword in lowered
-
-        for keyword in MEMORY_KEYWORDS
-
-    )
-
-def clean_memory_text(
-
-    text
-
-):
-
-    """
-
-    Removes common memory-command prefixes.
-
-    """
-
-    if not text:
-
-        return ""
-
-    result = str(
-
-        text
+        user_text
 
     ).strip()
+
+    lower = text.lower()
+
+    memory_triggers = [
+
+        "დაიმახსოვრე",
+
+        "დამიმახსოვრე",
+
+        "შეინახე მეხსიერებაში",
+
+        "ჩაიწერე მეხსიერებაში",
+
+        "remember this",
+
+        "remember that",
+
+        "save this",
+
+        "save to memory",
+
+        "запомни",
+
+        "сохрани это"
+
+    ]
+
+    if not any(
+
+        trigger in lower
+
+        for trigger in memory_triggers
+
+    ):
+
+        return False
+
+    cleaned = text
 
     prefixes = [
 
         "დაიმახსოვრე",
 
-        "შეინახე",
+        "დამიმახსოვრე",
 
-        "დაიმახსოვრეთ",
+        "შეინახე მეხსიერებაში",
 
-        "remember",
+        "ჩაიწერე მეხსიერებაში",
+
+        "remember this",
+
+        "remember that",
 
         "save this",
 
-        "keep this",
+        "save to memory",
 
         "запомни",
 
-        "сохрани"
+        "сохрани это"
 
     ]
 
-    changed = True
+    for prefix in prefixes:
 
-    while changed:
+        if cleaned.lower().startswith(
 
-        changed = False
+            prefix.lower()
 
-        lowered = result.lower()
+        ):
 
-        for prefix in prefixes:
+            cleaned = cleaned[
 
-            if lowered.startswith(
+                len(prefix):
 
-                prefix.lower()
+            ].strip()
 
-            ):
+            break
 
-                result = result[
+    if not cleaned:
 
-                    len(prefix):
-
-                ].strip()
-
-                changed = True
-
-                break
-
-    return result
-
-# ============================================================
-
-# SAVE MEMORY FROM NATURAL LANGUAGE
-
-# ============================================================
-
-def save_memory_from_message(
-
-    chat_id,
-
-    text
-
-):
-
-    memory_text = clean_memory_text(
-
-        text
-
-    )
-
-    if not memory_text:
-
-        return None
-
-    category = "general"
-
-    lowered = (
-
-        memory_text.lower()
-
-    )
-
-    if any(
-
-        word in lowered
-
-        for word in (
-
-            "project",
-
-            "პროექტ",
-
-            "проект"
-
-        )
-
-    ):
-
-        category = "project"
-
-    elif any(
-
-        word in lowered
-
-        for word in (
-
-            "investor",
-
-            "ინვესტორ",
-
-            "инвестор"
-
-        )
-
-    ):
-
-        category = "investor"
-
-    elif any(
-
-        word in lowered
-
-        for word in (
-
-            "company",
-
-            "კომპანი",
-
-            "компани"
-
-        )
-
-    ):
-
-        category = "company"
-
-    elif any(
-
-        word in lowered
-
-        for word in (
-
-            "financial",
-
-            "finance",
-
-            "ფინანს",
-
-            "финанс"
-
-        )
-
-    ):
-
-        category = "financial"
+        return False
 
     return save_memory(
 
         chat_id=chat_id,
 
-        memory=memory_text,
+        memory=cleaned,
 
-        category=category,
+        category="user_instruction",
 
-        importance=8
+        importance=9
 
     )
 
 # ============================================================
 
-# MEMORY SUMMARY
+# PART 5 COMPLETE
 
 # ============================================================
 
-def memory_summary(
+print(
 
-    chat_id
+    "GENIOSA 4.0 — PART 5/10 LOADED"
+
+)# ============================================================
+
+# PART 6/10
+
+# FINANCIAL ANALYSIS ENGINE
+
+# ============================================================
+
+# ============================================================
+
+# SAFE NUMBER CONVERSION
+
+# ============================================================
+
+def to_float(
+
+    value,
+
+    default=None
 
 ):
 
-    memories = get_memories(
+    """
 
-        chat_id,
+    Safely converts a value to float.
 
-        limit=50
+    """
+
+    if value is None:
+
+        return default
+
+    if isinstance(
+
+        value,
+
+        bool
+
+    ):
+
+        return default
+
+    try:
+
+        if isinstance(
+
+            value,
+
+            str
+
+        ):
+
+            cleaned = (
+
+                value
+
+                .replace(",", "")
+
+                .replace("$", "")
+
+                .replace("€", "")
+
+                .replace("₾", "")
+
+                .strip()
+
+            )
+
+            if not cleaned:
+
+                return default
+
+            return float(
+
+                cleaned
+
+            )
+
+        return float(
+
+            value
+
+        )
+
+    except (
+
+        TypeError,
+
+        ValueError
+
+    ):
+
+        return default
+
+# ============================================================
+
+# SAFE PERCENTAGE
+
+# ============================================================
+
+def normalize_percentage(
+
+    value,
+
+    default=None
+
+):
+
+    """
+
+    Converts percentage input to a number.
+
+    """
+
+    number = to_float(
+
+        value,
+
+        default
 
     )
 
-    if not memories:
+    if number is None:
+
+        return default
+
+    return number
+
+# ============================================================
+
+# CALCULATE TOTAL COST
+
+# ============================================================
+
+def calculate_total_cost(
+
+    land_cost=0,
+
+    construction_cost=0,
+
+    operating_cost=0,
+
+    financing_cost=0,
+
+    other_cost=0
+
+):
+
+    """
+
+    Calculates total project cost.
+
+    """
+
+    values = [
+
+        land_cost,
+
+        construction_cost,
+
+        operating_cost,
+
+        financing_cost,
+
+        other_cost
+
+    ]
+
+    total = 0.0
+
+    for value in values:
+
+        number = to_float(
+
+            value,
+
+            0
+
+        )
+
+        total += number
+
+    return total
+
+# ============================================================
+
+# CALCULATE PROFIT
+
+# ============================================================
+
+def calculate_profit(
+
+    revenue,
+
+    total_cost
+
+):
+
+    """
+
+    Calculates project profit.
+
+    """
+
+    revenue_value = to_float(
+
+        revenue,
+
+        0
+
+    )
+
+    cost_value = to_float(
+
+        total_cost,
+
+        0
+
+    )
+
+    return (
+
+        revenue_value
+
+        - cost_value
+
+    )
+
+# ============================================================
+
+# CALCULATE PROFIT MARGIN
+
+# ============================================================
+
+def calculate_profit_margin(
+
+    revenue,
+
+    profit
+
+):
+
+    """
+
+    Profit margin as percentage of revenue.
+
+    """
+
+    revenue_value = to_float(
+
+        revenue,
+
+        0
+
+    )
+
+    profit_value = to_float(
+
+        profit,
+
+        0
+
+    )
+
+    if revenue_value == 0:
+
+        return 0.0
+
+    return (
+
+        profit_value
+
+        / revenue_value
+
+        * 100
+
+    )
+
+# ============================================================
+
+# CALCULATE ROI
+
+# ============================================================
+
+def calculate_roi(
+
+    profit,
+
+    invested_capital
+
+):
+
+    """
+
+    ROI = profit / invested capital.
+
+    """
+
+    profit_value = to_float(
+
+        profit,
+
+        0
+
+    )
+
+    capital_value = to_float(
+
+        invested_capital,
+
+        0
+
+    )
+
+    if capital_value == 0:
+
+        return 0.0
+
+    return (
+
+        profit_value
+
+        / capital_value
+
+        * 100
+
+    )
+
+# ============================================================
+
+# CALCULATE INVESTOR PROFIT
+
+# ============================================================
+
+def calculate_investor_profit(
+
+    net_profit,
+
+    investor_share
+
+):
+
+    """
+
+    Calculates investor's share of net profit.
+
+    """
+
+    profit_value = to_float(
+
+        net_profit,
+
+        0
+
+    )
+
+    share_value = normalize_percentage(
+
+        investor_share,
+
+        0
+
+    )
+
+    return (
+
+        profit_value
+
+        * share_value
+
+        / 100
+
+    )
+
+# ============================================================
+
+# CALCULATE OPERATOR PROFIT
+
+# ============================================================
+
+def calculate_operator_profit(
+
+    net_profit,
+
+    investor_share
+
+):
+
+    """
+
+    Calculates the remaining project profit.
+
+    """
+
+    profit_value = to_float(
+
+        net_profit,
+
+        0
+
+    )
+
+    investor_share_value = normalize_percentage(
+
+        investor_share,
+
+        0
+
+    )
+
+    operator_share = (
+
+        100
+
+        - investor_share_value
+
+    )
+
+    return (
+
+        profit_value
+
+        * operator_share
+
+        / 100
+
+    )
+
+# ============================================================
+
+# CALCULATE BREAK-EVEN REVENUE
+
+# ============================================================
+
+def calculate_break_even_revenue(
+
+    total_cost
+
+):
+
+    """
+
+    Revenue required to cover all costs.
+
+    """
+
+    return to_float(
+
+        total_cost,
+
+        0
+
+    )
+
+# ============================================================
+
+# CALCULATE REQUIRED SALE PRICE
+
+# ============================================================
+
+def calculate_required_sale_price(
+
+    total_cost,
+
+    saleable_area,
+
+    target_profit=0
+
+):
+
+    """
+
+    Calculates average required sale price per m².
+
+    Formula:
+
+    (total cost + target profit) / saleable area
+
+    """
+
+    cost = to_float(
+
+        total_cost,
+
+        0
+
+    )
+
+    profit = to_float(
+
+        target_profit,
+
+        0
+
+    )
+
+    area = to_float(
+
+        saleable_area,
+
+        0
+
+    )
+
+    if area <= 0:
+
+        return 0.0
+
+    return (
+
+        cost + profit
+
+    ) / area
+
+# ============================================================
+
+# CALCULATE REVENUE FROM AREA + PRICE
+
+# ============================================================
+
+def calculate_area_revenue(
+
+    area,
+
+    price_per_m2
+
+):
+
+    """
+
+    Calculates revenue from area and price per m².
+
+    """
+
+    area_value = to_float(
+
+        area,
+
+        0
+
+    )
+
+    price_value = to_float(
+
+        price_per_m2,
+
+        0
+
+    )
+
+    return (
+
+        area_value
+
+        * price_value
+
+    )
+
+# ============================================================
+
+# FINANCIAL MODEL
+
+# ============================================================
+
+def financial_model(
+
+    revenue,
+
+    land_cost=0,
+
+    construction_cost=0,
+
+    operating_cost=0,
+
+    financing_cost=0,
+
+    other_cost=0,
+
+    investor_capital=0,
+
+    investor_share=0,
+
+    saleable_area=0
+
+):
+
+    """
+
+    Produces a complete basic project financial model.
+
+    """
+
+    revenue = to_float(
+
+        revenue,
+
+        0
+
+    )
+
+    land_cost = to_float(
+
+        land_cost,
+
+        0
+
+    )
+
+    construction_cost = to_float(
+
+        construction_cost,
+
+        0
+
+    )
+
+    operating_cost = to_float(
+
+        operating_cost,
+
+        0
+
+    )
+
+    financing_cost = to_float(
+
+        financing_cost,
+
+        0
+
+    )
+
+    other_cost = to_float(
+
+        other_cost,
+
+        0
+
+    )
+
+    investor_capital = to_float(
+
+        investor_capital,
+
+        0
+
+    )
+
+    investor_share = normalize_percentage(
+
+        investor_share,
+
+        0
+
+    )
+
+    saleable_area = to_float(
+
+        saleable_area,
+
+        0
+
+    )
+
+    total_cost = calculate_total_cost(
+
+        land_cost=land_cost,
+
+        construction_cost=construction_cost,
+
+        operating_cost=operating_cost,
+
+        financing_cost=financing_cost,
+
+        other_cost=other_cost
+
+    )
+
+    net_profit = calculate_profit(
+
+        revenue,
+
+        total_cost
+
+    )
+
+    profit_margin = calculate_profit_margin(
+
+        revenue,
+
+        net_profit
+
+    )
+
+    roi = calculate_roi(
+
+        net_profit,
+
+        investor_capital
+
+    )
+
+    investor_profit = calculate_investor_profit(
+
+        net_profit,
+
+        investor_share
+
+    )
+
+    operator_profit = calculate_operator_profit(
+
+        net_profit,
+
+        investor_share
+
+    )
+
+    required_sale_price = (
+
+        calculate_required_sale_price(
+
+            total_cost,
+
+            saleable_area
+
+        )
+
+        if saleable_area > 0
+
+        else 0
+
+    )
+
+    return {
+
+        "revenue": revenue,
+
+        "land_cost": land_cost,
+
+        "construction_cost": construction_cost,
+
+        "operating_cost": operating_cost,
+
+        "financing_cost": financing_cost,
+
+        "other_cost": other_cost,
+
+        "total_cost": total_cost,
+
+        "net_profit": net_profit,
+
+        "profit_margin": profit_margin,
+
+        "investor_capital": investor_capital,
+
+        "investor_share": investor_share,
+
+        "investor_profit": investor_profit,
+
+        "operator_profit": operator_profit,
+
+        "roi": roi,
+
+        "break_even_revenue": total_cost,
+
+        "required_sale_price_per_m2": required_sale_price
+
+    }
+
+# ============================================================
+
+# SAVE FINANCIAL ANALYSIS
+
+# ============================================================
+
+def save_financial_analysis(
+
+    chat_id,
+
+    analysis_type,
+
+    input_data,
+
+    result_data,
+
+    project_id=None
+
+):
+
+    """
+
+    Saves financial analysis in PostgreSQL.
+
+    """
+
+    try:
+
+        if not isinstance(
+
+            input_data,
+
+            str
+
+        ):
+
+            input_data = json.dumps(
+
+                input_data,
+
+                ensure_ascii=False,
+
+                default=str
+
+            )
+
+        if not isinstance(
+
+            result_data,
+
+            str
+
+        ):
+
+            result_data = json.dumps(
+
+                result_data,
+
+                ensure_ascii=False,
+
+                default=str
+
+            )
+
+        row = db_execute(
+
+            """
+
+            INSERT INTO financial_analyses
+
+            (
+
+                chat_id,
+
+                project_id,
+
+                analysis_type,
+
+                input_data,
+
+                result_data
+
+            )
+
+            VALUES
+
+            (
+
+                %s, %s, %s, %s, %s
+
+            )
+
+            RETURNING id
+
+            """,
+
+            (
+
+                int(chat_id),
+
+                project_id,
+
+                analysis_type,
+
+                input_data,
+
+                result_data
+
+            ),
+
+            fetchone=True,
+
+            commit=True
+
+        )
+
+        if row:
+
+            return row.get(
+
+                "id"
+
+            )
+
+        return None
+
+    except Exception:
+
+        logger.exception(
+
+            "save_financial_analysis failed"
+
+        )
+
+        return None
+
+# ============================================================
+
+# GET FINANCIAL ANALYSES
+
+# ============================================================
+
+def get_financial_analyses(
+
+    chat_id,
+
+    project_id=None,
+
+    limit=50
+
+):
+
+    """
+
+    Returns saved financial analyses.
+
+    """
+
+    try:
+
+        if project_id is None:
+
+            rows = db_execute(
+
+                """
+
+                SELECT *
+
+                FROM financial_analyses
+
+                WHERE chat_id = %s
+
+                ORDER BY
+
+                    created_at DESC,
+
+                    id DESC
+
+                LIMIT %s
+
+                """,
+
+                (
+
+                    int(chat_id),
+
+                    int(limit)
+
+                ),
+
+                fetchall=True
+
+            )
+
+        else:
+
+            rows = db_execute(
+
+                """
+
+                SELECT *
+
+                FROM financial_analyses
+
+                WHERE
+
+                    chat_id = %s
+
+                    AND project_id = %s
+
+                ORDER BY
+
+                    created_at DESC,
+
+                    id DESC
+
+                LIMIT %s
+
+                """,
+
+                (
+
+                    int(chat_id),
+
+                    int(project_id),
+
+                    int(limit)
+
+                ),
+
+                fetchall=True
+
+            )
+
+        return list(
+
+            rows or []
+
+        )
+
+    except Exception:
+
+        logger.exception(
+
+            "get_financial_analyses failed"
+
+        )
+
+        return []
+
+# ============================================================
+
+# FORMAT FINANCIAL MODEL
+
+# ============================================================
+
+def format_financial_model(
+
+    model
+
+):
+
+    """
+
+    Converts financial model into readable Telegram text.
+
+    """
+
+    if not model:
 
         return (
 
-            "🧠 Geniosa-ს მეხსიერებაში "
+            "ფინანსური მოდელის მონაცემები "
 
-            "შენახული ინფორმაცია ჯერ არ არის."
+            "არ არის ხელმისაწვდომი."
+
+        )
+
+    def money(
+
+        value
+
+    ):
+
+        return (
+
+            f"${to_float(value, 0):,.0f}"
+
+        )
+
+    def percent(
+
+        value
+
+    ):
+
+        return (
+
+            f"{to_float(value, 0):,.2f}%"
 
         )
 
     lines = [
 
-        f"🧠 შენახული მეხსიერება: {len(memories)}",
+        "📊 GENIOSA — FINANCIAL ANALYSIS",
 
-        ""
+        "",
+
+        f"💵 შემოსავალი: "
+
+        f"{money(model.get('revenue'))}",
+
+        f"🌍 მიწა: "
+
+        f"{money(model.get('land_cost'))}",
+
+        f"🔨 მშენებლობა: "
+
+        f"{money(model.get('construction_cost'))}",
+
+        f"⚙️ საოპერაციო ხარჯი: "
+
+        f"{money(model.get('operating_cost'))}",
+
+        f"🏦 ფინანსირების ხარჯი: "
+
+        f"{money(model.get('financing_cost'))}",
+
+        f"📦 სხვა ხარჯი: "
+
+        f"{money(model.get('other_cost'))}",
+
+        "",
+
+        f"💰 სრული ხარჯი: "
+
+        f"{money(model.get('total_cost'))}",
+
+        f"🟢 წმინდა მოგება: "
+
+        f"{money(model.get('net_profit'))}",
+
+        f"📈 მოგების მარჟა: "
+
+        f"{percent(model.get('profit_margin'))}",
+
+        "",
+
+        f"💼 ინვესტორის კაპიტალი: "
+
+        f"{money(model.get('investor_capital'))}",
+
+        f"📊 ინვესტორის წილი: "
+
+        f"{percent(model.get('investor_share'))}",
+
+        f"💼 ინვესტორის მოგება: "
+
+        f"{money(model.get('investor_profit'))}",
+
+        f"🏢 ოპერატორის მოგება: "
+
+        f"{money(model.get('operator_profit'))}",
+
+        f"📈 ROI: "
+
+        f"{percent(model.get('roi'))}",
+
+        "",
+
+        f"⚖️ Break-even revenue: "
+
+        f"{money(model.get('break_even_revenue'))}"
 
     ]
 
-    for memory in memories:
+    required_price = model.get(
 
-        memory_id = memory.get(
+        "required_sale_price_per_m2"
 
-            "id"
+    )
 
-        )
-
-        category = (
-
-            memory.get("category")
-
-            or "general"
-
-        )
-
-        memory_text = (
-
-            memory.get("memory")
-
-            or ""
-
-        )
+    if required_price:
 
         lines.append(
 
-            f"#{memory_id} "
+            f"🏷️ საჭირო საშუალო ფასი: "
 
-            f"[{category}] "
-
-            f"{memory_text}"
+            f"${required_price:,.2f}/მ²"
 
         )
 
@@ -7174,449 +9116,591 @@ def memory_summary(
 
 # ============================================================
 
-# DELETE MEMORY
+# PROJECT FINANCIAL ANALYSIS
 
 # ============================================================
 
-def delete_memory(
+def analyze_project_financials(
 
     chat_id,
 
-    memory_id
+    project_id
 
 ):
 
-    conn = None
+    """
 
-    cur = None
+    Performs financial analysis using project data.
 
-    try:
+    """
 
-        conn = db()
+    project = get_project(
 
-        cur = conn.cursor()
+        chat_id,
 
-        cur.execute(
+        project_id
 
-            """
+    )
 
-            DELETE FROM business_memory
+    if not project:
 
-            WHERE chat_id = %s
+        return {
 
-            AND id = %s
+            "success": False,
 
-            """,
+            "error": "პროექტი ვერ მოიძებნა."
 
-            (
+        }
 
-                chat_id,
+    revenue = project.get(
 
-                memory_id
+        "expected_revenue"
+
+    )
+
+    if revenue is None:
+
+        revenue = project.get(
+
+            "revenue"
+
+        )
+
+    total_cost = project.get(
+
+        "total_cost"
+
+    )
+
+    if total_cost is None:
+
+        total_cost = calculate_total_cost(
+
+            project.get(
+
+                "land_cost"
+
+            ),
+
+            project.get(
+
+                "construction_cost"
+
+            ),
+
+            project.get(
+
+                "operating_cost"
+
+            ),
+
+            project.get(
+
+                "financing_cost"
+
+            ),
+
+            project.get(
+
+                "other_cost"
 
             )
 
         )
 
-        deleted = cur.rowcount
+    profit = project.get(
 
-        conn.commit()
+        "expected_profit"
 
-        return deleted
+    )
 
-    except Exception:
+    if profit is None:
 
-        if conn:
+        profit = project.get(
 
-            conn.rollback()
-
-        logger.exception(
-
-            "delete_memory error"
+            "net_profit"
 
         )
 
-        return 0
+    if profit is None:
 
-    finally:
+        profit = calculate_profit(
 
-        if cur:
+            revenue,
 
-            cur.close()
+            total_cost
 
-        if conn:
+        )
 
-            conn.close()
+    investor_capital = (
+
+        project.get(
+
+            "investor_capital"
+
+        )
+
+        or 0
+
+    )
+
+    investor_share = (
+
+        project.get(
+
+            "investor_share"
+
+        )
+
+        or 0
+
+    )
+
+    model = financial_model(
+
+        revenue=revenue or 0,
+
+        land_cost=project.get(
+
+            "land_cost"
+
+        ) or 0,
+
+        construction_cost=project.get(
+
+            "construction_cost"
+
+        ) or 0,
+
+        operating_cost=project.get(
+
+            "operating_cost"
+
+        ) or 0,
+
+        financing_cost=project.get(
+
+            "financing_cost"
+
+        ) or 0,
+
+        other_cost=project.get(
+
+            "other_cost"
+
+        ) or 0,
+
+        investor_capital=investor_capital,
+
+        investor_share=investor_share,
+
+        saleable_area=project.get(
+
+            "saleable_area"
+
+        ) or 0
+
+    )
+
+    # Preserve project-level expected profit
+
+    # if explicitly supplied.
+
+    if project.get(
+
+        "expected_profit"
+
+    ) is not None:
+
+        model[
+
+            "net_profit"
+
+        ] = to_float(
+
+            project.get(
+
+                "expected_profit"
+
+            ),
+
+            0
+
+        )
+
+        model[
+
+            "profit_margin"
+
+        ] = calculate_profit_margin(
+
+            model["revenue"],
+
+            model["net_profit"]
+
+        )
+
+        model[
+
+            "investor_profit"
+
+        ] = calculate_investor_profit(
+
+            model["net_profit"],
+
+            model["investor_share"]
+
+        )
+
+        model[
+
+            "operator_profit"
+
+        ] = calculate_operator_profit(
+
+            model["net_profit"],
+
+            model["investor_share"]
+
+        )
+
+        model[
+
+            "roi"
+
+        ] = calculate_roi(
+
+            model["net_profit"],
+
+            model["investor_capital"]
+
+        )
+
+    analysis_id = save_financial_analysis(
+
+        chat_id=chat_id,
+
+        project_id=project_id,
+
+        analysis_type="project_financial_analysis",
+
+        input_data={
+
+            "project_id": project_id,
+
+            "project": dict(project)
+
+        },
+
+        result_data=model
+
+    )
+
+    return {
+
+        "success": True,
+
+        "analysis_id": analysis_id,
+
+        "project": project,
+
+        "model": model,
+
+        "profit_source": (
+
+            "expected_profit"
+
+            if project.get(
+
+                "expected_profit"
+
+            ) is not None
+
+            else "calculated"
+
+        )
+
+    }
 
 # ============================================================
 
-# AI RESPONSE WITH AUTOMATIC MEMORY COMMAND
+# SCENARIO ANALYSIS
 
 # ============================================================
 
-def process_ai_text(
+def scenario_analysis(
 
-    chat_id,
+    revenue,
 
-    user_text
+    total_cost,
+
+    scenarios=None
 
 ):
 
     """
 
-    Main natural-language AI processor.
+    Runs simple sensitivity analysis.
+
+    Default scenarios:
+
+    - 80% revenue
+
+    - 90% revenue
+
+    - 100% revenue
+
+    - 110% revenue
+
+    - 120% revenue
 
     """
 
-    if not user_text:
+    revenue_value = to_float(
+
+        revenue,
+
+        0
+
+    )
+
+    cost_value = to_float(
+
+        total_cost,
+
+        0
+
+    )
+
+    if scenarios is None:
+
+        scenarios = [
+
+            0.80,
+
+            0.90,
+
+            1.00,
+
+            1.10,
+
+            1.20
+
+        ]
+
+    results = []
+
+    for multiplier in scenarios:
+
+        multiplier_value = to_float(
+
+            multiplier,
+
+            None
+
+        )
+
+        if multiplier_value is None:
+
+            continue
+
+        scenario_revenue = (
+
+            revenue_value
+
+            * multiplier_value
+
+        )
+
+        scenario_profit = (
+
+            scenario_revenue
+
+            - cost_value
+
+        )
+
+        margin = calculate_profit_margin(
+
+            scenario_revenue,
+
+            scenario_profit
+
+        )
+
+        results.append(
+
+            {
+
+                "revenue_multiplier":
+
+                    multiplier_value,
+
+                "revenue":
+
+                    scenario_revenue,
+
+                "profit":
+
+                    scenario_profit,
+
+                "profit_margin":
+
+                    margin
+
+            }
+
+        )
+
+    return results
+
+# ============================================================
+
+# FORMAT SCENARIOS
+
+# ============================================================
+
+def format_scenario_analysis(
+
+    results
+
+):
+
+    """
+
+    Formats sensitivity analysis.
+
+    """
+
+    if not results:
 
         return (
 
-            "გთხოვთ დაწეროთ ტექსტი."
+            "სცენარის ანალიზი ვერ შესრულდა."
 
         )
 
-    # --------------------------------------------------------
+    lines = [
 
-    # Explicit memory request
+        "📉 SENSITIVITY ANALYSIS",
 
-    # --------------------------------------------------------
+        ""
 
-    if looks_like_memory_request(
+    ]
 
-        user_text
+    for result in results:
 
-    ):
+        multiplier = (
 
-        memory = save_memory_from_message(
+            result.get(
 
-            chat_id,
-
-            user_text
-
-        )
-
-        if memory:
-
-            return (
-
-                "🧠 ინფორმაცია შევინახე "
-
-                "Geniosa-ს ბიზნეს-მეხსიერებაში.\n\n"
-
-                f"{memory.get('memory')}"
+                "revenue_multiplier"
 
             )
 
-        return (
-
-            "⚠️ ინფორმაციის შენახვა ვერ მოხერხდა."
+            or 0
 
         )
 
-    # --------------------------------------------------------
+        revenue = (
 
-    # Normal AI conversation
+            result.get(
 
-    # --------------------------------------------------------
-
-    save_message(
-
-        chat_id,
-
-        "user",
-
-        user_text
-
-    )
-
-    response = ai_chat(
-
-        chat_id,
-
-        user_text
-
-    )
-
-    save_message(
-
-        chat_id,
-
-        "assistant",
-
-        response
-
-    )
-
-    return response
-
-# ============================================================
-
-# AI PROJECT EXTRACTION
-
-# ============================================================
-
-def extract_project_data_with_ai(
-
-    chat_id,
-
-    text
-
-):
-
-    """
-
-    Converts natural language project description
-
-    into structured JSON.
-
-    This is used later by project commands.
-
-    """
-
-    prompt = f"""
-
-შენ ხარ ბიზნეს მონაცემების სტრუქტურირების AI.
-
-მომხმარებელმა აღწერა პროექტი:
-
-{text}
-
-მომხმარებლის არსებული პროექტების კონტექსტი:
-
-{build_project_context(chat_id)}
-
-დააბრუნე მხოლოდ JSON ობიექტი.
-
-გამოიყენე შემდეგი ველები:
-
-{{
-
-  "name": null,
-
-  "industry": null,
-
-  "location": null,
-
-  "description": null,
-
-  "land_area": null,
-
-  "saleable_area": null,
-
-  "construction_area": null,
-
-  "total_area": null,
-
-  "revenue": null,
-
-  "total_cost": null,
-
-  "operating_cost": null,
-
-  "net_profit": null,
-
-  "investor_capital": null,
-
-  "investor_profit": null,
-
-  "investor_share": null
-
-}}
-
-თუ მონაცემი არ არის,
-
-დააყენე null.
-
-არ მოიგონო მონაცემები.
-
-არ დაამატო სხვა ველები.
-
-"""
-
-    result = gemini_generate(
-
-        prompt,
-
-        temperature=0.1,
-
-        max_output_tokens=2000
-
-    )
-
-    if not result:
-
-        return None
-
-    # --------------------------------------------------------
-
-    # Clean possible Markdown JSON
-
-    # --------------------------------------------------------
-
-    cleaned = result.strip()
-
-    if cleaned.startswith(
-
-        "```"
-
-    ):
-
-        cleaned = re.sub(
-
-            r"^```(?:json)?\s*",
-
-            "",
-
-            cleaned,
-
-            flags=re.IGNORECASE
-
-        )
-
-        cleaned = re.sub(
-
-            r"\s*```$",
-
-            "",
-
-            cleaned
-
-        )
-
-    # --------------------------------------------------------
-
-    # Parse JSON
-
-    # --------------------------------------------------------
-
-    try:
-
-        data = json.loads(
-
-            cleaned
-
-        )
-
-        if isinstance(
-
-            data,
-
-            dict
-
-        ):
-
-            return data
-
-    except Exception:
-
-        logger.warning(
-
-            "AI project JSON parse failed: %s",
-
-            cleaned[:2000]
-
-        )
-
-    # --------------------------------------------------------
-
-    # Try to extract JSON object
-
-    # --------------------------------------------------------
-
-    match = re.search(
-
-        r"\{.*\}",
-
-        cleaned,
-
-        flags=re.DOTALL
-
-    )
-
-    if match:
-
-        try:
-
-            data = json.loads(
-
-                match.group(0)
+                "revenue"
 
             )
 
-            if isinstance(
-
-                data,
-
-                dict
-
-            ):
-
-                return data
-
-        except Exception:
-
-            pass
-
-    return None
-
-# ============================================================
-
-# PART 5 CHECK
-
-# ============================================================
-
-print("GENIOSA PART 5/10 LOADED")# ============================================================
-
-# GENIOSA 4.0 — PART 6/10
-
-# TELEGRAM FILE DOWNLOAD / IMAGE PROCESSING / GEMINI VISION
-
-# ============================================================
-
-# ============================================================
-
-# TELEGRAM FILE DOWNLOAD
-
-# ============================================================
-
-def telegram_get_file(
-
-    file_id
-
-):
-
-    """
-
-    Gets Telegram file information.
-
-    """
-
-    if not file_id:
-
-        return None
-
-    try:
-
-        response = requests.get(
-
-            telegram_url("getFile"),
-
-            params={
-
-                "file_id": file_id
-
-            },
-
-            timeout=30
+            or 0
 
         )
 
-        if response.status_code != 200:
+        profit = (
 
-            logger.error(
+            result.get(
 
-                "Telegram getFile HTTP %s: %s",
+                "profit"
+
+            )
+
+            or 0
+
+        )
+
+        margin = (
+
+            result.get(
+
+                "profit_margin"
+
+            )
+
+            or 0
+
+        )
+
+        lines.append(
+
+            f"Revenue {multiplier * 100:.0f}% "
+
+            f"→ ${revenue:,.0f} | "
+
+            f"Profit ${profit:,.0f} | "
+
+            f"Margin {margin:.1f}%"
+
+        )
+
+    return "\n".join(
+
+        lines
+
+    )
+
+# ============================================================
+
+# PART 6 COMPLETE
+
+# ============================================================
+
+print(
+
+    "GENIOSA 4.0 — PART 6/10 LOADED"
+
+)# ============================================================
+
+# GENIOSA 4.0 — PART 7/10
+
+# Telegram files + documents + image/vision analysis
+
+# ============================================================
+
+def telegram_api(method, params=None, timeout=60):
+
+    """
+
+    Universal Telegram Bot API helper.
+
+    """
+
+    url = f"{TELEGRAM_API}/{method}"
+
+    try:
+
+        response = requests.post(
+
+            url,
+
+            json=params or {},
+
+            timeout=timeout
+
+        )
+
+        if not response.ok:
+
+            logging.error(
+
+                "Telegram API error %s: %s",
 
                 response.status_code,
 
@@ -7630,133 +9714,207 @@ def telegram_get_file(
 
         if not data.get("ok"):
 
-            logger.error(
+            logging.error(
 
-                "Telegram getFile failed: %s",
+                "Telegram API returned error: %s",
 
-                str(data)[:1000]
+                data
 
             )
 
             return None
 
-        return (
+        return data.get("result")
 
-            data.get("result")
+    except requests.RequestException as e:
 
-            or {}
-
-        )
-
-    except Exception:
-
-        logger.exception(
-
-            "telegram_get_file error"
-
-        )
+        logging.error("Telegram request failed: %s", e)
 
         return None
 
-def download_telegram_file(
+    except Exception as e:
 
-    file_id,
+        logging.exception("Telegram API unexpected error: %s", e)
 
-    filename=None
+        return None
 
-):
-
-    """
-
-    Downloads a Telegram file into /tmp/geniosa.
+def telegram_get_file(file_id):
 
     """
 
-    file_info = telegram_get_file(
+    Gets Telegram file metadata.
 
-        file_id
+    """
+
+    if not file_id:
+
+        return None
+
+    return telegram_api(
+
+        "getFile",
+
+        {"file_id": file_id},
+
+        timeout=60
 
     )
+
+def guess_mime_type(filename):
+
+    """
+
+    Determines MIME type from filename.
+
+    """
+
+    if not filename:
+
+        return "application/octet-stream"
+
+    name = filename.lower()
+
+    mime_map = {
+
+        ".jpg": "image/jpeg",
+
+        ".jpeg": "image/jpeg",
+
+        ".png": "image/png",
+
+        ".webp": "image/webp",
+
+        ".gif": "image/gif",
+
+        ".bmp": "image/bmp",
+
+        ".pdf": "application/pdf",
+
+        ".txt": "text/plain",
+
+        ".csv": "text/csv",
+
+        ".docx": (
+
+            "application/vnd.openxmlformats-officedocument."
+
+            "wordprocessingml.document"
+
+        ),
+
+        ".xlsx": (
+
+            "application/vnd.openxmlformats-officedocument."
+
+            "spreadsheetml.sheet"
+
+        ),
+
+        ".xlsm": (
+
+            "application/vnd.ms-excel.sheet.macroEnabled.12"
+
+        ),
+
+        ".pptx": (
+
+            "application/vnd.openxmlformats-officedocument."
+
+            "presentationml.presentation"
+
+        ),
+
+    }
+
+    for extension, mime in mime_map.items():
+
+        if name.endswith(extension):
+
+            return mime
+
+    return "application/octet-stream"
+
+def safe_filename(filename, default_name="file"):
+
+    """
+
+    Makes a safe local filename.
+
+    """
+
+    if not filename:
+
+        filename = default_name
+
+    filename = os.path.basename(str(filename))
+
+    filename = re.sub(
+
+        r"[^a-zA-Z0-9а-яА-ЯёЁ._-]+",
+
+        "_",
+
+        filename
+
+    )
+
+    if not filename:
+
+        filename = default_name
+
+    return filename[:180]
+
+def download_telegram_file(file_id, filename=None):
+
+    """
+
+    Downloads a Telegram file into Geniosa temporary storage.
+
+    Returns:
+
+        local file path or None
+
+    """
+
+    file_info = telegram_get_file(file_id)
 
     if not file_info:
 
         return None
 
-    file_path = file_info.get(
+    telegram_path = file_info.get("file_path")
 
-        "file_path"
+    if not telegram_path:
 
-    )
-
-    if not file_path:
+        logging.error("Telegram file_path missing")
 
         return None
 
     if not filename:
 
-        filename = Path(
+        filename = os.path.basename(telegram_path)
 
-            file_path
+    filename = safe_filename(filename)
 
-        ).name
-
-    # --------------------------------------------------------
-
-    # Sanitize filename
-
-    # --------------------------------------------------------
-
-    safe_name = re.sub(
-
-        r"[^A-Za-z0-9._-]+",
-
-        "_",
-
-        str(filename)
-
-    )
-
-    if not safe_name:
-
-        safe_name = (
-
-            f"telegram_{int(time.time())}"
-
-        )
-
-    local_path = (
-
-        DOWNLOAD_DIR
-
-        / f"{int(time.time() * 1000)}_{safe_name}"
-
-    )
-
-    download_url = (
-
-        f"https://api.telegram.org/file/bot"
-
-        f"{TELEGRAM_BOT_TOKEN}/"
-
-        f"{file_path}"
-
-    )
+    local_path = STORAGE_DIR / filename
 
     try:
 
+        url = f"{TELEGRAM_FILE_API}/{telegram_path}"
+
         response = requests.get(
 
-            download_url,
+            url,
 
-            timeout=90
+            timeout=120
 
         )
 
-        if response.status_code != 200:
+        if not response.ok:
 
-            logger.error(
+            logging.error(
 
-                "Telegram file download HTTP %s",
+                "Telegram file download failed: %s",
 
                 response.status_code
 
@@ -7764,159 +9922,289 @@ def download_telegram_file(
 
             return None
 
-        local_path.write_bytes(
+        local_path.write_bytes(response.content)
 
-            response.content
+        return str(local_path)
 
-        )
+    except requests.RequestException as e:
 
-        return local_path
+        logging.error(
 
-    except Exception:
+            "Telegram file download request failed: %s",
 
-        logger.exception(
-
-            "download_telegram_file error"
+            e
 
         )
 
         return None
 
-# ============================================================
+    except Exception as e:
 
-# IMAGE HELPERS
+        logging.exception(
 
-# ============================================================
+            "Telegram file download unexpected error: %s",
 
-SUPPORTED_IMAGE_TYPES = {
-
-    ".jpg": "image/jpeg",
-
-    ".jpeg": "image/jpeg",
-
-    ".png": "image/png",
-
-    ".webp": "image/webp"
-
-}
-
-def image_mime_type(
-
-    file_path
-
-):
-
-    suffix = (
-
-        Path(file_path)
-
-        .suffix
-
-        .lower()
-
-    )
-
-    return SUPPORTED_IMAGE_TYPES.get(
-
-        suffix
-
-    )
-
-def image_to_base64(
-
-    file_path
-
-):
-
-    try:
-
-        raw = Path(
-
-            file_path
-
-        ).read_bytes()
-
-        return base64.b64encode(
-
-            raw
-
-        ).decode(
-
-            "utf-8"
-
-        )
-
-    except Exception:
-
-        logger.exception(
-
-            "image_to_base64 error"
+            e
 
         )
 
         return None
 
-# ============================================================
-
-# GEMINI VISION
-
-# ============================================================
-
-def gemini_analyze_image(
-
-    prompt,
-
-    file_path,
-
-    temperature=0.25,
-
-    max_output_tokens=4000
-
-):
+def send_document(chat_id, file_path, caption=None):
 
     """
 
-    Sends an image + text prompt to Gemini.
+    Sends a generated/local file to Telegram.
 
     """
-
-    if not GEMINI_API_KEY:
-
-        return None
 
     if not file_path:
 
-        return None
+        return False
 
-    mime_type = image_mime_type(
+    if not os.path.exists(file_path):
 
-        file_path
+        logging.error(
 
-    )
-
-    if not mime_type:
-
-        logger.error(
-
-            "Unsupported image type: %s",
+            "send_document: file does not exist: %s",
 
             file_path
 
         )
 
-        return None
+        return False
 
-    encoded = image_to_base64(
+    url = f"{TELEGRAM_API}/sendDocument"
 
-        file_path
+    try:
+
+        with open(file_path, "rb") as file:
+
+            files = {
+
+                "document": (
+
+                    os.path.basename(file_path),
+
+                    file
+
+                )
+
+            }
+
+            data = {
+
+                "chat_id": str(chat_id)
+
+            }
+
+            if caption:
+
+                data["caption"] = str(caption)[:1000]
+
+            response = requests.post(
+
+                url,
+
+                data=data,
+
+                files=files,
+
+                timeout=120
+
+            )
+
+        if not response.ok:
+
+            logging.error(
+
+                "sendDocument failed: %s",
+
+                response.text[:1000]
+
+            )
+
+            return False
+
+        result = response.json()
+
+        if not result.get("ok"):
+
+            logging.error(
+
+                "sendDocument Telegram error: %s",
+
+                result
+
+            )
+
+            return False
+
+        return True
+
+    except Exception as e:
+
+        logging.exception(
+
+            "send_document error: %s",
+
+            e
+
+        )
+
+        return False
+
+def save_uploaded_document(
+
+    chat_id,
+
+    filename,
+
+    file_path,
+
+    project_id=None,
+
+    user_request=None
+
+):
+
+    """
+
+    Downloads/extracts/analyzes a Telegram document.
+
+    """
+
+    if not file_path:
+
+        return {
+
+            "success": False,
+
+            "message": "ფაილის ჩამოტვირთვა ვერ მოხერხდა."
+
+        }
+
+    try:
+
+        result = process_document_file(
+
+            chat_id=chat_id,
+
+            file_path=file_path,
+
+            filename=filename,
+
+            project_id=project_id,
+
+            user_request=user_request
+
+        )
+
+        return result
+
+    except Exception as e:
+
+        logging.exception(
+
+            "save_uploaded_document error: %s",
+
+            e
+
+        )
+
+        return {
+
+            "success": False,
+
+            "message": f"დოკუმენტის დამუშავების შეცდომა: {e}"
+
+        }
+
+def analyze_image_with_ai(
+
+    filename,
+
+    image_bytes,
+
+    mime_type="image/jpeg",
+
+    user_request=None
+
+):
+
+    """
+
+    Sends an image to Gemini Vision and returns business-oriented analysis.
+
+    """
+
+    if not image_bytes:
+
+        return "სურათი ცარიელია ან ვერ წავიკითხე."
+
+    if len(image_bytes) > 12 * 1024 * 1024:
+
+        return (
+
+            "სურათი ძალიან დიდია. გთხოვ, გამოგზავნე "
+
+            "12 MB-ზე ნაკლები ზომის ფაილი."
+
+        )
+
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    request_text = user_request or (
+
+        "გაანალიზე ეს სურათი პროფესიონალურად. "
+
+        "თუ სურათი ეხება უძრავ ქონებას, სამშენებლო პროექტს, "
+
+        "არქიტექტურას, ფინანსურ დოკუმენტს, ობიექტს ან ბიზნესს, "
+
+        "გამოყავი პრაქტიკული და საინვესტიციო მნიშვნელობის ინფორმაცია. "
+
+        "არ მოიგონო ფაქტები. რაც ზუსტად არ ჩანს, მიუთითე როგორც "
+
+        "შეფასება ან ვარაუდი."
 
     )
 
-    if not encoded:
+    prompt = f"""
 
-        return None
+ფაილის სახელი: {filename}
+
+მომხმარებლის მოთხოვნა:
+
+{request_text}
+
+უპასუხე მომხმარებლის ენაზე.
+
+თუ სურათიდან შესაძლებელია ტექსტის წაკითხვა, ამოიღე მნიშვნელოვანი ტექსტიც.
+
+თუ შესაძლებელია ფართობების, ფასების, რაოდენობების ან სხვა ციფრების დანახვა,
+
+მიუთითე ისინი მკაფიოდ და არ შეცვალო ერთეულები.
+
+ანალიზი იყოს პრაქტიკული, სტრუქტურირებული და პროფესიონალური.
+
+"""
 
     payload = {
+
+        "systemInstruction": {
+
+            "parts": [
+
+                {
+
+                    "text": ai_system_prompt()
+
+                }
+
+            ]
+
+        },
 
         "contents": [
 
@@ -7928,21 +10216,17 @@ def gemini_analyze_image(
 
                     {
 
-                        "text": str(
-
-                            prompt
-
-                        )
+                        "text": prompt
 
                     },
 
                     {
 
-                        "inline_data": {
+                        "inlineData": {
 
-                            "mime_type": mime_type,
+                            "mimeType": mime_type,
 
-                            "data": encoded
+                            "data": encoded_image
 
                         }
 
@@ -7956,31 +10240,25 @@ def gemini_analyze_image(
 
         "generationConfig": {
 
-            "temperature": float(
+            "temperature": 0.3,
 
-                temperature
-
-            ),
-
-            "maxOutputTokens": int(
-
-                max_output_tokens
-
-            )
+            "maxOutputTokens": 5000
 
         }
 
     }
 
+    url = gemini_url()
+
     try:
 
         response = requests.post(
 
-            gemini_url(),
+            url,
 
-            params={
+            headers={
 
-                "key": GEMINI_API_KEY
+                "Content-Type": "application/json"
 
             },
 
@@ -7990,585 +10268,107 @@ def gemini_analyze_image(
 
         )
 
-    except requests.RequestException as exc:
+        if not response.ok:
 
-        logger.error(
+            logging.error(
 
-            "Gemini Vision network error: %s",
+                "Gemini vision error %s: %s",
 
-            exc
+                response.status_code,
 
-        )
-
-        return None
-
-    except Exception:
-
-        logger.exception(
-
-            "Gemini Vision request error"
-
-        )
-
-        return None
-
-    if response.status_code != 200:
-
-        logger.error(
-
-            "Gemini Vision HTTP %s: %s",
-
-            response.status_code,
-
-            response.text[:2000]
-
-        )
-
-        return None
-
-    try:
-
-        data = response.json()
-
-    except Exception:
-
-        logger.error(
-
-            "Gemini Vision invalid JSON"
-
-        )
-
-        return None
-
-    candidates = (
-
-        data.get("candidates")
-
-        or []
-
-    )
-
-    if not candidates:
-
-        logger.warning(
-
-            "Gemini Vision returned no candidates"
-
-        )
-
-        return None
-
-    content = (
-
-        candidates[0].get(
-
-            "content"
-
-        )
-
-        or {}
-
-    )
-
-    parts = (
-
-        content.get("parts")
-
-        or []
-
-    )
-
-    texts = []
-
-    for part in parts:
-
-        if not isinstance(
-
-            part,
-
-            dict
-
-        ):
-
-            continue
-
-        value = part.get(
-
-            "text"
-
-        )
-
-        if value:
-
-            texts.append(
-
-                str(value)
+                response.text[:1500]
 
             )
-
-    result = "\n".join(
-
-        texts
-
-    ).strip()
-
-    return result or None
-
-# ============================================================
-
-# IMAGE ANALYSIS PROMPT
-
-# ============================================================
-
-def build_image_analysis_prompt(
-
-    chat_id,
-
-    caption=""
-
-):
-
-    project_context = build_project_context(
-
-        chat_id
-
-    )
-
-    memory_context = build_memory_context(
-
-        chat_id
-
-    )
-
-    caption_text = (
-
-        caption
-
-        if caption
-
-        else "მომხმარებელმა აღწერა არ დაურთო."
-
-    )
-
-    return f"""
-
-შენ ხარ Geniosa 4.0 —
-
-ბიზნესისა და საინვესტიციო ანალიზის AI ასისტენტი.
-
-მომხმარებელმა გამოგიგზავნა სურათი.
-
-მომხმარებლის ტექსტი/აღწერა:
-
-{caption_text}
-
-არსებული პროექტების კონტექსტი:
-
-{project_context}
-
-ბიზნეს-მეხსიერება:
-
-{memory_context}
-
-============================================================
-
-სურათის ანალიზის წესები
-
-============================================================
-
-გაანალიზე სურათი მაქსიმალურად პრაქტიკულად.
-
-თუ სურათი ეხება:
-
-• სამშენებლო პროექტს
-
-• არქიტექტურას
-
-• ინტერიერს
-
-• ექსტერიერს
-
-• უძრავ ქონებას
-
-• საინვესტიციო პროექტს
-
-• გეგმას
-
-• ცხრილს
-
-• დიაგრამას
-
-• დოკუმენტს
-
-• პროდუქტის დიზაინს
-
-მიუთითე შესაბამისი ინფორმაცია.
-
-აუცილებლად განასხვავე:
-
-1. რა ჩანს პირდაპირ სურათზე
-
-2. რა შეიძლება იყოს სავარაუდო
-
-3. რა ვერ დგინდება სურათიდან
-
-არ წარმოადგინო ვარაუდი ფაქტად.
-
-თუ სურათზე არის ტექსტი ან ციფრები,
-
-მოიყვანე მხოლოდ ის ინფორმაცია,
-
-რომლის წაკითხვაც შესაძლებელია.
-
-თუ რაიმე ნაწილი ბუნდოვანია,
-
-მიუთითე რომ მონაცემი ვერ იკითხება.
-
-თუ ეს სამშენებლო/უძრავი ქონების სურათია,
-
-შეაფასე:
-
-• არქიტექტურული გადაწყვეტა
-
-• ვიზუალური ხარისხი
-
-• ფუნქციონალური შესაძლებლობები
-
-• კომერციული მიმზიდველობა
-
-• პოტენციური პრობლემები
-
-• რა შეიძლება გაუმჯობესდეს
-
-თუ ფინანსური ცხრილია,
-
-გამოყავი:
-
-• შემოსავალი
-
-• ხარჯი
-
-• მოგება
-
-• პროცენტები
-
-• მნიშვნელოვანი შეუსაბამობები
-
-პასუხი დაწერე ქართულად,
-
-პროფესიონალური ბიზნეს-სტილით.
-
-"""
-
-# ============================================================
-
-# PROCESS IMAGE
-
-# ============================================================
-
-def process_image_file(
-
-    chat_id,
-
-    file_path,
-
-    filename=None,
-
-    caption=""
-
-):
-
-    """
-
-    Complete image-analysis pipeline.
-
-    """
-
-    if not file_path:
-
-        return (
-
-            "სურათის მიღება ვერ მოხერხდა."
-
-        )
-
-    if not filename:
-
-        filename = Path(
-
-            file_path
-
-        ).name
-
-    mime_type = image_mime_type(
-
-        file_path
-
-    )
-
-    if not mime_type:
-
-        return (
-
-            "⚠️ ეს სურათის ფორმატი "
-
-            "ამჟამად არ არის მხარდაჭერილი.\n\n"
-
-            "გამოიყენეთ JPG, PNG ან WEBP."
-
-        )
-
-    prompt = build_image_analysis_prompt(
-
-        chat_id,
-
-        caption
-
-    )
-
-    result = gemini_analyze_image(
-
-        prompt=prompt,
-
-        file_path=file_path,
-
-        temperature=0.25,
-
-        max_output_tokens=4000
-
-    )
-
-    if not result:
-
-        return gemini_error_message()
-
-    return (
-
-        f"🖼️ სურათის ანალიზი\n"
-
-        f"ფაილი: {filename}\n\n"
-
-        f"{result}"
-
-    )
-
-# ============================================================
-
-# PHOTO UPDATE PROCESSING
-
-# ============================================================
-
-def process_photo_update(
-
-    chat_id,
-
-    message
-
-):
-
-    """
-
-    Handles Telegram photo messages.
-
-    """
-
-    photos = (
-
-        message.get("photo")
-
-        or []
-
-    )
-
-    if not photos:
-
-        return (
-
-            "სურათი ვერ მოიძებნა."
-
-        )
-
-    # Telegram usually sends several sizes.
-
-    # The last one is normally the largest.
-
-    photo = photos[-1]
-
-    file_id = photo.get(
-
-        "file_id"
-
-    )
-
-    if not file_id:
-
-        return (
-
-            "სურათის file_id ვერ მოიძებნა."
-
-        )
-
-    caption = (
-
-        message.get("caption")
-
-        or ""
-
-    ).strip()
-
-    local_path = download_telegram_file(
-
-        file_id,
-
-        filename=f"photo_{int(time.time())}.jpg"
-
-    )
-
-    if not local_path:
-
-        return (
-
-            "⚠️ სურათის ჩამოტვირთვა ვერ მოხერხდა."
-
-        )
-
-    try:
-
-        return process_image_file(
-
-            chat_id=chat_id,
-
-            file_path=local_path,
-
-            filename=local_path.name,
-
-            caption=caption
-
-        )
-
-    finally:
-
-        try:
-
-            local_path.unlink(
-
-                missing_ok=True
-
-            )
-
-        except Exception:
-
-            pass
-
-# ============================================================
-
-# DOCUMENT MESSAGE PROCESSING
-
-# ============================================================
-
-def process_document_update(
-
-    chat_id,
-
-    message
-
-):
-
-    """
-
-    Handles Telegram document messages.
-
-    """
-
-    document = (
-
-        message.get("document")
-
-        or {}
-
-    )
-
-    file_id = document.get(
-
-        "file_id"
-
-    )
-
-    filename = (
-
-        document.get("file_name")
-
-        or f"document_{int(time.time())}"
-
-    )
-
-    if not file_id:
-
-        return (
-
-            "დოკუმენტის file_id ვერ მოიძებნა."
-
-        )
-
-    # --------------------------------------------------------
-
-    # Check supported type before download
-
-    # --------------------------------------------------------
-
-    file_type = detect_file_type(
-
-        filename
-
-    )
-
-    if file_type == "unknown":
-
-        suffix = (
-
-            Path(filename)
-
-            .suffix
-
-            .lower()
-
-        )
-
-        if suffix in (
-
-            ".doc",
-
-            ".xls"
-
-        ):
 
             return (
 
-                "⚠️ ძველი Office ფორმატები "
+                "სურათის AI ანალიზი ვერ შესრულდა.\n"
 
-                "(.doc / .xls) პირდაპირ არ იკითხება.\n\n"
-
-                "გთხოვთ შეინახოთ ფაილი "
-
-                "DOCX ან XLSX ფორმატში "
-
-                "და ხელახლა ატვირთოთ."
+                f"Gemini პასუხი: HTTP {response.status_code}"
 
             )
 
+        data = response.json()
+
+        text_result = extract_gemini_text(data)
+
+        if not text_result:
+
+            return (
+
+                "Gemini-მ სურათი მიიღო, მაგრამ "
+
+                "ანალიზის ტექსტური პასუხი ვერ დააბრუნა."
+
+            )
+
+        return text_result
+
+    except requests.Timeout:
+
         return (
 
-            f"⚠️ ფაილის ფორმატი "
+            "სურათის ანალიზს ძალიან დიდი დრო დასჭირდა. "
 
-            f"{suffix or 'უცნობი'} "
-
-            "არ არის მხარდაჭერილი."
+            "გთხოვ, სცადე ხელახლა."
 
         )
 
+    except requests.RequestException as e:
+
+        logging.error(
+
+            "Gemini vision network error: %s",
+
+            e
+
+        )
+
+        return (
+
+            "Gemini-სთან დაკავშირება ვერ მოხერხდა "
+
+            "სურათის ანალიზის დროს."
+
+        )
+
+    except Exception as e:
+
+        logging.exception(
+
+            "analyze_image_with_ai error: %s",
+
+            e
+
+        )
+
+        return (
+
+            "სურათის ანალიზის დროს მოხდა ტექნიკური შეცდომა."
+
+        )
+
+def analyze_telegram_image(
+
+    chat_id,
+
+    file_id,
+
+    filename="image.jpg",
+
+    user_request=None
+
+):
+
+    """
+
+    Downloads Telegram image and analyzes it with Gemini Vision.
+
+    """
+
     local_path = download_telegram_file(
 
-        file_id,
+        file_id=file_id,
 
         filename=filename
 
@@ -8578,101 +10378,45 @@ def process_document_update(
 
         return (
 
-            "⚠️ დოკუმენტის ჩამოტვირთვა "
-
-            "ვერ მოხერხდა."
+            "❌ სურათის ჩამოტვირთვა ვერ მოხერხდა."
 
         )
-
-    caption = (
-
-        message.get("caption")
-
-        or ""
-
-    ).strip()
-
-    # --------------------------------------------------------
-
-    # Optional project ID from caption
-
-    #
-
-    # Example:
-
-    # /project 12
-
-    # --------------------------------------------------------
-
-    project_id = None
-
-    match = re.search(
-
-        r"(?:/project|project)\s*#?\s*(\d+)",
-
-        caption,
-
-        flags=re.IGNORECASE
-
-    )
-
-    if match:
-
-        try:
-
-            project_id = int(
-
-                match.group(1)
-
-            )
-
-        except Exception:
-
-            project_id = None
 
     try:
 
-        result = process_document_file(
+        with open(local_path, "rb") as file:
 
-            chat_id=chat_id,
+            image_bytes = file.read()
 
-            file_path=local_path,
+        mime_type = guess_mime_type(filename)
+
+        analysis = analyze_image_with_ai(
 
             filename=filename,
 
-            project_id=project_id
+            image_bytes=image_bytes,
+
+            mime_type=mime_type,
+
+            user_request=user_request
 
         )
 
-        if not result.get("success"):
+        return analysis
 
-            return result.get(
+    except Exception as e:
 
-                "message",
+        logging.exception(
 
-                "დოკუმენტის დამუშავება ვერ მოხერხდა."
+            "analyze_telegram_image error: %s",
 
-            )
-
-        analysis = (
-
-            result.get("analysis")
-
-            or "AI ანალიზი ვერ დაბრუნდა."
+            e
 
         )
 
         return (
 
-            f"📄 დოკუმენტი დამუშავდა\n"
-
-            f"ფაილი: {filename}\n"
-
-            f"ტიპი: {file_type}\n"
-
-            f"Document ID: {result.get('document_id')}\n\n"
-
-            f"{analysis}"
+            "❌ სურათის დამუშავებისას მოხდა შეცდომა."
 
         )
 
@@ -8680,379 +10424,1099 @@ def process_document_update(
 
         try:
 
-            local_path.unlink(
+            if os.path.exists(local_path):
 
-                missing_ok=True
-
-            )
+                os.remove(local_path)
 
         except Exception:
 
             pass
 
-# ============================================================
-
-# GENERIC FILE MESSAGE PROCESSOR
-
-# ============================================================
-
-def process_media_message(
-
-    chat_id,
-
-    message
-
-):
+def get_best_photo_file_id(photo_sizes):
 
     """
 
-    Determines whether the Telegram message
+    Telegram photo contains several resolutions.
 
-    contains a photo or a document.
+    Select the largest one.
 
     """
 
-    if message.get("photo"):
+    if not photo_sizes:
 
-        return process_photo_update(
-
-            chat_id,
-
-            message
-
-        )
-
-    if message.get("document"):
-
-        return process_document_update(
-
-            chat_id,
-
-            message
-
-        )
-
-    return (
-
-        "ფაილის ტიპი ვერ განისაზღვრა."
-
-    )
-
-# ============================================================
-
-# PART 6 CHECK
-
-# ============================================================
-
-print("GENIOSA PART 6/10 LOADED")
-            
-# =========================
-
-# PART 7/10 — COMMANDS & MANAGEMENT
-
-# =========================
-
-def format_project(project):
-
-    if not project:
-
-        return "პროექტი ვერ მოიძებნა."
-
-    lines = [
-
-        f"🏗️ პროექტი #{project.get('id')}",
-
-        f"სახელი: {project.get('name') or '—'}",
-
-    ]
-
-    if project.get("location"):
-
-        lines.append(f"📍 მდებარეობა: {project.get('location')}")
-
-    if project.get("industry"):
-
-        lines.append(
-
-            f"🏢 მიმართულება: {industry_name(project.get('industry'))}"
-
-        )
-
-    if project.get("status"):
-
-        lines.append(f"📊 სტატუსი: {project.get('status')}")
-
-    if project.get("description"):
-
-        lines.append(
-
-            f"\n📝 აღწერა:\n{project.get('description')}"
-
-        )
-
-    numeric_fields = [
-
-        ("land_area", "მიწის ფართობი", "მ²"),
-
-        ("build_area", "სამშენებლო ფართობი", "მ²"),
-
-        ("saleable_area", "გასაყიდი ფართობი", "მ²"),
-
-        ("construction_cost", "სამშენებლო ღირებულება", "$"),
-
-        ("land_cost", "მიწის ღირებულება", "$"),
-
-        ("total_cost", "სრული ღირებულება", "$"),
-
-        ("expected_revenue", "მოსალოდნელი შემოსავალი", "$"),
-
-        ("expected_profit", "მოსალოდნელი მოგება", "$"),
-
-        ("net_profit", "წმინდა მოგება", "$"),
-
-    ]
-
-    for field, label, unit in numeric_fields:
-
-        value = project.get(field)
-
-        if value is None:
-
-            continue
-
-        if unit == "$":
-
-            formatted = format_money(value)
-
-        else:
-
-            formatted = format_number(value)
-
-        lines.append(f"• {label}: {formatted} {unit}")
-
-    if project.get("notes"):
-
-        lines.append(
-
-            f"\n📌 დამატებითი ინფორმაცია:\n{project.get('notes')}"
-
-        )
-
-    return "\n".join(lines)
-
-def format_project_list(projects):
-
-    if not projects:
-
-        return "📭 პროექტები ჯერ არ გაქვს დამატებული."
-
-    lines = ["🏗️ შენი პროექტები:\n"]
-
-    for project in projects:
-
-        project_id = project.get("id")
-
-        name = project.get("name") or "უსახელო პროექტი"
-
-        location = project.get("location") or "—"
-
-        status = project.get("status") or "აქტიური"
-
-        lines.append(
-
-            f"#{project_id} — {name}\n"
-
-            f"   📍 {location}\n"
-
-            f"   📊 {status}"
-
-        )
-
-    return "\n".join(lines)
-
-def get_document(chat_id, document_id):
-
-    conn = None
+        return None
 
     try:
 
-        conn = db()
+        best = max(
 
-        with conn.cursor() as cur:
+            photo_sizes,
 
-            cur.execute(
+            key=lambda item: (
 
-                """
+                int(item.get("width", 0))
 
-                SELECT *
-
-                FROM documents
-
-                WHERE id = %s AND chat_id = %s
-
-                LIMIT 1
-
-                """,
-
-                (document_id, chat_id),
+                * int(item.get("height", 0))
 
             )
 
-            row = cur.fetchone()
-
-        return row
-
-    except Exception as e:
-
-        logging.exception("get_document error: %s", e)
-
-        return None
-
-    finally:
-
-        if conn:
-
-            conn.close()
-
-def format_document(document):
-
-    if not document:
-
-        return "დოკუმენტი ვერ მოიძებნა."
-
-    lines = [
-
-        f"📄 დოკუმენტი #{document.get('id')}",
-
-        f"ფაილი: {document.get('filename') or '—'}",
-
-        f"ტიპი: {document.get('file_type') or '—'}",
-
-    ]
-
-    if document.get("project_id"):
-
-        lines.append(
-
-            f"🏗️ პროექტი: #{document.get('project_id')}"
-
         )
 
-    if document.get("analysis"):
+        return best.get("file_id")
 
-        lines.append(
+    except Exception:
 
-            f"\n🤖 AI ანალიზი:\n{document.get('analysis')}"
+        try:
 
-        )
+            return photo_sizes[-1].get("file_id")
 
-    if document.get("created_at"):
+        except Exception:
 
-        lines.append(
+            return None
 
-            f"\n📅 დამატებულია: {document.get('created_at')}"
+def build_image_request(caption):
 
-        )
+    """
 
-    return "\n".join(lines)
+    Converts Telegram caption into an image-analysis request.
 
-def command_help():
+    """
+
+    if caption:
+
+        return caption.strip()
 
     return (
 
-        "🤖 GENIOSA — ბრძანებები\n\n"
+        "გაანალიზე ეს სურათი დეტალურად ბიზნესის, "
 
-        "ძირითადი:\n"
+        "უძრავი ქონების და საინვესტიციო პერსპექტივიდან, "
 
-        "/start — დაწყება\n"
-
-        "/help — დახმარება\n"
-
-        "/status — სისტემის სტატუსი\n\n"
-
-        "🏗️ პროექტები:\n"
-
-        "/projects — ყველა პროექტი\n"
-
-        "/project — მთავარი პროექტი\n"
-
-        "/project ID — კონკრეტული პროექტი\n"
-
-        "/newproject ტექსტი — ახალი პროექტის შექმნა\n"
-
-        "/delete_project ID — პროექტის წაშლა\n\n"
-
-        "👥 ინვესტორები:\n"
-
-        "/investors — ინვესტორების სია\n"
-
-        "/investor ID — კონკრეტული ინვესტორი\n"
-
-        "/newinvestor ტექსტი — ინვესტორის დამატება\n\n"
-
-        "🤝 გარიგებები:\n"
-
-        "/deals — გარიგებების სია\n"
-
-        "/deal ID — კონკრეტული გარიგება\n\n"
-
-        "📄 დოკუმენტები:\n"
-
-        "/documents — დოკუმენტების სია\n"
-
-        "/document ID — კონკრეტული დოკუმენტი\n\n"
-
-        "💰 ფინანსები:\n"
-
-        "/financial — მთავარი პროექტის ფინანსები\n"
-
-        "/financial ID — კონკრეტული პროექტის ფინანსები\n\n"
-
-        "🧠 მეხსიერება:\n"
-
-        "/memory — შენახული ინფორმაცია\n"
-
-        "/forget ID — მეხსიერებიდან ინფორმაციის წაშლა\n\n"
-
-        "ასევე შეგიძლია უბრალოდ მომწერო ჩვეულებრივი ტექსტით "
-
-        "რა გჭირდება — Geniosa გამოიყენებს AI-ს."
+        "თუ ასეთი ინფორმაცია ჩანს."
 
     )
 
-def parse_command(text):
+def handle_photo_message(chat_id, message):
 
-    text = normalize_text(text)
+    """
 
-    if not text.startswith("/"):
+    Handles Telegram photo messages.
 
-        return None, ""
+    """
 
-    parts = text.split(maxsplit=1)
+    photo_sizes = message.get("photo") or []
 
-    command = parts[0].lower()
+    file_id = get_best_photo_file_id(photo_sizes)
 
-    # /start@GeniosaBot → /start
+    if not file_id:
 
-    if "@" in command:
+        send_message(
 
-        command = command.split("@", 1)[0]
+            chat_id,
 
-    args = ""
+            "❌ ფოტოს ფაილის მიღება ვერ მოხერხდა."
 
-    if len(parts) > 1:
+        )
 
-        args = parts[1].strip()
+        return
 
-    return command, args
+    caption = message.get("caption") or ""
 
-def parse_int_argument(args):
+    send_message(
+
+        chat_id,
+
+        "🖼️ ფოტო მივიღე.\n"
+
+        "ვიწყებ AI ანალიზს..."
+
+    )
+
+    analysis_request = build_image_request(caption)
+
+    filename = f"telegram_image_{int(time.time())}.jpg"
+
+    analysis = analyze_telegram_image(
+
+        chat_id=chat_id,
+
+        file_id=file_id,
+
+        filename=filename,
+
+        user_request=analysis_request
+
+    )
+
+    save_message(
+
+        chat_id,
+
+        "user",
+
+        f"[ფოტო] {caption}".strip()
+
+    )
+
+    save_message(
+
+        chat_id,
+
+        "assistant",
+
+        analysis
+
+    )
+
+    send_long_message(
+
+        chat_id,
+
+        "🖼️ **ფოტოს AI ანალიზი**\n\n" + analysis
+
+    )
+
+def build_document_request(caption):
+
+    """
+
+    Converts Telegram document caption into analysis request.
+
+    """
+
+    if caption:
+
+        return caption.strip()
+
+    return (
+
+        "გაანალიზე ეს დოკუმენტი სრულად. "
+
+        "გამოყავი მნიშვნელოვანი ფინანსური, კომერციული, "
+
+        "სამშენებლო, იურიდიული ან საინვესტიციო ინფორმაცია "
+
+        "იმდენად, რამდენადაც დოკუმენტიდან ამის დადგენა შესაძლებელია."
+
+    )
+
+def handle_document_message(chat_id, message):
+
+    """
+
+    Handles Telegram document uploads.
+
+    """
+
+    document = message.get("document") or {}
+
+    file_id = document.get("file_id")
+
+    if not file_id:
+
+        send_message(
+
+            chat_id,
+
+            "❌ დოკუმენტის ფაილის ID ვერ მივიღე."
+
+        )
+
+        return
+
+    original_filename = (
+
+        document.get("file_name")
+
+        or f"document_{int(time.time())}"
+
+    )
+
+    filename = safe_filename(original_filename)
+
+    caption = message.get("caption") or ""
+
+    send_message(
+
+        chat_id,
+
+        "📄 დოკუმენტი მივიღე.\n"
+
+        "ვტვირთავ და ვამზადებ AI ანალიზისთვის..."
+
+    )
+
+    local_path = download_telegram_file(
+
+        file_id=file_id,
+
+        filename=filename
+
+    )
+
+    if not local_path:
+
+        send_message(
+
+            chat_id,
+
+            "❌ დოკუმენტის ჩამოტვირთვა ვერ მოხერხდა."
+
+        )
+
+        return
+
+    try:
+
+        user_request = build_document_request(
+
+            caption
+
+        )
+
+        result = save_uploaded_document(
+
+            chat_id=chat_id,
+
+            filename=filename,
+
+            file_path=local_path,
+
+            project_id=None,
+
+            user_request=user_request
+
+        )
+
+        if isinstance(result, dict):
+
+            success = result.get("success", False)
+
+            if success:
+
+                document_id = result.get("document_id")
+
+                analysis = result.get("analysis") or ""
+
+                header = "📄 **დოკუმენტის ანალიზი**"
+
+                if document_id:
+
+                    header += (
+
+                        f"\nDocument ID: {document_id}"
+
+                    )
+
+                send_long_message(
+
+                    chat_id,
+
+                    header + "\n\n" + analysis
+
+                )
+
+            else:
+
+                send_long_message(
+
+                    chat_id,
+
+                    "❌ დოკუმენტის დამუშავება ვერ მოხერხდა.\n\n"
+
+                    + str(
+
+                        result.get(
+
+                            "message",
+
+                            "უცნობი შეცდომა"
+
+                        )
+
+                    )
+
+                )
+
+        else:
+
+            send_long_message(
+
+                chat_id,
+
+                str(result)
+
+            )
+
+    except Exception as e:
+
+        logging.exception(
+
+            "handle_document_message error: %s",
+
+            e
+
+        )
+
+        send_message(
+
+            chat_id,
+
+            "❌ დოკუმენტის დამუშავებისას მოხდა ტექნიკური შეცდომა."
+
+        )
+
+    finally:
+
+        try:
+
+            if os.path.exists(local_path):
+
+                os.remove(local_path)
+
+        except Exception:
+
+            pass
+
+def get_telegram_file_size(message):
+
+    """
+
+    Returns known Telegram file size when available.
+
+    """
+
+    document = message.get("document") or {}
+
+    try:
+
+        return int(
+
+            document.get("file_size") or 0
+
+        )
+
+    except Exception:
+
+        return 0
+
+def validate_document_size(message):
+
+    """
+
+    Prevents unnecessarily large document processing.
+
+    Telegram Bot API can provide file_size for documents.
+
+    """
+
+    size = get_telegram_file_size(message)
+
+    if size <= 0:
+
+        return True
+
+    max_size = 20 * 1024 * 1024
+
+    return size <= max_size
+
+print("GENIOSA 4.0 — PART 7/10 LOADED")# ============================================================
+
+# GENIOSA 4.0 — PART 8A/10
+
+# Telegram commands
+
+# ============================================================
+
+def safe_int(value, default=None):
+
+    try:
+
+        return int(value)
+
+    except Exception:
+
+        return default
+
+def extract_command_args(text):
+
+    if not text:
+
+        return ""
+
+    parts = text.strip().split(maxsplit=1)
+
+    if len(parts) == 1:
+
+        return ""
+
+    return parts[1].strip()
+
+def command_name(text):
+
+    if not text:
+
+        return ""
+
+    first = text.strip().split()[0]
+
+    if not first.startswith("/"):
+
+        return ""
+
+    first = first[1:]
+
+    if "@" in first:
+
+        first = first.split("@", 1)[0]
+
+    return first.lower()
+
+def help_text():
+
+    return """
+
+🤖 GENIOSA 4.0 — Business & Investment Advisor
+
+🏗️ პროექტები
+
+• პროექტების შექმნა და მართვა
+
+• ფართობები და ღირებულებები
+
+• შემოსავლები და მოგება
+
+• ფინანსური ანალიზი
+
+💼 ინვესტორები
+
+• ინვესტორების ბაზა
+
+• საკონტაქტო ინფორმაცია
+
+• საინვესტიციო შესაძლებლობები
+
+🤝 Deals / CRM
+
+• პროექტი + ინვესტორი
+
+• შეთავაზება
+
+• ინვესტორის წილი
+
+• შეფასება
+
+• შემდეგი ნაბიჯი
+
+📊 ფინანსები
+
+• ROI
+
+• Profit
+
+• Margin
+
+• Break-even
+
+• საჭირო გასაყიდი ფასი
+
+• სცენარების ანალიზი
+
+📄 დოკუმენტები
+
+• PDF
+
+• DOCX
+
+• XLSX / XLSM
+
+• PPTX
+
+• TXT
+
+• CSV
+
+🖼️ სურათები
+
+• ფოტოს AI ანალიზი
+
+• არქიტექტურული მასალები
+
+• ცხრილები და დიაგრამები
+
+• უძრავი ქონების ვიზუალური ანალიზი
+
+ძირითადი ბრძანებები:
+
+/start
+
+/help
+
+/status
+
+/memory
+
+/projects
+
+/project ID
+
+/investors
+
+/investor ID
+
+/deals
+
+/deal ID
+
+/documents
+
+/finance
+
+/finance ID
+
+ან უბრალოდ მომწერე ჩვეულებრივი ტექსტით.
+
+"""
+
+def start_text():
+
+    return """
+
+🤖 GENIOSA 4.0
+
+მოგესალმები.
+
+მე ვარ შენი პირადი Business & Investment Advisor.
+
+შემიძლია დაგეხმარო:
+
+🏗️ სამშენებლო და დეველოპერულ პროექტებში
+
+💰 ფინანსურ ანალიზში
+
+🤝 ინვესტორებთან მუშაობაში
+
+📊 ROI / Profit / Break-even ანალიზში
+
+📄 დოკუმენტების ანალიზში
+
+🖼️ ფოტოების ანალიზში
+
+🧠 ბიზნეს-მეხსიერებაში
+
+უბრალოდ მომწერე შენი მოთხოვნა.
+
+მაგალითად:
+
+„მაჩვენე ჩემი პროექტები“
+
+„გამოთვალე ამ პროექტის ROI“
+
+„დაამატე ახალი ინვესტორი“
+
+„გაანალიზე ეს დოკუმენტი“
+
+/help — ყველა ფუნქცია
+
+"""
+
+def status_text():
+
+    telegram_ok = bool(TELEGRAM_BOT_TOKEN)
+
+    database_ok = database_is_available()
+
+    gemini_ok = bool(GEMINI_API_KEY)
+
+    return (
+
+        "🟢 GENIOSA STATUS\n\n"
+
+        f"Telegram: {'✅' if telegram_ok else '❌'}\n"
+
+        f"Database: {'✅' if database_ok else '❌'}\n"
+
+        f"Gemini: {'✅' if gemini_ok else '❌'}\n"
+
+        "Application: ✅"
+
+    )
+
+def memory_command(chat_id):
+
+    memories = get_memories(
+
+        chat_id,
+
+        limit=50
+
+    )
+
+    if not memories:
+
+        return (
+
+            "🧠 შენახული ბიზნეს-მეხსიერება ჯერ არ არის."
+
+        )
+
+    lines = [
+
+        "🧠 შენახული მეხსიერება",
+
+        ""
+
+    ]
+
+    for memory in memories:
+
+        memory_id = memory.get("id")
+
+        category = memory.get("category") or "general"
+
+        importance = memory.get("importance") or 0
+
+        text_value = memory.get("memory") or ""
+
+        lines.append(
+
+            f"#{memory_id} [{category}] "
+
+            f"(მნიშვნელობა: {importance})"
+
+        )
+
+        lines.append(text_value)
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+def projects_command(chat_id):
+
+    projects = get_projects(
+
+        chat_id,
+
+        limit=50
+
+    )
+
+    if not projects:
+
+        return (
+
+            "🏗️ პროექტები ჯერ არ არის.\n\n"
+
+            "მაგალითი:\n"
+
+            "„შემიქმენი პროექტი Nikkea 12“"
+
+        )
+
+    return projects_summary(chat_id)
+
+def investors_command(chat_id):
+
+    investors = get_investors(
+
+        chat_id,
+
+        limit=100
+
+    )
+
+    if not investors:
+
+        return (
+
+            "💼 ინვესტორები ჯერ არ არის.\n\n"
+
+            "მაგალითი:\n"
+
+            "„დაამატე ინვესტორი John Smith, კომპანია ABC, UAE“"
+
+        )
+
+    return investors_summary(chat_id)
+
+def deals_command(chat_id):
+
+    deals = get_deals(
+
+        chat_id,
+
+        limit=100
+
+    )
+
+    if not deals:
+
+        return "🤝 გარიგებები ჯერ არ არის."
+
+    return deals_summary(chat_id)
+
+def documents_command(chat_id):
+
+    documents = get_documents(
+
+        chat_id,
+
+        limit=50
+
+    )
+
+    if not documents:
+
+        return (
+
+            "📄 დოკუმენტები ჯერ არ არის.\n\n"
+
+            "გამომიგზავნე PDF, DOCX, XLSX, PPTX, "
+
+            "TXT ან CSV ფაილი."
+
+        )
+
+    return documents_summary(chat_id)
+
+def finance_command(chat_id, args):
+
+    args = (args or "").strip()
 
     if not args:
 
+        projects = get_projects(
+
+            chat_id,
+
+            limit=50
+
+        )
+
+        if not projects:
+
+            return (
+
+                "📊 ფინანსური ანალიზისთვის ჯერ შექმენი პროექტი."
+
+            )
+
+        lines = [
+
+            "📊 ფინანსური ანალიზი",
+
+            "",
+
+            "მიუთითე Project ID:",
+
+            ""
+
+        ]
+
+        for project in projects:
+
+            lines.append(
+
+                f"#{project.get('id')} — "
+
+                f"{project.get('name')}"
+
+            )
+
+        lines.extend([
+
+            "",
+
+            "მაგალითი:",
+
+            "/finance 1"
+
+        ])
+
+        return "\n".join(lines)
+
+    project_id = safe_int(
+
+        args.split()[0]
+
+    )
+
+    if not project_id:
+
+        return (
+
+            "❌ Project ID უნდა იყოს რიცხვი.\n"
+
+            "მაგალითი: /finance 1"
+
+        )
+
+    model = analyze_project_financials(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if isinstance(model, dict) and model.get("error"):
+
+        return (
+
+            "❌ ფინანსური ანალიზი ვერ შესრულდა.\n\n"
+
+            + str(model.get("error"))
+
+        )
+
+    return (
+
+        "📊 PROJECT FINANCIAL ANALYSIS\n\n"
+
+        + format_financial_model(model)
+
+    )
+
+def project_command(chat_id, args):
+
+    args = (args or "").strip()
+
+    if not args:
+
+        return projects_command(chat_id)
+
+    project_id = safe_int(
+
+        args.split()[0]
+
+    )
+
+    if not project_id:
+
+        return "❌ Project ID უნდა იყოს რიცხვი."
+
+    project = get_project(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if not project:
+
+        return (
+
+            f"❌ პროექტი #{project_id} ვერ მოიძებნა."
+
+        )
+
+    lines = [
+
+        project_summary(project)
+
+    ]
+
+    deals = get_project_deals(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if deals:
+
+        lines.append("")
+
+        lines.append("🤝 დაკავშირებული Deals:")
+
+        for deal in deals:
+
+            lines.append(
+
+                format_deal(deal)
+
+            )
+
+    return "\n".join(lines)
+
+def investor_command(chat_id, args):
+
+    args = (args or "").strip()
+
+    if not args:
+
+        return investors_command(chat_id)
+
+    investor_id = safe_int(
+
+        args.split()[0]
+
+    )
+
+    if not investor_id:
+
+        return "❌ Investor ID უნდა იყოს რიცხვი."
+
+    investor = get_investor(
+
+        chat_id,
+
+        investor_id
+
+    )
+
+    if not investor:
+
+        return (
+
+            f"❌ ინვესტორი #{investor_id} ვერ მოიძებნა."
+
+        )
+
+    lines = [
+
+        format_investor(investor)
+
+    ]
+
+    deals = [
+
+        deal
+
+        for deal in get_deals(chat_id, limit=100)
+
+        if deal.get("investor_id") == investor_id
+
+    ]
+
+    if deals:
+
+        lines.append("")
+
+        lines.append("🤝 Deals:")
+
+        for deal in deals:
+
+            lines.append(
+
+                format_deal(deal)
+
+            )
+
+    return "\n".join(lines)
+
+def deal_command(chat_id, args):
+
+    args = (args or "").strip()
+
+    if not args:
+
+        return deals_command(chat_id)
+
+    deal_id = safe_int(
+
+        args.split()[0]
+
+    )
+
+    if not deal_id:
+
+        return "❌ Deal ID უნდა იყოს რიცხვი."
+
+    deal = get_deal(
+
+        chat_id,
+
+        deal_id
+
+    )
+
+    if not deal:
+
+        return (
+
+            f"❌ Deal #{deal_id} ვერ მოიძებნა."
+
+        )
+
+    return format_deal(deal)
+
+print("GENIOSA 4.0 — PART 8A/10 LOADED")# ============================================================
+
+# GENIOSA 4.0 — PART 8B/10
+
+# Natural language commands + text message handling
+
+# ============================================================
+
+def parse_key_value_text(text):
+
+    """
+
+    ამოიცნობს მარტივ key:value ან key=value ფორმატს.
+
+    გამოიყენება პროექტებისა და ინვესტორების შექმნისას.
+
+    """
+
+    result = {}
+
+    if not text:
+
+        return result
+
+    parts = re.split(
+
+        r"[;\n]+",
+
+        text
+
+    )
+
+    for part in parts:
+
+        part = part.strip()
+
+        if not part:
+
+            continue
+
+        match = re.match(
+
+            r"^\s*([^:=]+?)\s*[:=]\s*(.+?)\s*$",
+
+            part
+
+        )
+
+        if not match:
+
+            continue
+
+        key = match.group(1).strip().lower()
+
+        value = match.group(2).strip()
+
+        result[key] = value
+
+    return result
+
+def first_number(text):
+
+    if not text:
+
         return None
 
-    match = re.search(r"\d+", args)
+    match = re.search(
+
+        r"-?\d+(?:[.,]\d+)?",
+
+        str(text)
+
+    )
 
     if not match:
 
@@ -9060,495 +11524,313 @@ def parse_int_argument(args):
 
     try:
 
-        return int(match.group(0))
+        return float(
+
+            match.group(0).replace(",", ".")
+
+        )
 
     except Exception:
 
         return None
+
+def normalize_text_value(value):
+
+    if value is None:
+
+        return None
+
+    value = str(value).strip()
+
+    if not value:
+
+        return None
+
+    return value
 
 def create_project_from_text(chat_id, text):
 
-    if not text:
+    """
 
-        return (
+    ცდილობს მომხმარებლის ჩვეულებრივი ტექსტიდან
 
-            "მაგალითი:\n"
+    პროექტის შექმნას.
 
-            "/newproject ქუთაისში სასტუმროს პროექტი, "
+    """
 
-            "ნიკეას ქუჩაზე, 3070 მ² მიწაზე."
-
-        )
-
-    try:
-
-        data = extract_project_data_with_ai(chat_id, text)
-
-        if not isinstance(data, dict):
-
-            return "პროექტის მონაცემების ამოცნობა ვერ მოხერხდა."
-
-        name = (
-
-            data.get("name")
-
-            or data.get("project_name")
-
-            or data.get("title")
-
-        )
-
-        if not name:
-
-            return (
-
-                "პროექტის სახელი ვერ ამოვიცანი.\n\n"
-
-                "გთხოვ, მიუთითე პროექტის სახელი.\n"
-
-                "მაგალითად:\n"
-
-                "/newproject NIKKEA 12 Kutaisi"
-
-            )
-
-        project = create_project(
-
-            chat_id=chat_id,
-
-            name=name,
-
-            description=data.get("description"),
-
-            location=data.get("location"),
-
-            industry=data.get("industry"),
-
-            status=data.get("status") or "active",
-
-            land_area=to_float(data.get("land_area")),
-
-            build_area=to_float(data.get("build_area")),
-
-            saleable_area=to_float(data.get("saleable_area")),
-
-            land_cost=to_float(data.get("land_cost")),
-
-            construction_cost=to_float(
-
-                data.get("construction_cost")
-
-            ),
-
-            total_cost=to_float(data.get("total_cost")),
-
-            expected_revenue=to_float(
-
-                data.get("expected_revenue")
-
-            ),
-
-            expected_profit=to_float(
-
-                data.get("expected_profit")
-
-            ),
-
-            net_profit=to_float(data.get("net_profit")),
-
-            notes=data.get("notes"),
-
-        )
-
-        if not project:
-
-            return "❌ პროექტის შექმნა ვერ მოხერხდა."
-
-        return (
-
-            "✅ პროექტი წარმატებით შეიქმნა.\n\n"
-
-            + format_project(project)
-
-        )
-
-    except Exception as e:
-
-        logging.exception(
-
-            "create_project_from_text error: %s",
-
-            e
-
-        )
-
-        return (
-
-            "❌ პროექტის შექმნისას დაფიქსირდა შეცდომა.\n"
-
-            "გთხოვ, ისევ სცადო."
-
-        )
-
-def extract_investor_data_with_ai(chat_id, text):
-
-    prompt = f"""
-
-მომხმარებელს უნდა ინვესტორის დამატება CRM-ში.
-
-მომხმარებლის ტექსტი:
-
-{text}
-
-დააბრუნე მხოლოდ JSON ობიექტი შემდეგი ველებით:
-
-{{
-
-  "name": "",
-
-  "company": "",
-
-  "country": "",
-
-  "contact": "",
-
-  "investment_capacity": null,
-
-  "preferred_sector": "",
-
-  "status": "new",
-
-  "notes": ""
-
-}}
-
-წესები:
-
-- არ მოიგონო ინფორმაცია.
-
-- თუ ინფორმაცია არ არის, დატოვე ცარიელი.
-
-- investment_capacity უნდა იყოს მხოლოდ რიცხვი ან null.
-
-- მხოლოდ JSON დააბრუნე.
-
-"""
-
-    raw = gemini_generate(prompt)
-
-    if not raw:
-
-        return None
-
-    try:
-
-        cleaned = raw.strip()
-
-        if cleaned.startswith("```"):
-
-            cleaned = re.sub(
-
-                r"^```(?:json)?",
-
-                "",
-
-                cleaned,
-
-                flags=re.IGNORECASE
-
-            )
-
-            cleaned = re.sub(
-
-                r"```$",
-
-                "",
-
-                cleaned
-
-            ).strip()
-
-        match = re.search(
-
-            r"\{.*\}",
-
-            cleaned,
-
-            flags=re.DOTALL
-
-        )
-
-        if not match:
-
-            return None
-
-        return json.loads(match.group(0))
-
-    except Exception:
-
-        logging.exception(
-
-            "Investor JSON parsing error"
-
-        )
-
-        return None
-
-def create_investor_from_text(chat_id, text):
+    text = (text or "").strip()
 
     if not text:
 
         return (
 
-            "მაგალითი:\n"
-
-            "/newinvestor ABC Development, "
-
-            "Dubai, real estate investor, "
-
-            "capacity $20M"
+            "❌ პროექტის ინფორმაცია არ არის მითითებული."
 
         )
 
-    data = extract_investor_data_with_ai(
+    data = parse_key_value_text(text)
 
-        chat_id,
+    name = (
 
-        text
+        data.get("name")
+
+        or data.get("project")
+
+        or data.get("პროექტი")
+
+        or data.get("სახელი")
 
     )
 
-    if not data:
-
-        return "ინვესტორის მონაცემების ამოცნობა ვერ მოხერხდა."
-
-    name = data.get("name")
-
     if not name:
 
-        return (
+        match = re.search(
 
-            "ინვესტორის სახელი ვერ ამოვიცანი.\n"
+            r"(?:პროექტი|project)\s*[:\-]?\s*(.+)",
 
-            "გთხოვ, მიუთითე სახელი ან კომპანიის დასახელება."
+            text,
+
+            re.IGNORECASE
 
         )
 
+        if match:
+
+            name = match.group(1).strip()
+
+    if not name:
+
+        name = text[:120]
+
+    industry = (
+
+        data.get("industry")
+
+        or data.get("sector")
+
+        or data.get("ინდუსტრია")
+
+        or data.get("სექტორი")
+
+        or "real_estate"
+
+    )
+
+    location = (
+
+        data.get("location")
+
+        or data.get("city")
+
+        or data.get("ადგილმდებარეობა")
+
+    )
+
+    description = (
+
+        data.get("description")
+
+        or data.get("აღწერა")
+
+        or text
+
+    )
+
+    land_area = (
+
+        first_number(data.get("land_area"))
+
+        or first_number(data.get("land"))
+
+        or first_number(data.get("მიწა"))
+
+    )
+
+    saleable_area = (
+
+        first_number(data.get("saleable_area"))
+
+        or first_number(data.get("saleable"))
+
+        or first_number(data.get("გასაყიდი"))
+
+    )
+
+    construction_area = (
+
+        first_number(data.get("construction_area"))
+
+        or first_number(data.get("construction"))
+
+        or first_number(data.get("მშენებლობა"))
+
+    )
+
+    total_area = (
+
+        first_number(data.get("total_area"))
+
+        or first_number(data.get("total"))
+
+        or first_number(data.get("საერთო"))
+
+    )
+
+    revenue = (
+
+        first_number(data.get("revenue"))
+
+        or first_number(data.get("შემოსავალი"))
+
+    )
+
+    total_cost = (
+
+        first_number(data.get("total_cost"))
+
+        or first_number(data.get("cost"))
+
+        or first_number(data.get("ღირებულება"))
+
+    )
+
+    net_profit = (
+
+        first_number(data.get("net_profit"))
+
+        or first_number(data.get("profit"))
+
+        or first_number(data.get("მოგება"))
+
+    )
+
+    investor_capital = (
+
+        first_number(data.get("investor_capital"))
+
+        or first_number(data.get("capital"))
+
+        or first_number(data.get("ინვესტიცია"))
+
+    )
+
+    investor_profit = (
+
+        first_number(data.get("investor_profit"))
+
+    )
+
+    investor_share = (
+
+        first_number(data.get("investor_share"))
+
+        or first_number(data.get("share"))
+
+        or first_number(data.get("წილი"))
+
+    )
+
+    land_cost = (
+
+        first_number(data.get("land_cost"))
+
+        or first_number(data.get("land_price"))
+
+    )
+
+    construction_cost = (
+
+        first_number(data.get("construction_cost"))
+
+    )
+
+    financing_cost = (
+
+        first_number(data.get("financing_cost"))
+
+    )
+
+    other_cost = (
+
+        first_number(data.get("other_cost"))
+
+    )
+
+    expected_revenue = (
+
+        first_number(data.get("expected_revenue"))
+
+    )
+
+    expected_profit = (
+
+        first_number(data.get("expected_profit"))
+
+    )
+
+    notes = (
+
+        data.get("notes")
+
+        or data.get("note")
+
+        or data.get("შენიშვნა")
+
+    )
+
     try:
 
-        investor = create_investor(
+        project_id = create_project(
 
             chat_id=chat_id,
 
             name=name,
 
-            company=data.get("company"),
+            industry=industry,
 
-            country=data.get("country"),
+            location=location,
 
-            contact=data.get("contact"),
+            description=description,
 
-            investment_capacity=to_float(
+            land_area=land_area,
 
-                data.get("investment_capacity")
+            saleable_area=saleable_area,
 
-            ),
+            construction_area=construction_area,
 
-            preferred_sector=data.get("preferred_sector"),
+            total_area=total_area,
 
-            status=data.get("status") or "new",
+            revenue=revenue,
 
-            notes=data.get("notes"),
+            total_cost=total_cost,
 
-        )
+            operating_cost=None,
 
-        if not investor:
+            net_profit=net_profit,
 
-            return "❌ ინვესტორის დამატება ვერ მოხერხდა."
+            investor_capital=investor_capital,
 
-        return (
+            investor_profit=investor_profit,
 
-            "✅ ინვესტორი დაემატა CRM-ში.\n\n"
+            investor_share=investor_share,
 
-            + format_investor(investor)
+            status="active",
 
-        )
+            land_cost=land_cost,
 
-    except Exception as e:
+            construction_cost=construction_cost,
 
-        logging.exception(
+            financing_cost=financing_cost,
 
-            "create_investor_from_text error: %s",
+            other_cost=other_cost,
 
-            e
+            expected_revenue=expected_revenue,
 
-        )
+            expected_profit=expected_profit,
 
-        return "❌ ინვესტორის დამატებისას მოხდა შეცდომა."
-
-def handle_command(chat_id, text):
-
-    command, args = parse_command(text)
-
-    if not command:
-
-        return None
-
-    # =========================
-
-    # START
-
-    # =========================
-
-    if command == "/start":
-
-        return (
-
-            "👋 მოგესალმები Geniosa-ში.\n\n"
-
-            "მე ვარ შენი AI ბიზნეს ასისტენტი.\n"
-
-            "შემიძლია დაგეხმარო პროექტებში, ინვესტორებში, "
-
-            "გარიგებებში, ფინანსურ ანალიზში და დოკუმენტებში.\n\n"
-
-            "დაიწყე /help ბრძანებით."
+            notes=notes
 
         )
-
-    # =========================
-
-    # HELP
-
-    # =========================
-
-    if command in ("/help", "/commands"):
-
-        return command_help()
-
-    # =========================
-
-    # STATUS
-
-    # =========================
-
-    if command == "/status":
-
-        try:
-
-            conn = db()
-
-            with conn.cursor() as cur:
-
-                cur.execute("SELECT 1")
-
-                cur.fetchone()
-
-            conn.close()
-
-            return (
-
-                "🟢 GENIOSA STATUS\n\n"
-
-                "Telegram: ✅\n"
-
-                "Database: ✅\n"
-
-                f"Gemini: {'✅' if GEMINI_API_KEY else '❌'}\n"
-
-                "Application: ✅"
-
-            )
-
-        except Exception as e:
-
-            logging.exception(
-
-                "Status check error: %s",
-
-                e
-
-            )
-
-            return (
-
-                "🟡 GENIOSA STATUS\n\n"
-
-                "Telegram: ✅\n"
-
-                "Database: ❌\n"
-
-                "Application: ⚠️"
-
-            )
-
-    # =========================
-
-    # PROJECTS
-
-    # =========================
-
-    if command == "/projects":
-
-        projects = get_projects(chat_id)
-
-        return format_project_list(projects)
-
-    if command == "/project":
-
-        project_id = parse_int_argument(args)
-
-        if project_id:
-
-            project = get_project(
-
-                chat_id,
-
-                project_id
-
-            )
-
-        else:
-
-            project = get_primary_project(chat_id)
-
-        if not project:
-
-            return (
-
-                "📭 პროექტი ვერ მოიძებნა.\n\n"
-
-                "შეგიძლია შექმნა:\n"
-
-                "/newproject პროექტის აღწერა"
-
-            )
-
-        return format_project(project)
-
-    if command == "/newproject":
-
-        return create_project_from_text(
-
-            chat_id,
-
-            args
-
-        )
-
-    if command == "/delete_project":
-
-        project_id = parse_int_argument(args)
-
-        if not project_id:
-
-            return (
-
-                "გამოიყენე:\n"
-
-                "/delete_project ID"
-
-            )
 
         project = get_project(
 
@@ -9558,185 +11840,59 @@ def handle_command(chat_id, text):
 
         )
 
-        if not project:
+        return (
 
-            return "ასეთი პროექტი ვერ მოიძებნა."
+            "✅ პროექტი შეიქმნა.\n\n"
 
-        success = delete_project(
-
-            chat_id,
-
-            project_id
+            + project_summary(project)
 
         )
 
-        if success:
+    except TypeError:
 
-            return (
+        # თავსებადობა იმ შემთხვევისთვის,
 
-                f"🗑️ პროექტი #{project_id} წაიშალა."
+        # თუ create_project-ის ძველი signature გამოიყენება.
 
-            )
+        try:
 
-        return "პროექტის წაშლა ვერ მოხერხდა."
+            project_id = create_project(
 
-    # =========================
+                chat_id=chat_id,
 
-    # INVESTORS
+                name=name,
 
-    # =========================
+                industry=industry,
 
-    if command == "/investors":
+                location=location,
 
-        investors = get_investors(chat_id)
+                description=description,
 
-        if not investors:
+                land_area=land_area,
 
-            return (
+                saleable_area=saleable_area,
 
-                "📭 ინვესტორები ჯერ არ არის დამატებული.\n\n"
+                construction_area=construction_area,
 
-                "შეგიძლია დაამატო:\n"
+                total_area=total_area,
 
-                "/newinvestor ინვესტორის ინფორმაცია"
+                revenue=revenue,
 
-            )
+                total_cost=total_cost,
 
-        return investors_summary(investors)
+                operating_cost=None,
 
-    if command == "/investor":
+                net_profit=net_profit,
 
-        investor_id = parse_int_argument(args)
+                investor_capital=investor_capital,
 
-        if not investor_id:
+                investor_profit=investor_profit,
 
-            return (
+                investor_share=investor_share,
 
-                "გამოიყენე:\n"
-
-                "/investor ID"
+                status="active"
 
             )
-
-        investor = get_investor(
-
-            chat_id,
-
-            investor_id
-
-        )
-
-        if not investor:
-
-            return "ინვესტორი ვერ მოიძებნა."
-
-        return format_investor(investor)
-
-    if command == "/newinvestor":
-
-        return create_investor_from_text(
-
-            chat_id,
-
-            args
-
-        )
-
-    # =========================
-
-    # DEALS
-
-    # =========================
-
-    if command == "/deals":
-
-        deals = get_deals(chat_id)
-
-        if not deals:
-
-            return "📭 გარიგებები ჯერ არ არის დამატებული."
-
-        return deals_summary(deals)
-
-    if command == "/deal":
-
-        deal_id = parse_int_argument(args)
-
-        if not deal_id:
-
-            return (
-
-                "გამოიყენე:\n"
-
-                "/deal ID"
-
-            )
-
-        deal = get_deal(
-
-            chat_id,
-
-            deal_id
-
-        )
-
-        if not deal:
-
-            return "გარიგება ვერ მოიძებნა."
-
-        return format_deal(deal)
-
-    # =========================
-
-    # DOCUMENTS
-
-    # =========================
-
-    if command == "/documents":
-
-        documents = get_documents(chat_id)
-
-        return documents_summary(documents)
-
-    if command == "/document":
-
-        document_id = parse_int_argument(args)
-
-        if not document_id:
-
-            return (
-
-                "გამოიყენე:\n"
-
-                "/document ID"
-
-            )
-
-        document = get_document(
-
-            chat_id,
-
-            document_id
-
-        )
-
-        if not document:
-
-            return "დოკუმენტი ვერ მოიძებნა."
-
-        return format_document(document)
-
-    # =========================
-
-    # FINANCIAL
-
-    # =========================
-
-    if command == "/financial":
-
-        project_id = parse_int_argument(args)
-
-        if project_id:
 
             project = get_project(
 
@@ -9746,319 +11902,477 @@ def handle_command(chat_id, text):
 
             )
 
-        else:
+            return (
 
-            project = get_primary_project(chat_id)
+                "✅ პროექტი შეიქმნა.\n\n"
 
-        if not project:
-
-            return "ფინანსური ანალიზისთვის პროექტი ვერ მოიძებნა."
-
-        try:
-
-            snapshot = build_project_financial_snapshot(
-
-                project
+                + project_summary(project)
 
             )
 
-            return format_financial_report(
-
-                snapshot
-
-            )
-
-        except Exception as e:
+        except Exception as exc:
 
             logging.exception(
 
-                "Financial command error: %s",
-
-                e
+                "Project creation failed"
 
             )
 
             return (
 
-                "ფინანსური ანალიზის შექმნა ვერ მოხერხდა."
+                "❌ პროექტის შექმნა ვერ მოხერხდა.\n\n"
+
+                + str(exc)
 
             )
 
-    # =========================
+    except Exception as exc:
 
-    # MEMORY
+        logging.exception(
 
-    # =========================
+            "Project creation failed"
 
-    if command == "/memory":
+        )
 
-        return memory_summary(chat_id)
+        return (
 
-    if command == "/forget":
+            "❌ პროექტის შექმნა ვერ მოხერხდა.\n\n"
 
-        memory_id = parse_int_argument(args)
+            + str(exc)
 
-        if not memory_id:
+        )
 
-            return (
+def create_investor_from_text(chat_id, text):
 
-                "გამოიყენე:\n"
+    """
 
-                "/forget ID"
+    ცდილობს ჩვეულებრივი ტექსტიდან ინვესტორის შექმნას.
 
-            )
+    """
 
-        try:
+    text = (text or "").strip()
 
-            deleted = delete_memory(
+    if not text:
 
-                chat_id,
+        return (
 
-                memory_id
+            "❌ ინვესტორის ინფორმაცია არ არის მითითებული."
 
-            )
+        )
 
-            if deleted:
+    data = parse_key_value_text(text)
 
-                return (
+    name = (
 
-                    f"🗑️ მეხსიერების ჩანაწერი "
+        data.get("name")
 
-                    f"#{memory_id} წაიშალა."
+        or data.get("investor")
 
-                )
+        or data.get("სახელი")
 
-            return "ასეთი მეხსიერების ჩანაწერი ვერ მოიძებნა."
-
-        except Exception:
-
-            logging.exception(
-
-                "Memory delete error"
-
-            )
-
-            return "მეხსიერების წაშლა ვერ მოხერხდა."
-
-    # =========================
-
-    # UNKNOWN COMMAND
-
-    # =========================
-
-    return (
-
-        "❓ ასეთი ბრძანება არ ვიცი.\n\n"
-
-        "იხილე ყველა ხელმისაწვდომი ბრძანება:\n"
-
-        "/help"
+        or data.get("ინვესტორი")
 
     )
 
-print("GENIOSA PART 7/10 LOADED")# =========================
+    if not name:
 
-# PART 8/10 — MESSAGE ROUTER
+        match = re.search(
 
-# =========================
+            r"(?:ინვესტორი|investor)\s*[:\-]?\s*(.+)",
 
-def normalize_text(text):
+            text,
 
-    if text is None:
+            re.IGNORECASE
 
-        return ""
+        )
 
-    return str(text).strip()
+        if match:
 
-def is_command(text):
+            name = match.group(1).strip()
 
-    text = normalize_text(text)
+    if not name:
 
-    return text.startswith("/")
+        name = text[:120]
+
+    company = (
+
+        data.get("company")
+
+        or data.get("კომპანია")
+
+    )
+
+    country = (
+
+        data.get("country")
+
+        or data.get("ქვეყანა")
+
+    )
+
+    contact = (
+
+        data.get("contact")
+
+        or data.get("email")
+
+        or data.get("phone")
+
+        or data.get("კონტაქტი")
+
+    )
+
+    investment_capacity = (
+
+        first_number(
+
+            data.get("investment_capacity")
+
+        )
+
+        or first_number(
+
+            data.get("capacity")
+
+        )
+
+        or first_number(
+
+            data.get("ინვესტიციის_უნარი")
+
+        )
+
+    )
+
+    preferred_sector = (
+
+        data.get("preferred_sector")
+
+        or data.get("sector")
+
+        or data.get("industry")
+
+        or data.get("სექტორი")
+
+        or data.get("ინდუსტრია")
+
+    )
+
+    status = (
+
+        data.get("status")
+
+        or data.get("სტატუსი")
+
+        or "new"
+
+    )
+
+    notes = (
+
+        data.get("notes")
+
+        or data.get("note")
+
+        or data.get("შენიშვნა")
+
+        or text
+
+    )
+
+    try:
+
+        investor_id = create_investor(
+
+            chat_id=chat_id,
+
+            name=name,
+
+            company=company,
+
+            country=country,
+
+            contact=contact,
+
+            investment_capacity=investment_capacity,
+
+            preferred_sector=preferred_sector,
+
+            status=status,
+
+            notes=notes
+
+        )
+
+        investor = get_investor(
+
+            chat_id,
+
+            investor_id
+
+        )
+
+        return (
+
+            "✅ ინვესტორი შეიქმნა.\n\n"
+
+            + format_investor(investor)
+
+        )
+
+    except TypeError:
+
+        try:
+
+            investor_id = create_investor(
+
+                chat_id=chat_id,
+
+                name=name,
+
+                company=company,
+
+                country=country,
+
+                contact=contact
+
+            )
+
+            investor = get_investor(
+
+                chat_id,
+
+                investor_id
+
+            )
+
+            return (
+
+                "✅ ინვესტორი შეიქმნა.\n\n"
+
+                + format_investor(investor)
+
+            )
+
+        except Exception as exc:
+
+            logging.exception(
+
+                "Investor creation failed"
+
+            )
+
+            return (
+
+                "❌ ინვესტორის შექმნა ვერ მოხერხდა.\n\n"
+
+                + str(exc)
+
+            )
+
+    except Exception as exc:
+
+        logging.exception(
+
+            "Investor creation failed"
+
+        )
+
+        return (
+
+            "❌ ინვესტორის შექმნა ვერ მოხერხდა.\n\n"
+
+            + str(exc)
+
+        )
+
+def handle_command(chat_id, text):
+
+    """
+
+    Telegram command router.
+
+    """
+
+    name = command_name(text)
+
+    args = extract_command_args(text)
+
+    if name == "start":
+
+        return start_text()
+
+    if name == "help":
+
+        return help_text()
+
+    if name == "status":
+
+        return status_text()
+
+    if name == "memory":
+
+        return memory_command(chat_id)
+
+    if name == "projects":
+
+        return projects_command(chat_id)
+
+    if name == "project":
+
+        return project_command(
+
+            chat_id,
+
+            args
+
+        )
+
+    if name == "investors":
+
+        return investors_command(chat_id)
+
+    if name == "investor":
+
+        return investor_command(
+
+            chat_id,
+
+            args
+
+        )
+
+    if name == "deals":
+
+        return deals_command(chat_id)
+
+    if name == "deal":
+
+        return deal_command(
+
+            chat_id,
+
+            args
+
+        )
+
+    if name == "documents":
+
+        return documents_command(chat_id)
+
+    if name == "finance":
+
+        return finance_command(
+
+            chat_id,
+
+            args
+
+        )
+
+    return None
 
 def looks_like_project_request(text):
 
-    t = normalize_text(text).lower()
+    if not text:
+
+        return False
+
+    lower = text.lower()
 
     keywords = [
 
-        "პროექტი",
+        "შემიქმენი პროექტი",
 
-        "პროექტის",
+        "შექმენი პროექტი",
 
-        "project",
+        "დაამატე პროექტი",
 
-        "უძრავი ქონება",
+        "ახალი პროექტი",
 
-        "მშენებლობა",
+        "create project",
 
-        "დეველოპმენტი",
+        "new project",
 
-        "developer",
-
-        "construction",
-
-        "development",
+        "add project"
 
     ]
 
-    return any(k in t for k in keywords)
+    return any(
+
+        keyword in lower
+
+        for keyword in keywords
+
+    )
 
 def looks_like_investor_request(text):
 
-    t = normalize_text(text).lower()
+    if not text:
+
+        return False
+
+    lower = text.lower()
 
     keywords = [
 
-        "ინვესტორი",
+        "დაამატე ინვესტორი",
 
-        "ინვესტორები",
+        "შექმენი ინვესტორი",
 
-        "ინვესტიცია",
+        "ახალი ინვესტორი",
 
-        "investor",
+        "შემიქმენი ინვესტორი",
 
-        "investors",
+        "add investor",
 
-        "investment",
+        "create investor",
 
-        "fund",
-
-        "ფონდი",
+        "new investor"
 
     ]
 
-    return any(k in t for k in keywords)
+    return any(
 
-def looks_like_financial_request(text):
+        keyword in lower
 
-    t = normalize_text(text).lower()
+        for keyword in keywords
 
-    keywords = [
+    )
 
-        "ფინანს",
+def handle_text_message(chat_id, text):
 
-        "მოგება",
+    """
 
-        "შემოსავალი",
+    მთავარი ტექსტური დამუშავება.
 
-        "ხარჯი",
+    პრიორიტეტი:
 
-        "ბიუჯეტი",
+    1. Telegram commands
 
-        "profit",
+    2. Project creation
 
-        "revenue",
+    3. Investor creation
 
-        "cost",
+    4. ჩვეულებრივი AI კითხვა
 
-        "financial",
+    """
 
-        "roi",
+    text = (text or "").strip()
 
-        "cash flow",
+    if not text:
 
-        "break even",
+        return "❌ ცარიელი შეტყობინებაა."
 
-        "payback",
+    # --------------------------------------------------------
 
-    ]
+    # 1. Telegram command
 
-    return any(k in t for k in keywords)
+    # --------------------------------------------------------
 
-def looks_like_deal_request(text):
+    if text.startswith("/"):
 
-    t = normalize_text(text).lower()
-
-    keywords = [
-
-        "გარიგება",
-
-        "deal",
-
-        "crm",
-
-        "შეთანხმება",
-
-        "ინვესტორის შეთავაზება",
-
-        "კონტრაქტი",
-
-        "ხელშეკრულება",
-
-    ]
-
-    return any(k in t for k in keywords)
-
-def looks_like_document_request(text):
-
-    t = normalize_text(text).lower()
-
-    keywords = [
-
-        "დოკუმენტი",
-
-        "ფაილი",
-
-        "pdf",
-
-        "excel",
-
-        "xlsx",
-
-        "docx",
-
-        "pptx",
-
-        "ფაილები",
-
-    ]
-
-    return any(k in t for k in keywords)
-
-def build_router_context(chat_id):
-
-    parts = []
-
-    try:
-
-        project_context = build_project_context(chat_id)
-
-        if project_context:
-
-            parts.append(project_context)
-
-    except Exception:
-
-        logging.exception(
-
-            "Could not build project context"
-
-        )
-
-    try:
-
-        memory_context = build_memory_context(chat_id)
-
-        if memory_context:
-
-            parts.append(memory_context)
-
-    except Exception:
-
-        logging.exception(
-
-            "Could not build memory context"
-
-        )
-
-    return "\n\n".join(parts)
-
-def safe_ai_reply(chat_id, text):
-
-    try:
-
-        reply = ai_chat(
+        result = handle_command(
 
             chat_id,
 
@@ -10066,495 +12380,55 @@ def safe_ai_reply(chat_id, text):
 
         )
 
-        if reply:
+        if result is not None:
 
-            return reply
-
-        return (
-
-            "ამ მომენტში AI პასუხის მიღება ვერ მოხერხდა.\n"
-
-            "გთხოვ, რამდენიმე წამში ისევ სცადო."
-
-        )
-
-    except Exception as e:
-
-        logging.exception(
-
-            "AI reply error: %s",
-
-            e
-
-        )
+            return result
 
         return (
 
-            "დაფიქსირდა დროებითი AI შეცდომა.\n"
+            "❌ უცნობი ბრძანებაა.\n\n"
 
-            "გთხოვ, ისევ სცადო."
-
-        )
-
-def handle_text_message(chat_id, text):
-
-    text = normalize_text(text)
-
-    if not text:
-
-        return (
-
-            "მომწერე ტექსტი ან გამომიგზავნე "
-
-            "ფაილი/სურათი."
+            "გამოიყენე /help"
 
         )
 
-    # =========================
+    # --------------------------------------------------------
 
-    # MEMORY
+    # 2. Project creation
 
-    # =========================
-
-    if looks_like_memory_request(text):
-
-        try:
-
-            saved = save_memory_from_message(
-
-                chat_id,
-
-                text
-
-            )
-
-            if saved:
-
-                return (
-
-                    "✅ ინფორმაცია შევინახე "
-
-                    "მეხსიერებაში.\n\n"
-
-                    f"{saved}"
-
-                )
-
-        except Exception:
-
-            logging.exception(
-
-                "Memory save error"
-
-            )
-
-        return (
-
-            "მეხსიერებაში შენახვა ვერ მოხერხდა."
-
-        )
-
-    # =========================
-
-    # FINANCIAL
-
-    # =========================
-
-    if looks_like_financial_request(text):
-
-        try:
-
-            project = get_primary_project(
-
-                chat_id
-
-            )
-
-            if project:
-
-                snapshot = (
-
-                    build_project_financial_snapshot(
-
-                        project
-
-                    )
-
-                )
-
-                report = format_financial_report(
-
-                    snapshot
-
-                )
-
-                prompt = (
-
-                    "მომხმარებელი სვამს ფინანსურ "
-
-                    "კითხვას პროექტთან დაკავშირებით.\n\n"
-
-                    "პროექტის ფინანსური მონაცემები:\n"
-
-                    f"{report}\n\n"
-
-                    "მომხმარებლის კითხვა:\n"
-
-                    f"{text}\n\n"
-
-                    "უპასუხე ქართულად. "
-
-                    "გამოიყენე მხოლოდ მოცემული მონაცემები. "
-
-                    "თუ რაიმე მონაცემი არ არის, "
-
-                    "პირდაპირ თქვი რომ მონაცემი არ გვაქვს. "
-
-                    "არ მოიგონო ციფრები."
-
-                )
-
-                answer = safe_ai_reply(
-
-                    chat_id,
-
-                    prompt
-
-                )
-
-                if answer:
-
-                    return answer
-
-        except Exception:
-
-            logging.exception(
-
-                "Financial routing error"
-
-            )
-
-    # =========================
-
-    # PROJECT
-
-    # =========================
+    # --------------------------------------------------------
 
     if looks_like_project_request(text):
 
-        try:
+        return create_project_from_text(
 
-            project = get_primary_project(
+            chat_id,
 
-                chat_id
-
-            )
-
-            if project:
-
-                context = build_project_context(
-
-                    chat_id
-
-                )
-
-                prompt = (
-
-                    "უპასუხე მომხმარებლის კითხვას "
-
-                    "მისი პროექტის კონტექსტის გამოყენებით.\n\n"
-
-                    f"{context}\n\n"
-
-                    f"კითხვა:\n{text}\n\n"
-
-                    "უპასუხე ქართულად, კონკრეტულად "
-
-                    "და პრაქტიკულად. "
-
-                    "არ მოიგონო ისეთი ფაქტები, "
-
-                    "რომლებიც კონტექსტში არ არის."
-
-                )
-
-                answer = safe_ai_reply(
-
-                    chat_id,
-
-                    prompt
-
-                )
-
-                if answer:
-
-                    return answer
-
-        except Exception:
-
-            logging.exception(
-
-                "Project routing error"
-
-            )
-
-    # =========================
-
-    # INVESTOR
-
-    # =========================
-
-    if looks_like_investor_request(text):
-
-        try:
-
-            investors = get_investors(
-
-                chat_id
-
-            )
-
-            investor_text = investors_summary(
-
-                investors
-
-            )
-
-            prompt = (
-
-                "მომხმარებელი საუბრობს "
-
-                "ინვესტორებთან დაკავშირებით.\n\n"
-
-                f"შენახული ინვესტორები:\n"
-
-                f"{investor_text}\n\n"
-
-                f"მომხმარებლის მოთხოვნა:\n{text}\n\n"
-
-                "უპასუხე ქართულად. "
-
-                "თუ მონაცემთა ბაზაში ინფორმაცია "
-
-                "არ არის, პირდაპირ აღნიშნე ეს. "
-
-                "არ მოიგონო ინვესტორის მონაცემები."
-
-            )
-
-            answer = safe_ai_reply(
-
-                chat_id,
-
-                prompt
-
-            )
-
-            if answer:
-
-                return answer
-
-        except Exception:
-
-            logging.exception(
-
-                "Investor routing error"
-
-            )
-
-    # =========================
-
-    # DEAL / CRM
-
-    # =========================
-
-    if looks_like_deal_request(text):
-
-        try:
-
-            deals = get_deals(
-
-                chat_id
-
-            )
-
-            deal_text = deals_summary(
-
-                deals
-
-            )
-
-            prompt = (
-
-                "მომხმარებელი ეკითხება "
-
-                "საინვესტიციო გარიგებებს ან CRM-ს.\n\n"
-
-                f"შენახული გარიგებები:\n"
-
-                f"{deal_text}\n\n"
-
-                f"მოთხოვნა:\n{text}\n\n"
-
-                "უპასუხე ქართულად და პრაქტიკულად. "
-
-                "არ მოიგონო მონაცემები."
-
-            )
-
-            answer = safe_ai_reply(
-
-                chat_id,
-
-                prompt
-
-            )
-
-            if answer:
-
-                return answer
-
-        except Exception:
-
-            logging.exception(
-
-                "Deal routing error"
-
-            )
-
-    # =========================
-
-    # DOCUMENTS
-
-    # =========================
-
-    if looks_like_document_request(text):
-
-        try:
-
-            docs = get_documents(
-
-                chat_id
-
-            )
-
-            if docs:
-
-                lines = [
-
-                    "📄 შენახული დოკუმენტები:\n"
-
-                ]
-
-                for doc in docs[:20]:
-
-                    doc_id = doc.get("id")
-
-                    filename = (
-
-                        doc.get("filename")
-
-                        or "უცნობი ფაილი"
-
-                    )
-
-                    file_type = (
-
-                        doc.get("file_type")
-
-                        or ""
-
-                    )
-
-                    lines.append(
-
-                        f"#{doc_id} — "
-
-                        f"{filename} {file_type}"
-
-                    )
-
-                return "\n".join(lines)
-
-        except Exception:
-
-            logging.exception(
-
-                "Document routing error"
-
-            )
-
-    # =========================
-
-    # GENERAL AI
-
-    # =========================
-
-    return safe_ai_reply(
-
-        chat_id,
-
-        text
-
-    )
-
-def process_text_update(update):
-
-    if not isinstance(update, dict):
-
-        return None
-
-    message = update.get(
-
-        "message"
-
-    ) or {}
-
-    chat = message.get(
-
-        "chat"
-
-    ) or {}
-
-    chat_id = chat.get(
-
-        "id"
-
-    )
-
-    if not chat_id:
-
-        return None
-
-    if not user_allowed(chat_id):
-
-        logging.warning(
-
-            "Unauthorized user attempted access: %s",
-
-            chat_id
+            text
 
         )
 
-        return None
+    # --------------------------------------------------------
 
-    text = message.get(
+    # 3. Investor creation
 
-        "text"
+    # --------------------------------------------------------
 
-    )
+    if looks_like_investor_request(text):
 
-    if not text:
+        return create_investor_from_text(
 
-        return None
+            chat_id,
 
-    text = normalize_text(
+            text
 
-        text
+        )
 
-    )
+    # --------------------------------------------------------
 
-    # Save incoming message
+    # 4. Save user message
+
+    # --------------------------------------------------------
 
     try:
 
@@ -10564,9 +12438,7 @@ def process_text_update(update):
 
             role="user",
 
-            content=text,
-
-            message_type="text",
+            content=text
 
         )
 
@@ -10574,21 +12446,57 @@ def process_text_update(update):
 
         logging.exception(
 
-            "Could not save incoming message"
+            "Could not save user message"
 
         )
 
-    # =========================
+    # --------------------------------------------------------
 
-    # TELEGRAM COMMAND
+    # 5. Build business context
 
-    # =========================
+    # --------------------------------------------------------
 
-    if is_command(text):
+    try:
+
+        context = build_full_ai_context(
+
+            chat_id
+
+        )
+
+    except Exception:
+
+        logging.exception(
+
+            "Could not build AI context"
+
+        )
+
+        context = ""
+
+    # --------------------------------------------------------
+
+    # 6. Build prompt
+
+    # --------------------------------------------------------
+
+    try:
+
+        prompt = build_ai_prompt(
+
+            chat_id,
+
+            text,
+
+            context=context
+
+        )
+
+    except TypeError:
 
         try:
 
-            result = handle_command(
+            prompt = build_ai_prompt(
 
                 chat_id,
 
@@ -10596,873 +12504,2189 @@ def process_text_update(update):
 
             )
 
-            if result:
-
-                try:
-
-                    save_message(
-
-                        chat_id=chat_id,
-
-                        role="assistant",
-
-                        content=result,
-
-                        message_type="command",
-
-                    )
-
-                except Exception:
-
-                    logging.exception(
-
-                        "Could not save command response"
-
-                    )
-
-                send_long_message(
-
-                    chat_id,
-
-                    result
-
-                )
-
-            return result
-
-        except Exception as e:
-
-            logging.exception(
-
-                "Command processing error: %s",
-
-                e
-
-            )
-
-            error_text = (
-
-                "დაფიქსირდა ბრძანების "
-
-                "დამუშავების შეცდომა.\n"
-
-                "გთხოვ, ისევ სცადო."
-
-            )
-
-            send_message(
-
-                chat_id,
-
-                error_text
-
-            )
-
-            return error_text
-
-    # =========================
-
-    # NORMAL TEXT
-
-    # =========================
-
-    try:
-
-        result = handle_text_message(
-
-            chat_id,
-
-            text
-
-        )
-
-        if not result:
-
-            result = (
-
-                "პასუხის მომზადება ვერ მოხერხდა."
-
-            )
-
-        try:
-
-            save_message(
-
-                chat_id=chat_id,
-
-                role="assistant",
-
-                content=result,
-
-                message_type="text",
-
-            )
-
         except Exception:
 
-            logging.exception(
+            prompt = text
 
-                "Could not save AI response"
-
-            )
-
-        send_long_message(
-
-            chat_id,
-
-            result
-
-        )
-
-        return result
-
-    except Exception as e:
+    except Exception:
 
         logging.exception(
 
-            "Text processing error: %s",
-
-            e
+            "Could not build AI prompt"
 
         )
 
-        error_text = (
+        prompt = text
 
-            "დაფიქსირდა დროებითი შეცდომა.\n"
+    # --------------------------------------------------------
 
-            "გთხოვ, ისევ სცადო."
+    # 7. Gemini
 
-        )
-
-        send_message(
-
-            chat_id,
-
-            error_text
-
-        )
-
-        return error_text
-
-print("GENIOSA PART 8/10 LOADED")# =========================
-
-# PART 9/10 — TELEGRAM UPDATE ENGINE
-
-# =========================
-
-def process_update(update):
-
-    """
-
-    მთავარი Telegram update router.
-
-    ამუშავებს:
-
-    - ტექსტს
-
-    - ბრძანებებს
-
-    - ფოტოებს
-
-    - დოკუმენტებს
-
-    """
-
-    if not isinstance(update, dict):
-
-        return None
+    # --------------------------------------------------------
 
     try:
 
-        # =========================
+        ai_response = gemini_generate(
 
-        # CALLBACK QUERY
+            prompt,
 
-        # =========================
-
-        callback_query = update.get("callback_query")
-
-        if callback_query:
-
-            callback_message = (
-
-                callback_query.get("message")
-
-                or {}
-
-            )
-
-            callback_chat = (
-
-                callback_message.get("chat")
-
-                or {}
-
-            )
-
-            callback_chat_id = callback_chat.get(
-
-                "id"
-
-            )
-
-            callback_data = (
-
-                callback_query.get("data")
-
-                or ""
-
-            )
-
-            if callback_chat_id:
-
-                try:
-
-                    telegram_url_data = {
-
-                        "callback_query_id":
-
-                            callback_query.get("id")
-
-                    }
-
-                    requests.post(
-
-                        telegram_url(
-
-                            "answerCallbackQuery"
-
-                        ),
-
-                        json=telegram_url_data,
-
-                        timeout=10,
-
-                    )
-
-                except Exception:
-
-                    pass
-
-                if callback_data:
-
-                    return process_text_update(
-
-                        {
-
-                            "message": {
-
-                                "chat": {
-
-                                    "id": callback_chat_id
-
-                                },
-
-                                "from": (
-
-                                    callback_message.get(
-
-                                        "from"
-
-                                    )
-
-                                    or {}
-
-                                ),
-
-                                "text": callback_data,
-
-                            }
-
-                        }
-
-                    )
-
-            return None
-
-        # =========================
-
-        # TEXT MESSAGE
-
-        # =========================
-
-        message = update.get(
-
-            "message"
+            system_instruction=ai_system_prompt()
 
         )
 
-        if not message:
-
-            return None
-
-        chat = message.get(
-
-            "chat"
-
-        ) or {}
-
-        chat_id = chat.get(
-
-            "id"
-
-        )
-
-        if not chat_id:
-
-            return None
-
-        if not user_allowed(chat_id):
-
-            logging.warning(
-
-                "Blocked Telegram user: %s",
-
-                chat_id
-
-            )
-
-            return None
-
-        # =========================
-
-        # PHOTO
-
-        # =========================
-
-        if message.get("photo"):
-
-            return process_photo_update(
-
-                update
-
-            )
-
-        # =========================
-
-        # DOCUMENT
-
-        # =========================
-
-        if message.get("document"):
-
-            return process_document_update(
-
-                update
-
-            )
-
-        # =========================
-
-        # TEXT
-
-        # =========================
-
-        if message.get("text"):
-
-            return process_text_update(
-
-                update
-
-            )
-
-        # =========================
-
-        # OTHER MESSAGE TYPES
-
-        # =========================
-
-        if message.get("voice"):
-
-            send_message(
-
-                chat_id,
-
-                "🎤 Voice შეტყობინებების მხარდაჭერა "
-
-                "ამ ვერსიაში ჯერ არ არის ჩართული."
-
-            )
-
-            return None
-
-        if message.get("video"):
-
-            send_message(
-
-                chat_id,
-
-                "🎥 ვიდეო ფაილების დამუშავება "
-
-                "ამ ვერსიაში ჯერ არ არის ჩართული."
-
-            )
-
-            return None
-
-        if message.get("audio"):
-
-            send_message(
-
-                chat_id,
-
-                "🎵 აუდიო ფაილების დამუშავება "
-
-                "ამ ვერსიაში ჯერ არ არის ჩართული."
-
-            )
-
-            return None
-
-        return None
-
-    except Exception as e:
-
-        logging.exception(
-
-            "process_update error: %s",
-
-            e
-
-        )
+    except TypeError:
 
         try:
 
-            chat = (
+            ai_response = gemini_generate(
 
-                update.get("message", {})
-
-                .get("chat", {})
+                prompt
 
             )
 
-            chat_id = chat.get("id")
+        except Exception as exc:
 
-            if chat_id:
+            logging.exception(
 
-                send_message(
+                "Gemini generation failed"
 
-                    chat_id,
+            )
 
-                    "⚠️ შეტყობინების დამუშავებისას "
+            return (
 
-                    "დაფიქსირდა შეცდომა."
+                "❌ AI პასუხის მიღება ვერ მოხერხდა.\n\n"
+
+                + str(exc)
+
+            )
+
+    except Exception as exc:
+
+        logging.exception(
+
+            "Gemini generation failed"
+
+        )
+
+        return (
+
+            "❌ AI პასუხის მიღება ვერ მოხერხდა.\n\n"
+
+            + str(exc)
+
+        )
+
+    # --------------------------------------------------------
+
+    # 8. Normalize AI response
+
+    # --------------------------------------------------------
+
+    if isinstance(ai_response, dict):
+
+        response_text = extract_gemini_text(
+
+            ai_response
+
+        )
+
+        if not response_text:
+
+            error_text = extract_gemini_error(
+
+                ai_response
+
+            )
+
+            response_text = (
+
+                "❌ Gemini-მ პასუხი ვერ დააბრუნა."
+
+            )
+
+            if error_text:
+
+                response_text += (
+
+                    "\n\n" + error_text
 
                 )
 
-        except Exception:
+    else:
 
-            pass
+        response_text = str(
 
-        return None
+            ai_response or ""
 
-def telegram_get_updates(
+        )
 
-    offset=None,
+    response_text = response_text.strip()
 
-    timeout=30
+    if not response_text:
+
+        response_text = (
+
+            "❌ ცარიელი პასუხი მივიღე AI-სგან."
+
+        )
+
+    # --------------------------------------------------------
+
+    # 9. Process AI text
+
+    # --------------------------------------------------------
+
+    try:
+
+        processed_response = process_ai_text(
+
+            chat_id,
+
+            text,
+
+            response_text
+
+        )
+
+        if processed_response:
+
+            response_text = processed_response
+
+    except Exception:
+
+        logging.exception(
+
+            "AI post-processing failed"
+
+        )
+
+    # --------------------------------------------------------
+
+    # 10. Save assistant message
+
+    # --------------------------------------------------------
+
+    try:
+
+        save_message(
+
+            chat_id=chat_id,
+
+            role="assistant",
+
+            content=response_text
+
+        )
+
+    except Exception:
+
+        logging.exception(
+
+            "Could not save assistant message"
+
+        )
+
+    # --------------------------------------------------------
+
+    # 11. Important memory detection
+
+    # --------------------------------------------------------
+
+    try:
+
+        maybe_save_important_memory(
+
+            chat_id,
+
+            text,
+
+            response_text
+
+        )
+
+    except Exception:
+
+        logging.exception(
+
+            "Memory processing failed"
+
+        )
+
+    return response_text
+
+print("GENIOSA 4.0 — PART 8B/10 LOADED")# ============================================================
+
+# GENIOSA 4.0 — PART 9/10
+
+# Excel + PowerPoint generation
+
+# ============================================================
+
+def generated_asset_save(
+
+    chat_id,
+
+    project_id,
+
+    asset_type,
+
+    filename,
+
+    description=""
 
 ):
 
     """
 
-    იღებს ახალ Telegram updates-ს.
-
-    """
-
-    params = {
-
-        "timeout": timeout,
-
-        "allowed_updates": json.dumps(
-
-            [
-
-                "message",
-
-                "callback_query",
-
-            ]
-
-        ),
-
-    }
-
-    if offset is not None:
-
-        params["offset"] = offset
-
-    response = requests.get(
-
-        telegram_url(
-
-            "getUpdates"
-
-        ),
-
-        params=params,
-
-        timeout=timeout + 10,
-
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("ok"):
-
-        raise RuntimeError(
-
-            data.get(
-
-                "description",
-
-                "Telegram API error"
-
-            )
-
-        )
-
-    return data.get(
-
-        "result",
-
-        []
-
-    )
-
-def telegram_delete_webhook():
-
-    """
-
-    Webhook-ის წაშლა საჭიროა,
-
-    თუ ბოტს polling რეჟიმში ვუშვებთ.
+    ინახავს გენერირებულ ფაილს generated_assets ცხრილში.
 
     """
 
     try:
 
-        response = requests.post(
+        with db() as conn:
 
-            telegram_url(
+            with conn.cursor() as cur:
 
-                "deleteWebhook"
+                cur.execute(
 
-            ),
+                    """
 
-            json={
+                    INSERT INTO generated_assets
 
-                "drop_pending_updates": False
+                    (
 
-            },
+                        chat_id,
 
-            timeout=15,
+                        project_id,
 
-        )
+                        asset_type,
 
-        data = response.json()
+                        filename,
 
-        if data.get("ok"):
+                        description
 
-            logging.info(
+                    )
 
-                "Telegram webhook deleted."
+                    VALUES (%s, %s, %s, %s, %s)
 
-            )
+                    RETURNING id
 
-            return True
+                    """,
 
-        logging.warning(
+                    (
 
-            "Could not delete Telegram webhook: %s",
+                        chat_id,
 
-            data
+                        project_id,
 
-        )
+                        asset_type,
 
-    except Exception as e:
+                        filename,
 
-        logging.exception(
+                        description
 
-            "deleteWebhook error: %s",
+                    )
 
-            e
+                )
 
-        )
+                row = cur.fetchone()
 
-    return False
+                return row[0] if row else None
 
-def telegram_bot_info():
-
-    """
-
-    ამოწმებს Telegram Bot Token-ს.
-
-    """
-
-    try:
-
-        response = requests.get(
-
-            telegram_url(
-
-                "getMe"
-
-            ),
-
-            timeout=15,
-
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not data.get("ok"):
-
-            return None
-
-        return data.get(
-
-            "result"
-
-        )
-
-    except Exception as e:
+    except Exception:
 
         logging.exception(
 
-            "getMe error: %s",
-
-            e
+            "Could not save generated asset"
 
         )
 
         return None
 
-def polling_loop():
+def format_money(value):
+
+    try:
+
+        number = float(value or 0)
+
+        return f"${number:,.0f}"
+
+    except Exception:
+
+        return "$0"
+
+def format_number(value):
+
+    try:
+
+        number = float(value or 0)
+
+        if number.is_integer():
+
+            return f"{int(number):,}"
+
+        return f"{number:,.2f}"
+
+    except Exception:
+
+        return "0"
+
+def generate_project_excel(
+
+    chat_id,
+
+    project_id
+
+):
 
     """
 
-    ძირითადი Telegram polling loop.
-
-    Render-ზე ერთი polling thread მუშაობს.
+    ქმნის პროექტის ფინანსურ Excel მოდელს.
 
     """
 
-    global TELEGRAM_OFFSET
+    project = get_project(
 
-    logging.info(
+        chat_id,
 
-        "Geniosa Telegram polling started."
+        project_id
 
     )
 
-    telegram_delete_webhook()
+    if not project:
 
-    bot = telegram_bot_info()
+        return {
 
-    if bot:
+            "error": f"პროექტი #{project_id} ვერ მოიძებნა."
 
-        logging.info(
+        }
 
-            "Telegram bot connected: @%s",
+    try:
 
-            bot.get("username")
+        model = analyze_project_financials(
+
+            chat_id,
+
+            project_id
 
         )
 
-    else:
+        if isinstance(model, dict) and model.get("error"):
+
+            return model
+
+        workbook = Workbook()
+
+        ws = workbook.active
+
+        ws.title = "Project Summary"
+
+        ws["A1"] = "GENIOSA 4.0"
+
+        ws["A2"] = "Project Financial Model"
+
+        ws["A4"] = "Project ID"
+
+        ws["B4"] = project.get("id")
+
+        ws["A5"] = "Project Name"
+
+        ws["B5"] = project.get("name")
+
+        ws["A6"] = "Industry"
+
+        ws["B6"] = industry_name(
+
+            project.get("industry")
+
+        )
+
+        ws["A7"] = "Location"
+
+        ws["B7"] = project.get("location") or ""
+
+        ws["A9"] = "AREA"
+
+        ws["B9"] = "VALUE"
+
+        area_rows = [
+
+            (
+
+                "Land Area (m²)",
+
+                project.get("land_area")
+
+            ),
+
+            (
+
+                "Construction Area (m²)",
+
+                project.get("construction_area")
+
+            ),
+
+            (
+
+                "Saleable Area (m²)",
+
+                project.get("saleable_area")
+
+            ),
+
+            (
+
+                "Total Area (m²)",
+
+                project.get("total_area")
+
+            )
+
+        ]
+
+        row_number = 10
+
+        for label, value in area_rows:
+
+            ws.cell(
+
+                row=row_number,
+
+                column=1,
+
+                value=label
+
+            )
+
+            ws.cell(
+
+                row=row_number,
+
+                column=2,
+
+                value=float(value or 0)
+
+            )
+
+            row_number += 1
+
+        row_number += 1
+
+        ws.cell(
+
+            row=row_number,
+
+            column=1,
+
+            value="FINANCIALS"
+
+        )
+
+        ws.cell(
+
+            row=row_number,
+
+            column=2,
+
+            value="VALUE"
+
+        )
+
+        row_number += 1
+
+        financial_rows = [
+
+            (
+
+                "Land Cost",
+
+                model.get("land_cost")
+
+            ),
+
+            (
+
+                "Construction Cost",
+
+                model.get("construction_cost")
+
+            ),
+
+            (
+
+                "Financing Cost",
+
+                model.get("financing_cost")
+
+            ),
+
+            (
+
+                "Other Cost",
+
+                model.get("other_cost")
+
+            ),
+
+            (
+
+                "Total Cost",
+
+                model.get("total_cost")
+
+            ),
+
+            (
+
+                "Expected Revenue",
+
+                model.get("expected_revenue")
+
+            ),
+
+            (
+
+                "Expected Profit",
+
+                model.get("expected_profit")
+
+            ),
+
+            (
+
+                "Profit Margin (%)",
+
+                model.get("profit_margin")
+
+            ),
+
+            (
+
+                "ROI (%)",
+
+                model.get("roi")
+
+            ),
+
+            (
+
+                "Investor Capital",
+
+                model.get("investor_capital")
+
+            ),
+
+            (
+
+                "Investor Profit",
+
+                model.get("investor_profit")
+
+            ),
+
+            (
+
+                "Investor Share (%)",
+
+                model.get("investor_share")
+
+            ),
+
+            (
+
+                "Operator Profit",
+
+                model.get("operator_profit")
+
+            ),
+
+            (
+
+                "Break-even Revenue",
+
+                model.get("break_even_revenue")
+
+            ),
+
+            (
+
+                "Required Sale Price / m²",
+
+                model.get("required_sale_price")
+
+            )
+
+        ]
+
+        for label, value in financial_rows:
+
+            ws.cell(
+
+                row=row_number,
+
+                column=1,
+
+                value=label
+
+            )
+
+            try:
+
+                numeric_value = float(value or 0)
+
+            except Exception:
+
+                numeric_value = 0
+
+            ws.cell(
+
+                row=row_number,
+
+                column=2,
+
+                value=numeric_value
+
+            )
+
+            row_number += 1
+
+        # ----------------------------------------------------
+
+        # Scenario sheet
+
+        # ----------------------------------------------------
+
+        scenario_sheet = workbook.create_sheet(
+
+            "Scenarios"
+
+        )
+
+        scenario_sheet["A1"] = "SCENARIO ANALYSIS"
+
+        scenarios = scenario_analysis(
+
+            chat_id,
+
+            project_id
+
+        )
+
+        scenario_sheet["A3"] = "Scenario"
+
+        scenario_sheet["B3"] = "Revenue"
+
+        scenario_sheet["C3"] = "Cost"
+
+        scenario_sheet["D3"] = "Profit"
+
+        scenario_sheet["E3"] = "Margin %"
+
+        scenario_sheet["F3"] = "ROI %"
+
+        row_number = 4
+
+        if isinstance(scenarios, dict):
+
+            scenario_items = scenarios.get(
+
+                "scenarios",
+
+                scenarios
+
+            )
+
+            if isinstance(
+
+                scenario_items,
+
+                dict
+
+            ):
+
+                for scenario_name, scenario in scenario_items.items():
+
+                    if not isinstance(
+
+                        scenario,
+
+                        dict
+
+                    ):
+
+                        continue
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=1,
+
+                        value=str(scenario_name)
+
+                    )
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=2,
+
+                        value=float(
+
+                            scenario.get(
+
+                                "revenue",
+
+                                0
+
+                            ) or 0
+
+                        )
+
+                    )
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=3,
+
+                        value=float(
+
+                            scenario.get(
+
+                                "total_cost",
+
+                                scenario.get(
+
+                                    "cost",
+
+                                    0
+
+                                )
+
+                            ) or 0
+
+                        )
+
+                    )
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=4,
+
+                        value=float(
+
+                            scenario.get(
+
+                                "profit",
+
+                                0
+
+                            ) or 0
+
+                        )
+
+                    )
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=5,
+
+                        value=float(
+
+                            scenario.get(
+
+                                "profit_margin",
+
+                                0
+
+                            ) or 0
+
+                        )
+
+                    )
+
+                    scenario_sheet.cell(
+
+                        row=row_number,
+
+                        column=6,
+
+                        value=float(
+
+                            scenario.get(
+
+                                "roi",
+
+                                0
+
+                            ) or 0
+
+                        )
+
+                    )
+
+                    row_number += 1
+
+        # ----------------------------------------------------
+
+        # Project data sheet
+
+        # ----------------------------------------------------
+
+        data_sheet = workbook.create_sheet(
+
+            "Project Data"
+
+        )
+
+        fields = [
+
+            "id",
+
+            "chat_id",
+
+            "name",
+
+            "industry",
+
+            "location",
+
+            "description",
+
+            "land_area",
+
+            "saleable_area",
+
+            "construction_area",
+
+            "total_area",
+
+            "revenue",
+
+            "total_cost",
+
+            "operating_cost",
+
+            "net_profit",
+
+            "investor_capital",
+
+            "investor_profit",
+
+            "investor_share",
+
+            "status",
+
+            "land_cost",
+
+            "construction_cost",
+
+            "financing_cost",
+
+            "other_cost",
+
+            "expected_revenue",
+
+            "expected_profit",
+
+            "notes"
+
+        ]
+
+        for col, field in enumerate(
+
+            fields,
+
+            start=1
+
+        ):
+
+            data_sheet.cell(
+
+                row=1,
+
+                column=col,
+
+                value=field
+
+            )
+
+            data_sheet.cell(
+
+                row=2,
+
+                column=col,
+
+                value=project.get(field)
+
+            )
+
+        # ----------------------------------------------------
+
+        # Formatting
+
+        # ----------------------------------------------------
+
+        for sheet in workbook.worksheets:
+
+            for column_cells in sheet.columns:
+
+                max_length = 0
+
+                column_letter = (
+
+                    column_cells[0].column_letter
+
+                )
+
+                for cell in column_cells:
+
+                    try:
+
+                        value_length = len(
+
+                            str(cell.value or "")
+
+                        )
+
+                        max_length = max(
+
+                            max_length,
+
+                            value_length
+
+                        )
+
+                    except Exception:
+
+                        pass
+
+                sheet.column_dimensions[
+
+                    column_letter
+
+                ].width = min(
+
+                    max(max_length + 2, 12),
+
+                    45
+
+                )
+
+        filename = safe_filename(
+
+            f"Geniosa_Project_{project_id}_Financial_Model.xlsx"
+
+        )
+
+        filepath = (
+
+            STORAGE_DIR / filename
+
+        )
+
+        workbook.save(
+
+            filepath
+
+        )
+
+        generated_asset_save(
+
+            chat_id=chat_id,
+
+            project_id=project_id,
+
+            asset_type="xlsx",
+
+            filename=filename,
+
+            description=(
+
+                "Project financial model"
+
+            )
+
+        )
+
+        return {
+
+            "success": True,
+
+            "filepath": str(filepath),
+
+            "filename": filename,
+
+            "asset_type": "xlsx"
+
+        }
+
+    except Exception as exc:
+
+        logging.exception(
+
+            "Excel generation failed"
+
+        )
+
+        return {
+
+            "error": str(exc)
+
+        }
+
+def generate_project_presentation(
+
+    chat_id,
+
+    project_id
+
+):
+
+    """
+
+    ქმნის პროექტის საინვესტიციო PowerPoint პრეზენტაციას.
+
+    """
+
+    project = get_project(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if not project:
+
+        return {
+
+            "error": f"პროექტი #{project_id} ვერ მოიძებნა."
+
+        }
+
+    try:
+
+        model = analyze_project_financials(
+
+            chat_id,
+
+            project_id
+
+        )
+
+        if isinstance(model, dict) and model.get("error"):
+
+            return model
+
+        prs = Presentation()
+
+        # ----------------------------------------------------
+
+        # Slide 1 — Cover
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[0]
+
+        )
+
+        slide.shapes.title.text = (
+
+            project.get("name")
+
+            or "Investment Project"
+
+        )
+
+        slide.placeholders[1].text = (
+
+            "GENIOSA 4.0\n"
+
+            "Business & Investment Analysis"
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 2 — Project Overview
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Project Overview"
+
+        )
+
+        overview = [
+
+            f"Project: {project.get('name') or '-'}",
+
+            f"Industry: {industry_name(project.get('industry'))}",
+
+            f"Location: {project.get('location') or '-'}",
+
+            f"Land Area: {format_number(project.get('land_area'))} m²",
+
+            f"Construction Area: {format_number(project.get('construction_area'))} m²",
+
+            f"Saleable Area: {format_number(project.get('saleable_area'))} m²",
+
+            f"Total Area: {format_number(project.get('total_area'))} m²"
+
+        ]
+
+        slide.placeholders[1].text = (
+
+            "\n".join(overview)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 3 — Financial Overview
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Financial Overview"
+
+        )
+
+        financial_text = [
+
+            f"Total Cost: {format_money(model.get('total_cost'))}",
+
+            f"Expected Revenue: {format_money(model.get('expected_revenue'))}",
+
+            f"Expected Profit: {format_money(model.get('expected_profit'))}",
+
+            f"Profit Margin: {format_number(model.get('profit_margin'))}%",
+
+            f"ROI: {format_number(model.get('roi'))}%",
+
+            f"Break-even Revenue: {format_money(model.get('break_even_revenue'))}",
+
+            f"Required Sale Price / m²: {format_money(model.get('required_sale_price'))}"
+
+        ]
+
+        slide.placeholders[1].text = (
+
+            "\n".join(financial_text)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 4 — Investment Structure
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Investment Structure"
+
+        )
+
+        investment_text = [
+
+            f"Investor Capital: {format_money(model.get('investor_capital'))}",
+
+            f"Investor Profit: {format_money(model.get('investor_profit'))}",
+
+            f"Investor Share: {format_number(model.get('investor_share'))}%",
+
+            f"Operator Profit: {format_money(model.get('operator_profit'))}"
+
+        ]
+
+        slide.placeholders[1].text = (
+
+            "\n".join(investment_text)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 5 — Scenario Analysis
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Scenario Analysis"
+
+        )
+
+        scenarios = scenario_analysis(
+
+            chat_id,
+
+            project_id
+
+        )
+
+        scenario_lines = []
+
+        if isinstance(scenarios, dict):
+
+            scenario_items = scenarios.get(
+
+                "scenarios",
+
+                scenarios
+
+            )
+
+            if isinstance(
+
+                scenario_items,
+
+                dict
+
+            ):
+
+                for scenario_name, scenario in scenario_items.items():
+
+                    if not isinstance(
+
+                        scenario,
+
+                        dict
+
+                    ):
+
+                        continue
+
+                    scenario_lines.append(
+
+                        f"{scenario_name}: "
+
+                        f"Revenue {format_money(scenario.get('revenue'))}, "
+
+                        f"Profit {format_money(scenario.get('profit'))}, "
+
+                        f"ROI {format_number(scenario.get('roi'))}%"
+
+                    )
+
+        if not scenario_lines:
+
+            scenario_lines.append(
+
+                "Scenario data is not available."
+
+            )
+
+        slide.placeholders[1].text = (
+
+            "\n".join(scenario_lines)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 6 — Project Description
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Project Description"
+
+        )
+
+        description = (
+
+            project.get("description")
+
+            or project.get("notes")
+
+            or "No description provided."
+
+        )
+
+        slide.placeholders[1].text = (
+
+            str(description)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Slide 7 — Investment Highlights
+
+        # ----------------------------------------------------
+
+        slide = prs.slides.add_slide(
+
+            prs.slide_layouts[1]
+
+        )
+
+        slide.shapes.title.text = (
+
+            "Investment Highlights"
+
+        )
+
+        highlights = [
+
+            "• Clearly defined development project",
+
+            "• Structured financial analysis",
+
+            "• Revenue and profitability assessment",
+
+            "• Investor return analysis",
+
+            "• Scenario-based financial planning",
+
+            "• Professional project presentation"
+
+        ]
+
+        slide.placeholders[1].text = (
+
+            "\n".join(highlights)
+
+        )
+
+        # ----------------------------------------------------
+
+        # Save
+
+        # ----------------------------------------------------
+
+        filename = safe_filename(
+
+            f"Geniosa_Project_{project_id}_Investor_Presentation.pptx"
+
+        )
+
+        filepath = (
+
+            STORAGE_DIR / filename
+
+        )
+
+        prs.save(
+
+            filepath
+
+        )
+
+        generated_asset_save(
+
+            chat_id=chat_id,
+
+            project_id=project_id,
+
+            asset_type="pptx",
+
+            filename=filename,
+
+            description=(
+
+                "Investor presentation"
+
+            )
+
+        )
+
+        return {
+
+            "success": True,
+
+            "filepath": str(filepath),
+
+            "filename": filename,
+
+            "asset_type": "pptx"
+
+        }
+
+    except Exception as exc:
+
+        logging.exception(
+
+            "PowerPoint generation failed"
+
+        )
+
+        return {
+
+            "error": str(exc)
+
+        }
+
+def generate_project_files(
+
+    chat_id,
+
+    project_id
+
+):
+
+    """
+
+    ქმნის ორივე ფაილს:
+
+    XLSX + PPTX
+
+    """
+
+    excel_result = generate_project_excel(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if not excel_result.get("success"):
+
+        return {
+
+            "error": (
+
+                "Excel-ის შექმნა ვერ მოხერხდა: "
+
+                + str(
+
+                    excel_result.get("error")
+
+                )
+
+            )
+
+        }
+
+    ppt_result = generate_project_presentation(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if not ppt_result.get("success"):
+
+        return {
+
+            "error": (
+
+                "PowerPoint-ის შექმნა ვერ მოხერხდა: "
+
+                + str(
+
+                    ppt_result.get("error")
+
+                )
+
+            )
+
+        }
+
+    return {
+
+        "success": True,
+
+        "excel": excel_result,
+
+        "powerpoint": ppt_result
+
+    }
+
+def generated_files_command(
+
+    chat_id,
+
+    args
+
+):
+
+    """
+
+    /generate ID
+
+    /generate ID xlsx
+
+    /generate ID pptx
+
+    """
+
+    args = (args or "").strip()
+
+    if not args:
+
+        projects = get_projects(
+
+            chat_id,
+
+            limit=50
+
+        )
+
+        if not projects:
+
+            return (
+
+                "📁 ფაილის შესაქმნელად ჯერ პროექტი უნდა არსებობდეს."
+
+            )
+
+        lines = [
+
+            "📁 ფაილების გენერაცია",
+
+            "",
+
+            "მიუთითე Project ID:",
+
+            ""
+
+        ]
+
+        for project in projects:
+
+            lines.append(
+
+                f"#{project.get('id')} — "
+
+                f"{project.get('name')}"
+
+            )
+
+        lines.extend([
+
+            "",
+
+            "მაგალითი:",
+
+            "/generate 1",
+
+            "",
+
+            "ან:",
+
+            "/generate 1 xlsx",
+
+            "/generate 1 pptx"
+
+        ])
+
+        return "\n".join(lines)
+
+    parts = args.split()
+
+    project_id = safe_int(
+
+        parts[0]
+
+    )
+
+    if not project_id:
+
+        return (
+
+            "❌ Project ID უნდა იყოს რიცხვი."
+
+        )
+
+    file_type = (
+
+        parts[1].lower()
+
+        if len(parts) > 1
+
+        else "all"
+
+    )
+
+    if file_type not in (
+
+        "all",
+
+        "xlsx",
+
+        "excel",
+
+        "pptx",
+
+        "powerpoint",
+
+        "ppt"
+
+    ):
+
+        return (
+
+            "❌ ფაილის ტიპი არასწორია.\n\n"
+
+            "გამოიყენე:\n"
+
+            "/generate 1\n"
+
+            "/generate 1 xlsx\n"
+
+            "/generate 1 pptx"
+
+        )
+
+    if file_type in (
+
+        "xlsx",
+
+        "excel"
+
+    ):
+
+        result = generate_project_excel(
+
+            chat_id,
+
+            project_id
+
+        )
+
+        if not result.get("success"):
+
+            return (
+
+                "❌ Excel ვერ შეიქმნა.\n\n"
+
+                + str(result.get("error"))
+
+            )
+
+        return {
+
+            "type": "generated_file",
+
+            "files": [
+
+                result
+
+            ],
+
+            "message": (
+
+                "✅ Excel ფინანსური მოდელი მზად არის."
+
+            )
+
+        }
+
+    if file_type in (
+
+        "pptx",
+
+        "powerpoint",
+
+        "ppt"
+
+    ):
+
+        result = generate_project_presentation(
+
+            chat_id,
+
+            project_id
+
+        )
+
+        if not result.get("success"):
+
+            return (
+
+                "❌ PowerPoint ვერ შეიქმნა.\n\n"
+
+                + str(result.get("error"))
+
+            )
+
+        return {
+
+            "type": "generated_file",
+
+            "files": [
+
+                result
+
+            ],
+
+            "message": (
+
+                "✅ PowerPoint პრეზენტაცია მზად არის."
+
+            )
+
+        }
+
+    result = generate_project_files(
+
+        chat_id,
+
+        project_id
+
+    )
+
+    if not result.get("success"):
+
+        return (
+
+            "❌ ფაილების შექმნა ვერ მოხერხდა.\n\n"
+
+            + str(result.get("error"))
+
+        )
+
+    return {
+
+        "type": "generated_file",
+
+        "files": [
+
+            result.get("excel"),
+
+            result.get("powerpoint")
+
+        ],
+
+        "message": (
+
+            "✅ ორივე ფაილი მზად არის."
+
+        )
+
+    }
+
+def generated_asset_command(
+
+    chat_id
+
+):
+
+    """
+
+    აჩვენებს გენერირებული ფაილების ისტორიას.
+
+    """
+
+    try:
+
+        with db() as conn:
+
+            with conn.cursor(
+
+                cursor_factory=RealDictCursor
+
+            ) as cur:
+
+                cur.execute(
+
+                    """
+
+                    SELECT *
+
+                    FROM generated_assets
+
+                    WHERE chat_id = %s
+
+                    ORDER BY created_at DESC
+
+                    LIMIT 50
+
+                    """,
+
+                    (chat_id,)
+
+                )
+
+                rows = cur.fetchall()
+
+        if not rows:
+
+            return (
+
+                "📁 გენერირებული ფაილები ჯერ არ არის."
+
+            )
+
+        lines = [
+
+            "📁 გენერირებული ფაილები",
+
+            ""
+
+        ]
+
+        for row in rows:
+
+            lines.append(
+
+                f"#{row.get('id')} — "
+
+                f"{row.get('filename')}"
+
+            )
+
+            if row.get("description"):
+
+                lines.append(
+
+                    str(row.get("description"))
+
+                )
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+
+        logging.exception(
+
+            "Could not load generated assets"
+
+        )
+
+        return (
+
+            "❌ გენერირებული ფაილების წაკითხვა ვერ მოხერხდა.\n\n"
+
+            + str(exc)
+
+        )
+
+print("GENIOSA 4.0 — PART 9/10 LOADED")# ============================================================
+
+# GENIOSA 4.0 — PART 10/10
+
+# Telegram polling + file sending + PostgreSQL lock
+
+# + startup / shutdown
+
+# ============================================================
+
+def send_document_to_chat(
+
+    chat_id,
+
+    filepath,
+
+    caption=""
+
+):
+
+    """
+
+    აგზავნის გენერირებულ ან ატვირთულ ფაილს Telegram-ში.
+
+    """
+
+    if not filepath:
+
+        return False
+
+    path = Path(
+
+        str(filepath)
+
+    )
+
+    if not path.exists():
 
         logging.error(
 
-            "Telegram bot authentication failed."
+            "File does not exist: %s",
+
+            filepath
 
         )
 
-        return
+        return False
 
-    consecutive_errors = 0
+    try:
 
-    while not POLLING_STOP.is_set():
+        url = (
 
-        try:
+            f"{TELEGRAM_API}/sendDocument"
 
-            updates = telegram_get_updates(
+        )
 
-                offset=TELEGRAM_OFFSET,
+        with open(
 
-                timeout=30,
+            path,
+
+            "rb"
+
+        ) as file_handle:
+
+            response = requests.post(
+
+                url,
+
+                data={
+
+                    "chat_id": chat_id,
+
+                    "caption": caption[:1024]
+
+                },
+
+                files={
+
+                    "document": (
+
+                        path.name,
+
+                        file_handle
+
+                    )
+
+                },
+
+                timeout=120
 
             )
 
-            consecutive_errors = 0
-
-            for update in updates:
-
-                if POLLING_STOP.is_set():
-
-                    break
-
-                update_id = update.get(
-
-                    "update_id"
-
-                )
-
-                if update_id is not None:
-
-                    TELEGRAM_OFFSET = (
-
-                        update_id + 1
-
-                    )
-
-                try:
-
-                    process_update(
-
-                        update
-
-                    )
-
-                except Exception:
-
-                    logging.exception(
-
-                        "Single update processing error"
-
-                    )
-
-        except requests.exceptions.Timeout:
-
-            # Long polling timeout is normal.
-
-            continue
-
-        except requests.exceptions.RequestException as e:
-
-            consecutive_errors += 1
+        if response.status_code != 200:
 
             logging.error(
 
-                "Telegram network error "
+                "Telegram sendDocument failed: %s",
 
-                "(%s): %s",
-
-                consecutive_errors,
-
-                e,
+                response.text[:2000]
 
             )
 
-            sleep_time = min(
+            return False
 
-                30,
+        return True
 
-                2 * consecutive_errors
+    except Exception:
 
-            )
+        logging.exception(
 
-            time.sleep(
+            "Could not send Telegram document"
 
-                sleep_time
+        )
 
-            )
+        return False
 
-        except Exception as e:
+def send_generated_files(
 
-            consecutive_errors += 1
+    chat_id,
 
-            logging.exception(
+    result
 
-                "Polling loop error: %s",
+):
 
-                e
+    """
 
-            )
+    ამუშავებს generated_file პასუხს
 
-            time.sleep(
+    და აგზავნის ფაილებს Telegram-ში.
 
-                min(
+    """
 
-                    30,
+    if not isinstance(
 
-                    2 * consecutive_errors
+        result,
 
-                )
+        dict
 
-            )
+    ):
 
-    logging.info(
+        return False
 
-        "Geniosa Telegram polling stopped."
+    files = result.get(
+
+        "files",
+
+        []
 
     )
 
-def start_polling():
+    if not files:
 
-    """
+        return False
 
-    იწყებს Telegram polling-ს მხოლოდ ერთხელ.
+    success_count = 0
 
-    """
+    for file_info in files:
 
-    global POLLING_THREAD
+        if not isinstance(
 
-    if POLLING_THREAD is not None:
+            file_info,
 
-        if POLLING_THREAD.is_alive():
+            dict
 
-            logging.info(
+        ):
 
-                "Polling thread already running."
+            continue
+
+        filepath = file_info.get(
+
+            "filepath"
+
+        )
+
+        filename = file_info.get(
+
+            "filename"
+
+        )
+
+        asset_type = file_info.get(
+
+            "asset_type",
+
+            "file"
+
+        )
+
+        if not filepath:
+
+            continue
+
+        if send_document_to_chat(
+
+            chat_id,
+
+            filepath,
+
+            caption=(
+
+                f"📁 GENIOSA 4.0\n"
+
+                f"{filename or asset_type}"
 
             )
 
-            return
+        ):
 
-    POLLING_STOP.clear()
+            success_count += 1
 
-    POLLING_THREAD = threading.Thread(
+    return success_count > 0
 
-        target=polling_loop,
+def handle_incoming_update(
 
-        name="geniosa-telegram-polling",
+    update
 
-        daemon=True,
-
-    )
-
-    POLLING_THREAD.start()
-
-    logging.info(
-
-        "Polling thread started."
-
-    )
-
-def stop_polling():
+):
 
     """
 
-    აჩერებს polling thread-ს.
+    ამუშავებს Telegram update-ს.
 
     """
 
-    global POLLING_THREAD
+    if not isinstance(
 
-    POLLING_STOP.set()
+        update,
 
-    if POLLING_THREAD is not None:
+        dict
+
+    ):
+
+        return
+
+    message = update.get(
+
+        "message"
+
+    )
+
+    if not message:
+
+        return
+
+    chat = message.get(
+
+        "chat"
+
+    )
+
+    if not chat:
+
+        return
+
+    chat_id = chat.get(
+
+        "id"
+
+    )
+
+    if chat_id is None:
+
+        return
+
+    # --------------------------------------------------------
+
+    # Access control
+
+    # --------------------------------------------------------
+
+    if not user_allowed(
+
+        chat_id
+
+    ):
 
         try:
 
-            POLLING_THREAD.join(
+            send_message(
 
-                timeout=5
+                chat_id,
+
+                "⛔ წვდომა შეზღუდულია."
 
             )
 
@@ -11470,43 +14694,379 @@ def stop_polling():
 
             pass
 
-    POLLING_THREAD = None
+        return
 
-    logging.info(
+    # --------------------------------------------------------
 
-        "Polling stopped."
+    # Photo
+
+    # --------------------------------------------------------
+
+    photos = message.get(
+
+        "photo"
 
     )
 
-def telegram_send_startup_message():
+    if photos:
+
+        try:
+
+            response = handle_photo_message(
+
+                chat_id,
+
+                message
+
+            )
+
+            if response:
+
+                send_long_message(
+
+                    chat_id,
+
+                    response
+
+                )
+
+        except Exception as exc:
+
+            logging.exception(
+
+                "Photo handler failed"
+
+            )
+
+            send_message(
+
+                chat_id,
+
+                "❌ ფოტოს დამუშავება ვერ მოხერხდა.\n\n"
+
+                + str(exc)
+
+            )
+
+        return
+
+    # --------------------------------------------------------
+
+    # Document
+
+    # --------------------------------------------------------
+
+    document = message.get(
+
+        "document"
+
+    )
+
+    if document:
+
+        try:
+
+            response = handle_document_message(
+
+                chat_id,
+
+                message
+
+            )
+
+            if isinstance(
+
+                response,
+
+                dict
+
+            ) and response.get("type") == "generated_file":
+
+                send_long_message(
+
+                    chat_id,
+
+                    response.get(
+
+                        "message",
+
+                        "✅ ფაილი მზად არის."
+
+                    )
+
+                )
+
+                send_generated_files(
+
+                    chat_id,
+
+                    response
+
+                )
+
+            elif response:
+
+                send_long_message(
+
+                    chat_id,
+
+                    str(response)
+
+                )
+
+        except Exception as exc:
+
+            logging.exception(
+
+                "Document handler failed"
+
+            )
+
+            send_message(
+
+                chat_id,
+
+                "❌ დოკუმენტის დამუშავება ვერ მოხერხდა.\n\n"
+
+                + str(exc)
+
+            )
+
+        return
+
+    # --------------------------------------------------------
+
+    # Text
+
+    # --------------------------------------------------------
+
+    text_value = message.get(
+
+        "text"
+
+    )
+
+    if text_value:
+
+        try:
+
+            # /generate is handled separately because
+
+            # it returns files.
+
+            if command_name(
+
+                text_value
+
+            ) == "generate":
+
+                args = extract_command_args(
+
+                    text_value
+
+                )
+
+                result = generated_files_command(
+
+                    chat_id,
+
+                    args
+
+                )
+
+                if isinstance(
+
+                    result,
+
+                    dict
+
+                ) and result.get(
+
+                    "type"
+
+                ) == "generated_file":
+
+                    send_long_message(
+
+                        chat_id,
+
+                        result.get(
+
+                            "message",
+
+                            "✅ ფაილები მზად არის."
+
+                        )
+
+                    )
+
+                    send_generated_files(
+
+                        chat_id,
+
+                        result
+
+                    )
+
+                else:
+
+                    send_long_message(
+
+                        chat_id,
+
+                        str(result)
+
+                    )
+
+                return
+
+            # /files
+
+            if command_name(
+
+                text_value
+
+            ) in (
+
+                "files",
+
+                "generated"
+
+            ):
+
+                send_long_message(
+
+                    chat_id,
+
+                    generated_asset_command(
+
+                        chat_id
+
+                    )
+
+                )
+
+                return
+
+            response = handle_text_message(
+
+                chat_id,
+
+                text_value
+
+            )
+
+            if response:
+
+                send_long_message(
+
+                    chat_id,
+
+                    response
+
+                )
+
+        except Exception as exc:
+
+            logging.exception(
+
+                "Text handler failed"
+
+            )
+
+            send_message(
+
+                chat_id,
+
+                "❌ შეტყობინების დამუშავება ვერ მოხერხდა.\n\n"
+
+                + str(exc)
+
+            )
+
+        return
+
+def acquire_polling_lock():
 
     """
 
-    სურვილის შემთხვევაში აგზავნის startup შეტყობინებას
+    PostgreSQL advisory lock.
 
-    მხოლოდ მაშინ, თუ OWNER_ID განსაზღვრულია.
+    მიზანი:
+
+    Render-ზე მხოლოდ ერთმა Geniosa instance-მა
+
+    გამოიყენოს Telegram getUpdates polling.
 
     """
 
-    if not OWNER_ID:
+    global POLLING_LOCK_CONN
 
-        return False
+    global POLLING_LOCK_ACQUIRED
+
+    if not DATABASE_URL:
+
+        return True
 
     try:
 
-        send_message(
+        conn = psycopg2.connect(
 
-            OWNER_ID,
+            DATABASE_URL,
 
-            (
+            connect_timeout=10
 
-                "🟢 Geniosa ჩაირთო.\n\n"
+        )
 
-                "Telegram bot მუშაობს.\n"
+        conn.autocommit = True
 
-                "გამოიყენე /help ბრძანება."
+        with conn.cursor() as cur:
+
+            cur.execute(
+
+                """
+
+                SELECT pg_try_advisory_lock(
+
+                    987654321
+
+                )
+
+                """
 
             )
+
+            row = cur.fetchone()
+
+            acquired = bool(
+
+                row and row[0]
+
+            )
+
+        if not acquired:
+
+            conn.close()
+
+            POLLING_LOCK_ACQUIRED = False
+
+            logging.warning(
+
+                "Telegram polling lock is already held "
+
+                "by another Geniosa instance."
+
+            )
+
+            return False
+
+        POLLING_LOCK_CONN = conn
+
+        POLLING_LOCK_ACQUIRED = True
+
+        logging.info(
+
+            "Telegram polling lock acquired."
 
         )
 
@@ -11516,53 +15076,423 @@ def telegram_send_startup_message():
 
         logging.exception(
 
-            "Startup Telegram message failed."
+            "Could not acquire polling lock"
+
+        )
+
+        POLLING_LOCK_ACQUIRED = False
+
+        return False
+
+def release_polling_lock():
+
+    global POLLING_LOCK_CONN
+
+    global POLLING_LOCK_ACQUIRED
+
+    try:
+
+        if (
+
+            POLLING_LOCK_CONN
+
+            and POLLING_LOCK_ACQUIRED
+
+        ):
+
+            try:
+
+                with POLLING_LOCK_CONN.cursor() as cur:
+
+                    cur.execute(
+
+                        """
+
+                        SELECT pg_advisory_unlock(
+
+                            987654321
+
+                        )
+
+                        """
+
+                    )
+
+            except Exception:
+
+                pass
+
+            try:
+
+                POLLING_LOCK_CONN.close()
+
+            except Exception:
+
+                pass
+
+    finally:
+
+        POLLING_LOCK_CONN = None
+
+        POLLING_LOCK_ACQUIRED = False
+
+        logging.info(
+
+            "Telegram polling lock released."
+
+        )
+
+def telegram_delete_webhook():
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        return False
+
+    try:
+
+        response = requests.post(
+
+            f"{TELEGRAM_API}/deleteWebhook",
+
+            json={
+
+                "drop_pending_updates": False
+
+            },
+
+            timeout=20
+
+        )
+
+        if response.status_code != 200:
+
+            logging.warning(
+
+                "deleteWebhook failed: %s",
+
+                response.text[:1000]
+
+            )
+
+            return False
+
+        return True
+
+    except Exception:
+
+        logging.exception(
+
+            "Could not delete Telegram webhook"
 
         )
 
         return False
 
-print("GENIOSA PART 9/10 LOADED")# =========================
+def telegram_get_updates(
 
-# PART 10/10 — FINAL STARTUP
+    offset=None,
 
-# =========================
+    timeout=25
 
-from contextlib import asynccontextmanager
+):
 
-@asynccontextmanager
+    params = {
 
-async def lifespan(app: FastAPI):
+        "timeout": timeout,
 
-    """
+        "allowed_updates": [
 
-    FastAPI application lifecycle.
+            "message"
 
-    """
+        ]
+
+    }
+
+    if offset is not None:
+
+        params["offset"] = offset
+
+    try:
+
+        response = requests.get(
+
+            f"{TELEGRAM_API}/getUpdates",
+
+            params=params,
+
+            timeout=timeout + 10
+
+        )
+
+        if response.status_code != 200:
+
+            logging.error(
+
+                "Telegram getUpdates HTTP %s: %s",
+
+                response.status_code,
+
+                response.text[:2000]
+
+            )
+
+            return None
+
+        data = response.json()
+
+        if not data.get(
+
+            "ok",
+
+            False
+
+        ):
+
+            logging.error(
+
+                "Telegram getUpdates error: %s",
+
+                data
+
+            )
+
+            return None
+
+        return data.get(
+
+            "result",
+
+            []
+
+        )
+
+    except requests.exceptions.Timeout:
+
+        return []
+
+    except Exception:
+
+        logging.exception(
+
+            "Telegram getUpdates failed"
+
+        )
+
+        return None
+
+def telegram_polling_loop():
+
+    global TELEGRAM_OFFSET
 
     logging.info(
 
-        "===================================="
+        "GENIOSA Telegram polling loop started."
 
     )
+
+    # --------------------------------------------------------
+
+    # Only one poller allowed
+
+    # --------------------------------------------------------
+
+    if not acquire_polling_lock():
+
+        logging.warning(
+
+            "Polling loop stopped because another "
+
+            "instance owns the lock."
+
+        )
+
+        return
+
+    try:
+
+        telegram_delete_webhook()
+
+        consecutive_errors = 0
+
+        while not POLLING_STOP.is_set():
+
+            updates = telegram_get_updates(
+
+                offset=TELEGRAM_OFFSET,
+
+                timeout=25
+
+            )
+
+            if updates is None:
+
+                consecutive_errors += 1
+
+                wait_seconds = min(
+
+                    30,
+
+                    2 ** min(
+
+                        consecutive_errors,
+
+                        4
+
+                    )
+
+                )
+
+                logging.warning(
+
+                    "Telegram polling error. "
+
+                    "Retrying in %s seconds.",
+
+                    wait_seconds
+
+                )
+
+                POLLING_STOP.wait(
+
+                    wait_seconds
+
+                )
+
+                continue
+
+            consecutive_errors = 0
+
+            for update in updates:
+
+                if POLLING_STOP.is_set():
+
+                    break
+
+                try:
+
+                    update_id = update.get(
+
+                        "update_id"
+
+                    )
+
+                    if update_id is not None:
+
+                        TELEGRAM_OFFSET = (
+
+                            int(update_id) + 1
+
+                        )
+
+                    handle_incoming_update(
+
+                        update
+
+                    )
+
+                except Exception:
+
+                    logging.exception(
+
+                        "Error handling Telegram update"
+
+                    )
+
+    finally:
+
+        release_polling_lock()
+
+        logging.info(
+
+            "GENIOSA Telegram polling loop stopped."
+
+        )
+
+def start_telegram_polling():
+
+    global POLLING_THREAD
+
+    global POLLING_STOP
+
+    with POLLING_THREAD_LOCK:
+
+        if (
+
+            POLLING_THREAD
+
+            and POLLING_THREAD.is_alive()
+
+        ):
+
+            logging.info(
+
+                "Telegram polling is already running."
+
+            )
+
+            return
+
+        POLLING_STOP.clear()
+
+        POLLING_THREAD = threading.Thread(
+
+            target=telegram_polling_loop,
+
+            name="geniosa-telegram-poller",
+
+            daemon=True
+
+        )
+
+        POLLING_THREAD.start()
+
+        logging.info(
+
+            "Telegram polling thread started."
+
+        )
+
+def stop_telegram_polling():
+
+    global POLLING_THREAD
+
+    global POLLING_STOP
+
+    POLLING_STOP.set()
+
+    thread = POLLING_THREAD
+
+    if (
+
+        thread
+
+        and thread.is_alive()
+
+        and thread is not threading.current_thread()
+
+    ):
+
+        thread.join(
+
+            timeout=10
+
+        )
+
+    POLLING_THREAD = None
 
     logging.info(
 
-        "GENIOSA STARTUP"
+        "Telegram polling stopped."
 
     )
+
+def startup_application():
 
     logging.info(
 
-        "===================================="
+        "GENIOSA 4.0 startup started."
 
     )
-
-    # =========================
-
-    # DATABASE
-
-    # =========================
 
     try:
 
@@ -11570,330 +15500,76 @@ async def lifespan(app: FastAPI):
 
         logging.info(
 
-            "Database initialization: OK"
+            "Database initialized."
 
         )
-
-    except Exception as e:
-
-        logging.exception(
-
-            "Database initialization failed: %s",
-
-            e
-
-        )
-
-    # =========================
-
-    # TELEGRAM
-
-    # =========================
-
-    try:
-
-        bot = telegram_bot_info()
-
-        if bot:
-
-            logging.info(
-
-                "Telegram connection: OK"
-
-            )
-
-            logging.info(
-
-                "Bot username: @%s",
-
-                bot.get("username")
-
-            )
-
-        else:
-
-            logging.error(
-
-                "Telegram connection: FAILED"
-
-            )
-
-    except Exception as e:
-
-        logging.exception(
-
-            "Telegram startup check failed: %s",
-
-            e
-
-        )
-
-    # =========================
-
-    # START POLLING
-
-    # =========================
-
-    try:
-
-        start_polling()
-
-        logging.info(
-
-            "Telegram polling: STARTED"
-
-        )
-
-    except Exception as e:
-
-        logging.exception(
-
-            "Could not start Telegram polling: %s",
-
-            e
-
-        )
-
-    # =========================
-
-    # STARTUP MESSAGE
-
-    # =========================
-
-    try:
-
-        # მცირე დაყოვნება, რომ polling thread
-
-        # და Telegram connection სტაბილურად გაეშვას.
-
-        time.sleep(1)
-
-        telegram_send_startup_message()
 
     except Exception:
 
         logging.exception(
 
-            "Startup message error"
+            "Database initialization failed."
+
+        )
+
+    if TELEGRAM_BOT_TOKEN:
+
+        start_telegram_polling()
+
+    else:
+
+        logging.warning(
+
+            "TELEGRAM_BOT_TOKEN is not configured."
 
         )
 
     logging.info(
 
-        "===================================="
+        "GENIOSA 4.0 startup completed."
 
     )
+
+def shutdown_application():
 
     logging.info(
 
-        "GENIOSA IS READY"
+        "GENIOSA 4.0 shutdown started."
 
     )
+
+    stop_telegram_polling()
+
+    release_polling_lock()
 
     logging.info(
 
-        "===================================="
+        "GENIOSA 4.0 shutdown completed."
 
     )
 
-    # Application მუშაობს
+# ============================================================
 
-    yield
+# Replace FastAPI lifespan
 
-    # =========================
+# ============================================================
 
-    # SHUTDOWN
+@asynccontextmanager
 
-    # =========================
+async def geniosa_lifespan(app_instance):
 
-    logging.info(
-
-        "===================================="
-
-    )
-
-    logging.info(
-
-        "GENIOSA SHUTDOWN"
-
-    )
-
-    logging.info(
-
-        "===================================="
-
-    )
+    startup_application()
 
     try:
 
-        stop_polling()
-
-    except Exception:
-
-        logging.exception(
-
-            "Polling shutdown error"
-
-        )
-
-# =========================
-
-# FASTAPI LIFESPAN
-
-# =========================
-
-app.router.lifespan_context = lifespan
-
-# =========================
-
-# FINAL HEALTH ENDPOINTS
-
-# =========================
-
-@app.get("/health")
-
-def final_health():
-
-    return {
-
-        "status": "ok",
-
-        "service": "geniosa",
-
-        "telegram": bool(TELEGRAM_BOT_TOKEN),
-
-        "gemini": bool(GEMINI_API_KEY),
-
-        "database": bool(DATABASE_URL),
-
-    }
-
-@app.get("/telegram")
-
-def telegram_status():
-
-    bot = telegram_bot_info()
-
-    if not bot:
-
-        return {
-
-            "status": "error",
-
-            "telegram": False,
-
-        }
-
-    return {
-
-        "status": "ok",
-
-        "telegram": True,
-
-        "bot_id": bot.get("id"),
-
-        "username": bot.get("username"),
-
-        "first_name": bot.get("first_name"),
-
-    }
-
-@app.get("/db")
-
-def database_status():
-
-    conn = None
-
-    try:
-
-        conn = db()
-
-        with conn.cursor() as cur:
-
-            cur.execute(
-
-                "SELECT NOW() AS current_time"
-
-            )
-
-            row = cur.fetchone()
-
-        return {
-
-            "status": "ok",
-
-            "database": True,
-
-            "time": str(
-
-                row.get("current_time")
-
-                if row
-
-                else ""
-
-            ),
-
-        }
-
-    except Exception as e:
-
-        logging.exception(
-
-            "Database health check failed: %s",
-
-            e
-
-        )
-
-        return {
-
-            "status": "error",
-
-            "database": False,
-
-            "error": str(e),
-
-        }
+        yield
 
     finally:
 
-        if conn:
+        shutdown_application()
 
-            conn.close()
+app.router.lifespan_context = geniosa_lifespan
 
-# =========================
+print("GENIOSA 4.0 — PART 10/10 LOADED")
 
-# ROOT INFORMATION
-
-# =========================
-
-@app.get("/")
-
-def final_root():
-
-    return {
-
-        "name": "Geniosa",
-
-        "version": "4.0",
-
-        "status": "running",
-
-        "message": "Geniosa AI Business Assistant",
-
-    }
-
-# =========================
-
-# STARTUP MARKER
-
-# =========================
-
-print("====================================")
-
-print("GENIOSA 4.0 — ALL PARTS LOADED")
-
-print("GENIOSA IS READY")
-
-print("====================================")
+print("GENIOSA 4.0 — COMPLETE BUILD LOADED")
