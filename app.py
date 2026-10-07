@@ -291,6 +291,7 @@ if ALLOWED_CHAT_IDS_RAW:
             )
 
         except ValueError:
+
             logger.warning(
                 "Invalid ALLOWED_CHAT_IDS value: %s",
                 value,
@@ -342,8 +343,6 @@ def get_environment_status() -> Dict[str, bool]:
 def validate_environment() -> Dict[str, bool]:
     """
     Проверяет основные переменные окружения.
-    Не останавливает приложение при отсутствии
-    переменных.
     """
 
     status = get_environment_status()
@@ -374,9 +373,6 @@ def validate_environment() -> Dict[str, bool]:
 # ============================================================
 
 def get_db_connection():
-    """
-    Создаёт новое PostgreSQL-соединение.
-    """
 
     if not DATABASE_URL:
 
@@ -384,12 +380,10 @@ def get_db_connection():
             "DATABASE_URL is not configured"
         )
 
-    connection = psycopg2.connect(
+    return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=DATABASE_CONNECT_TIMEOUT,
     )
-
-    return connection
 
 
 # ============================================================
@@ -397,9 +391,6 @@ def get_db_connection():
 # ============================================================
 
 def database_available() -> bool:
-    """
-    Проверяет доступность PostgreSQL.
-    """
 
     if not DATABASE_URL:
         return False
@@ -431,7 +422,7 @@ def database_available() -> bool:
 
     finally:
 
-        if connection:
+        if connection is not None:
 
             try:
                 connection.close()
@@ -460,9 +451,6 @@ def telegram_request(
     payload: Optional[Dict[str, Any]] = None,
     timeout: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Универсальный Telegram Bot API request.
-    """
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -541,9 +529,6 @@ def send_telegram_message(
     parse_mode: Optional[str] = None,
     disable_web_page_preview: bool = True,
 ) -> bool:
-    """
-    Отправляет текстовое сообщение в Telegram.
-    """
 
     if not text:
         return False
@@ -877,6 +862,35 @@ print(
 # PostgreSQL database layer, initialization and migrations
 # ============================================================
 
+
+# ============================================================
+# 2.1 — DATABASE CONNECTION ALIAS
+# ============================================================
+
+def db():
+    """
+    Main PostgreSQL connection function used by Geniosa.
+    """
+
+    return get_db_connection()
+
+
+# ============================================================
+# 2.1.1 — DATABASE AVAILABILITY COMPATIBILITY FUNCTION
+# ============================================================
+
+def database_is_available() -> bool:
+    """
+    Compatibility wrapper used by other Geniosa parts.
+    """
+
+    return database_available()
+
+
+# ============================================================
+# 2.1.2 — GENERIC DATABASE EXECUTOR
+# ============================================================
+
 def db_execute(
     query: str,
     params: Optional[tuple] = None,
@@ -889,10 +903,11 @@ def db_execute(
     cursor = None
 
     try:
+
         connection = db()
 
         cursor = connection.cursor(
-            cursor_factory=RealDictCursor
+            cursor_factory=psycopg2.extras.RealDictCursor
         )
 
         cursor.execute(
@@ -903,12 +918,15 @@ def db_execute(
         result = None
 
         if fetchone:
+
             result = cursor.fetchone()
 
         elif fetchall:
+
             result = cursor.fetchall()
 
         if commit:
+
             connection.commit()
 
         return result
@@ -916,8 +934,10 @@ def db_execute(
     except Exception as exc:
 
         if connection is not None:
+
             try:
                 connection.rollback()
+
             except Exception:
                 pass
 
@@ -932,14 +952,18 @@ def db_execute(
     finally:
 
         if cursor is not None:
+
             try:
                 cursor.close()
+
             except Exception:
                 pass
 
         if connection is not None:
+
             try:
                 connection.close()
+
             except Exception:
                 pass
 
@@ -950,11 +974,11 @@ def db_execute(
 
 def init_db() -> bool:
     """
-    Create all Geniosa database tables and apply safe,
-    non-destructive schema migrations.
+    Creates all Geniosa database tables and applies
+    safe, non-destructive schema migrations.
 
     Existing database data is preserved.
-    This function is safe to run repeatedly.
+    This function can be executed repeatedly.
     """
 
     connection = None
@@ -965,12 +989,12 @@ def init_db() -> bool:
         connection = db()
 
         cursor = connection.cursor(
-            cursor_factory=RealDictCursor
+            cursor_factory=psycopg2.extras.RealDictCursor
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # MESSAGES
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -991,9 +1015,30 @@ def init_db() -> bool:
             """
         )
 
-        # ====================================================
-        # 2.2.0 — MESSAGES MIGRATION
-        # ====================================================
+        message_columns = {
+
+            "chat_id": "TEXT",
+
+            "role": "TEXT",
+
+            "text": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in message_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
 
         cursor.execute(
             """
@@ -1009,67 +1054,37 @@ def init_db() -> bool:
             for row in (cursor.fetchall() or [])
         }
 
-        # ----------------------------------------------------
-        # Add missing text column
-        # ----------------------------------------------------
-
-        if "text" not in existing_message_columns:
-
-            cursor.execute(
-                """
-                ALTER TABLE messages
-                ADD COLUMN text TEXT
-                """
-            )
-
-            existing_message_columns.add(
-                "text"
-            )
-
-            logger.info(
-                "Messages migration: added missing `text` column."
-            )
-
-        # ----------------------------------------------------
-        # Preserve legacy message data
-        # ----------------------------------------------------
-
-        legacy_text_columns = [
+        legacy_message_columns = [
             "content",
             "message_text",
             "message",
             "body",
         ]
 
-        legacy_column = None
+        legacy_message_column = None
 
-        for candidate in legacy_text_columns:
+        for candidate in legacy_message_columns:
 
             if candidate in existing_message_columns:
 
-                legacy_column = candidate
+                legacy_message_column = candidate
                 break
 
-        if legacy_column:
+        if legacy_message_column:
 
             cursor.execute(
                 f"""
                 UPDATE messages
-                SET text = {legacy_column}
+                SET text = {legacy_message_column}
                 WHERE text IS NULL
-                  AND {legacy_column} IS NOT NULL
+                  AND {legacy_message_column} IS NOT NULL
                 """
             )
 
             logger.info(
-                "Messages migration: copied legacy `%s` values "
-                "into `text`.",
-                legacy_column,
+                "Messages migration: copied legacy `%s` into `text`.",
+                legacy_message_column,
             )
-
-        # ----------------------------------------------------
-        # Replace remaining NULL values
-        # ----------------------------------------------------
 
         cursor.execute(
             """
@@ -1079,20 +1094,25 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
-        # Make text NOT NULL
-        # ----------------------------------------------------
-
         cursor.execute(
             """
-            ALTER TABLE messages
-            ALTER COLUMN text SET NOT NULL
+            UPDATE messages
+            SET role = 'user'
+            WHERE role IS NULL
             """
         )
 
-        # ----------------------------------------------------
+        cursor.execute(
+            """
+            UPDATE messages
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+            """
+        )
+
+        # ====================================================
         # BUSINESS MEMORY
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1118,9 +1138,69 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        business_memory_columns = {
+
+            "chat_id": "TEXT",
+
+            "memory": "TEXT",
+
+            "category": (
+                "TEXT DEFAULT 'general'"
+            ),
+
+            "importance": (
+                "INTEGER DEFAULT 5"
+            ),
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in business_memory_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE business_memory
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE business_memory
+            SET category = 'general'
+            WHERE category IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE business_memory
+            SET importance = 5
+            WHERE importance IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE business_memory
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # PROJECTS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1186,9 +1266,99 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        project_columns = {
+
+            "chat_id": "TEXT",
+
+            "name": "TEXT",
+
+            "industry": "TEXT",
+
+            "location": "TEXT",
+
+            "description": "TEXT",
+
+            "land_area": "DOUBLE PRECISION",
+
+            "saleable_area": "DOUBLE PRECISION",
+
+            "construction_area": "DOUBLE PRECISION",
+
+            "total_area": "DOUBLE PRECISION",
+
+            "land_cost": "DOUBLE PRECISION",
+
+            "construction_cost": "DOUBLE PRECISION",
+
+            "operating_cost": "DOUBLE PRECISION",
+
+            "financing_cost": "DOUBLE PRECISION",
+
+            "other_cost": "DOUBLE PRECISION",
+
+            "total_cost": "DOUBLE PRECISION",
+
+            "revenue": "DOUBLE PRECISION",
+
+            "expected_revenue": "DOUBLE PRECISION",
+
+            "net_profit": "DOUBLE PRECISION",
+
+            "expected_profit": "DOUBLE PRECISION",
+
+            "investor_capital": "DOUBLE PRECISION",
+
+            "investor_profit": "DOUBLE PRECISION",
+
+            "investor_share": "DOUBLE PRECISION",
+
+            "notes": "TEXT",
+
+            "status": (
+                "TEXT DEFAULT 'active'"
+            ),
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in project_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE projects
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE projects
+            SET status = 'active'
+            WHERE status IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE projects
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # DOCUMENTS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1218,9 +1388,53 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        document_columns = {
+
+            "chat_id": "TEXT",
+
+            "project_id": "BIGINT",
+
+            "filename": "TEXT",
+
+            "file_type": "TEXT",
+
+            "extracted_text": "TEXT",
+
+            "analysis": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in document_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE documents
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # INVESTORS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1256,9 +1470,71 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        investor_columns = {
+
+            "chat_id": "TEXT",
+
+            "name": "TEXT",
+
+            "company": "TEXT",
+
+            "country": "TEXT",
+
+            "contact": "TEXT",
+
+            "investment_capacity": (
+                "DOUBLE PRECISION"
+            ),
+
+            "preferred_sector": "TEXT",
+
+            "status": (
+                "TEXT DEFAULT 'new'"
+            ),
+
+            "notes": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in investor_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE investors
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE investors
+            SET status = 'new'
+            WHERE status IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE investors
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # DEALS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1294,9 +1570,75 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        deal_columns = {
+
+            "chat_id": "TEXT",
+
+            "project_id": "BIGINT",
+
+            "investor_id": "BIGINT",
+
+            "stage": (
+                "TEXT DEFAULT 'new'"
+            ),
+
+            "proposed_amount": (
+                "DOUBLE PRECISION"
+            ),
+
+            "proposed_share": (
+                "DOUBLE PRECISION"
+            ),
+
+            "valuation": (
+                "DOUBLE PRECISION"
+            ),
+
+            "notes": "TEXT",
+
+            "next_step": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in deal_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE deals
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE deals
+            SET stage = 'new'
+            WHERE stage IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE deals
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # RESEARCH
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1319,9 +1661,36 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        research_columns = {
+
+            "chat_id": "TEXT",
+
+            "project_id": "BIGINT",
+
+            "query": "TEXT",
+
+            "result": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in research_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE research
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        # ====================================================
         # FINANCIAL ANALYSES
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1346,9 +1715,38 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        financial_columns = {
+
+            "chat_id": "TEXT",
+
+            "project_id": "BIGINT",
+
+            "analysis_type": "TEXT",
+
+            "input_data": "TEXT",
+
+            "result_data": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in financial_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE financial_analyses
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        # ====================================================
         # GENERATED ASSETS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1373,9 +1771,38 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        generated_asset_columns = {
+
+            "chat_id": "TEXT",
+
+            "project_id": "BIGINT",
+
+            "asset_type": "TEXT",
+
+            "filename": "TEXT",
+
+            "description": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in generated_asset_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE generated_assets
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        # ====================================================
         # SECURITIES
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1411,9 +1838,61 @@ def init_db() -> bool:
             """
         )
 
-        # ----------------------------------------------------
+        securities_columns = {
+
+            "chat_id": "TEXT",
+
+            "symbol": "TEXT",
+
+            "name": "TEXT",
+
+            "asset_type": "TEXT",
+
+            "exchange": "TEXT",
+
+            "currency": "TEXT",
+
+            "quantity": "DOUBLE PRECISION",
+
+            "average_price": (
+                "DOUBLE PRECISION"
+            ),
+
+            "notes": "TEXT",
+
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+            "updated_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
+
+        }
+
+        for column_name, column_type in securities_columns.items():
+
+            cursor.execute(
+                f"""
+                ALTER TABLE securities
+                ADD COLUMN IF NOT EXISTS
+                {column_name} {column_type}
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE securities
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
+
+        # ====================================================
         # CRYPTO ASSETS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -1445,29 +1924,28 @@ def init_db() -> bool:
             """
         )
 
-        # ====================================================
-        # 2.2.1 — PROJECT MIGRATIONS
-        # ====================================================
+        crypto_columns = {
 
-        project_columns = {
+            "chat_id": "TEXT",
 
-            "land_cost": "DOUBLE PRECISION",
+            "symbol": "TEXT",
 
-            "construction_cost": "DOUBLE PRECISION",
+            "name": "TEXT",
 
-            "operating_cost": "DOUBLE PRECISION",
+            "quantity": "DOUBLE PRECISION",
 
-            "financing_cost": "DOUBLE PRECISION",
+            "average_price": (
+                "DOUBLE PRECISION"
+            ),
 
-            "other_cost": "DOUBLE PRECISION",
-
-            "expected_revenue": "DOUBLE PRECISION",
-
-            "expected_profit": "DOUBLE PRECISION",
+            "wallet": "TEXT",
 
             "notes": "TEXT",
 
-            "status": "TEXT DEFAULT 'active'",
+            "created_at": (
+                "TIMESTAMP NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
+            ),
 
             "updated_at": (
                 "TIMESTAMP NOT NULL "
@@ -1476,117 +1954,26 @@ def init_db() -> bool:
 
         }
 
-        for column_name, column_type in project_columns.items():
+        for column_name, column_type in crypto_columns.items():
 
             cursor.execute(
                 f"""
-                ALTER TABLE projects
+                ALTER TABLE crypto_assets
                 ADD COLUMN IF NOT EXISTS
                 {column_name} {column_type}
                 """
             )
 
-        # ====================================================
-        # 2.2.2 — DOCUMENT MIGRATIONS
-        # ====================================================
-
-        document_columns = {
-
-            "analysis": "TEXT",
-
-            "updated_at": (
-                "TIMESTAMP NOT NULL "
-                "DEFAULT CURRENT_TIMESTAMP"
-            ),
-
-            "project_id": "BIGINT",
-
-        }
-
-        for column_name, column_type in document_columns.items():
-
-            cursor.execute(
-                f"""
-                ALTER TABLE documents
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE crypto_assets
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+            """
+        )
 
         # ====================================================
-        # 2.2.3 — INVESTOR MIGRATIONS
-        # ====================================================
-
-        investor_columns = {
-
-            "contact": "TEXT",
-
-            "investment_capacity": "DOUBLE PRECISION",
-
-            "preferred_sector": "TEXT",
-
-            "status": "TEXT DEFAULT 'new'",
-
-            "notes": "TEXT",
-
-            "updated_at": (
-                "TIMESTAMP NOT NULL "
-                "DEFAULT CURRENT_TIMESTAMP"
-            ),
-
-        }
-
-        for column_name, column_type in investor_columns.items():
-
-            cursor.execute(
-                f"""
-                ALTER TABLE investors
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
-
-        # ====================================================
-        # 2.2.4 — DEAL MIGRATIONS
-        # ====================================================
-
-        deal_columns = {
-
-            "project_id": "BIGINT",
-
-            "investor_id": "BIGINT",
-
-            "proposed_amount": "DOUBLE PRECISION",
-
-            "proposed_share": "DOUBLE PRECISION",
-
-            "valuation": "DOUBLE PRECISION",
-
-            "notes": "TEXT",
-
-            "next_step": "TEXT",
-
-            "stage": "TEXT DEFAULT 'new'",
-
-            "updated_at": (
-                "TIMESTAMP NOT NULL "
-                "DEFAULT CURRENT_TIMESTAMP"
-            ),
-
-        }
-
-        for column_name, column_type in deal_columns.items():
-
-            cursor.execute(
-                f"""
-                ALTER TABLE deals
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
-
-        # ====================================================
-        # 2.2.5 — INDEXES
+        # 2.3 — INDEXES
         # ====================================================
 
         cursor.execute(
@@ -1600,8 +1987,24 @@ def init_db() -> bool:
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
-            idx_memory_chat_id
+            idx_messages_created_at
+            ON messages(created_at)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_business_memory_chat_id
             ON business_memory(chat_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_business_memory_category
+            ON business_memory(category)
             """
         )
 
@@ -1616,8 +2019,24 @@ def init_db() -> bool:
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_projects_status
+            ON projects(status)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_documents_chat_id
             ON documents(chat_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_documents_project_id
+            ON documents(project_id)
             """
         )
 
@@ -1632,6 +2051,14 @@ def init_db() -> bool:
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_investors_status
+            ON investors(status)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_deals_chat_id
             ON deals(chat_id)
             """
@@ -1640,8 +2067,16 @@ def init_db() -> bool:
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
-            idx_generated_assets_chat_id
-            ON generated_assets(chat_id)
+            idx_deals_project_id
+            ON deals(project_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_deals_investor_id
+            ON deals(investor_id)
             """
         )
 
@@ -1656,10 +2091,62 @@ def init_db() -> bool:
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_research_project_id
+            ON research(project_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_financial_analyses_chat_id
             ON financial_analyses(chat_id)
             """
         )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_financial_analyses_project_id
+            ON financial_analyses(project_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_generated_assets_chat_id
+            ON generated_assets(chat_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_generated_assets_project_id
+            ON generated_assets(project_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_securities_chat_id
+            ON securities(chat_id)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_crypto_assets_chat_id
+            ON crypto_assets(chat_id)
+            """
+        )
+
+        # ====================================================
+        # 2.4 — COMMIT
+        # ====================================================
 
         connection.commit()
 
@@ -1675,12 +2162,13 @@ def init_db() -> bool:
 
             try:
                 connection.rollback()
+
             except Exception:
                 pass
 
         logger.exception(
             "Database initialization failed: %s",
-            exc
+            exc,
         )
 
         return False
@@ -1691,6 +2179,7 @@ def init_db() -> bool:
 
             try:
                 cursor.close()
+
             except Exception:
                 pass
 
@@ -1698,15 +2187,19 @@ def init_db() -> bool:
 
             try:
                 connection.close()
+
             except Exception:
                 pass
 
 
 # ============================================================
-# 2.3 — DATABASE STARTUP TEST
+# 2.5 — DATABASE STARTUP TEST
 # ============================================================
 
 def ensure_database_ready() -> bool:
+    """
+    Initializes PostgreSQL and verifies availability.
+    """
 
     if not DATABASE_URL:
 
@@ -1732,16 +2225,20 @@ def ensure_database_ready() -> bool:
 
         return False
 
+    logger.info(
+        "Geniosa database is ready."
+    )
+
     return True
 
 
 # ============================================================
-# 2.4 — PART 2 COMPLETION MARKER
+# 2.6 — PART 2 COMPLETION MARKER
 # ============================================================
 
 print(
     "GENIOSA 4.0 — PART 2/12 LOADED"
-)
+) 
 
 
 # ============================================================
