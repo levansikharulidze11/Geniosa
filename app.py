@@ -745,7 +745,11 @@ def root():
         "database_configured": env["database"],
 
     }
+@app.head("/")
 
+def root_head():
+
+    return None
 # ============================================================
 
 # 1.20 — FASTAPI STATUS
