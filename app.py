@@ -928,6 +928,43 @@ def db_execute(
 
         result = None
 
+
+print(# ============================================================
+# GENIOSA 4.0 — PART 2/12
+# PostgreSQL database layer, initialization and migrations
+# ============================================================
+
+
+# ============================================================
+# 2.1 — DATABASE EXECUTION HELPER
+# ============================================================
+
+def db_execute(
+    query: str,
+    params: Optional[tuple] = None,
+    fetchone: bool = False,
+    fetchall: bool = False,
+    commit: bool = False,
+) -> Any:
+
+    connection = None
+    cursor = None
+
+    try:
+
+        connection = db()
+
+        cursor = connection.cursor(
+            cursor_factory=RealDictCursor
+        )
+
+        cursor.execute(
+            query,
+            params or (),
+        )
+
+        result = None
+
         if fetchone:
 
             result = cursor.fetchone()
@@ -947,21 +984,14 @@ def db_execute(
         if connection is not None:
 
             try:
-
                 connection.rollback()
-
             except Exception:
-
                 pass
 
         logger.error(
-
             "Database query failed: %s | Query: %s",
-
             exc,
-
             query[:500],
-
         )
 
         raise
@@ -971,61 +1001,48 @@ def db_execute(
         if cursor is not None:
 
             try:
-
                 cursor.close()
-
             except Exception:
-
                 pass
 
         if connection is not None:
 
             try:
-
                 connection.close()
-
             except Exception:
-
                 pass
 
+
 # ============================================================
-
 # 2.2 — DATABASE INITIALIZATION
-
 # ============================================================
 
 def init_db() -> bool:
-
     """
+    Create all Geniosa database tables and apply safe,
+    non-destructive schema migrations.
 
-    Create all Geniosa database tables and apply lightweight
-
-    schema migrations.
-
+    Existing database data is preserved.
     This function is safe to run repeatedly.
-
     """
 
     connection = None
-
     cursor = None
 
     try:
 
         connection = db()
 
-        cursor = connection.cursor()
+        cursor = connection.cursor(
+            cursor_factory=RealDictCursor
+        )
 
         # ----------------------------------------------------
-
         # MESSAGES
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS messages (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1034,26 +1051,131 @@ def init_db() -> bool:
 
                 role TEXT NOT NULL,
 
-                text TEXT NOT NULL,
+                text TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
+        # ====================================================
+        # 2.2.0 — MESSAGES MIGRATION
+        #
+        # IMPORTANT:
+        # Older Geniosa versions may already have a messages
+        # table without the `text` column.
+        #
+        # We DO NOT delete or recreate the table.
+        # We add the missing column safely and preserve data.
+        # ====================================================
+
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'messages'
+            """
+        )
+
+        existing_message_columns = {
+            row["column_name"]
+            for row in (cursor.fetchall() or [])
+        }
+
+        # ----------------------------------------------------
+        # Add missing text column
         # ----------------------------------------------------
 
-        # BUSINESS MEMORY
+        if "text" not in existing_message_columns:
 
+            cursor.execute(
+                """
+                ALTER TABLE messages
+                ADD COLUMN text TEXT
+                """
+            )
+
+            existing_message_columns.add(
+                "text"
+            )
+
+            logger.info(
+                "Messages migration: added missing `text` column."
+            )
+
+        # ----------------------------------------------------
+        # Try to preserve text from common legacy columns
+        # ----------------------------------------------------
+
+        legacy_text_columns = [
+            "content",
+            "message_text",
+            "message",
+            "body",
+        ]
+
+        legacy_column = None
+
+        for candidate in legacy_text_columns:
+
+            if candidate in existing_message_columns:
+
+                legacy_column = candidate
+                break
+
+        if legacy_column:
+
+            cursor.execute(
+                f"""
+                UPDATE messages
+                SET text = {legacy_column}
+                WHERE text IS NULL
+                  AND {legacy_column} IS NOT NULL
+                """
+            )
+
+            logger.info(
+                "Messages migration: copied legacy `%s` "
+                "values into `text`.",
+                legacy_column,
+            )
+
+        # ----------------------------------------------------
+        # Any remaining NULL text values become empty strings.
+        #
+        # This allows the column to remain compatible with the
+        # current save_message() implementation.
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
+            UPDATE messages
+            SET text = ''
+            WHERE text IS NULL
+            """
+        )
 
+        # ----------------------------------------------------
+        # Make text NOT NULL only after all existing rows have
+        # been safely populated.
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            ALTER TABLE messages
+            ALTER COLUMN text SET NOT NULL
+            """
+        )
+
+        # ----------------------------------------------------
+        # BUSINESS MEMORY
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS business_memory (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1066,26 +1188,22 @@ def init_db() -> bool:
 
                 importance INTEGER DEFAULT 5,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # PROJECTS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS projects (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1138,26 +1256,22 @@ def init_db() -> bool:
 
                 status TEXT DEFAULT 'active',
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # DOCUMENTS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS documents (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1174,26 +1288,22 @@ def init_db() -> bool:
 
                 analysis TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # INVESTORS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS investors (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1216,26 +1326,22 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # DEALS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS deals (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1258,26 +1364,22 @@ def init_db() -> bool:
 
                 next_step TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # RESEARCH
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS research (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1290,24 +1392,19 @@ def init_db() -> bool:
 
                 result TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # FINANCIAL ANALYSES
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS financial_analyses (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1322,24 +1419,19 @@ def init_db() -> bool:
 
                 result_data TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # GENERATED ASSETS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS generated_assets (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1354,24 +1446,19 @@ def init_db() -> bool:
 
                 description TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # SECURITIES
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS securities (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1394,26 +1481,22 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ----------------------------------------------------
-
         # CRYPTO ASSETS
-
         # ----------------------------------------------------
 
         cursor.execute(
-
             """
-
             CREATE TABLE IF NOT EXISTS crypto_assets (
 
                 id BIGSERIAL PRIMARY KEY,
@@ -1432,20 +1515,18 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
 
             )
-
             """
-
         )
 
         # ====================================================
-
         # 2.2.1 — PROJECT MIGRATIONS
-
         # ====================================================
 
         project_columns = {
@@ -1469,11 +1550,8 @@ def init_db() -> bool:
             "status": "TEXT DEFAULT 'active'",
 
             "updated_at": (
-
                 "TIMESTAMP NOT NULL "
-
                 "DEFAULT CURRENT_TIMESTAMP"
-
             ),
 
         }
@@ -1481,23 +1559,15 @@ def init_db() -> bool:
         for column_name, column_type in project_columns.items():
 
             cursor.execute(
-
                 f"""
-
                 ALTER TABLE projects
-
                 ADD COLUMN IF NOT EXISTS
-
                 {column_name} {column_type}
-
                 """
-
             )
 
         # ====================================================
-
         # 2.2.2 — DOCUMENT MIGRATIONS
-
         # ====================================================
 
         document_columns = {
@@ -1505,11 +1575,8 @@ def init_db() -> bool:
             "analysis": "TEXT",
 
             "updated_at": (
-
                 "TIMESTAMP NOT NULL "
-
                 "DEFAULT CURRENT_TIMESTAMP"
-
             ),
 
             "project_id": "BIGINT",
@@ -1519,23 +1586,15 @@ def init_db() -> bool:
         for column_name, column_type in document_columns.items():
 
             cursor.execute(
-
                 f"""
-
                 ALTER TABLE documents
-
                 ADD COLUMN IF NOT EXISTS
-
                 {column_name} {column_type}
-
                 """
-
             )
 
         # ====================================================
-
         # 2.2.3 — INVESTOR MIGRATIONS
-
         # ====================================================
 
         investor_columns = {
@@ -1551,11 +1610,8 @@ def init_db() -> bool:
             "notes": "TEXT",
 
             "updated_at": (
-
                 "TIMESTAMP NOT NULL "
-
                 "DEFAULT CURRENT_TIMESTAMP"
-
             ),
 
         }
@@ -1563,23 +1619,15 @@ def init_db() -> bool:
         for column_name, column_type in investor_columns.items():
 
             cursor.execute(
-
                 f"""
-
                 ALTER TABLE investors
-
                 ADD COLUMN IF NOT EXISTS
-
                 {column_name} {column_type}
-
                 """
-
             )
 
         # ====================================================
-
         # 2.2.4 — DEAL MIGRATIONS
-
         # ====================================================
 
         deal_columns = {
@@ -1601,11 +1649,8 @@ def init_db() -> bool:
             "stage": "TEXT DEFAULT 'new'",
 
             "updated_at": (
-
                 "TIMESTAMP NOT NULL "
-
                 "DEFAULT CURRENT_TIMESTAMP"
-
             ),
 
         }
@@ -1613,157 +1658,93 @@ def init_db() -> bool:
         for column_name, column_type in deal_columns.items():
 
             cursor.execute(
-
                 f"""
-
                 ALTER TABLE deals
-
                 ADD COLUMN IF NOT EXISTS
-
                 {column_name} {column_type}
-
                 """
-
             )
 
         # ====================================================
-
         # 2.2.5 — INDEXES
-
         # ====================================================
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_messages_chat_id
-
             ON messages(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_memory_chat_id
-
             ON business_memory(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_projects_chat_id
-
             ON projects(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_documents_chat_id
-
             ON documents(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_investors_chat_id
-
             ON investors(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_deals_chat_id
-
             ON deals(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_generated_assets_chat_id
-
             ON generated_assets(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_research_chat_id
-
             ON research(chat_id)
-
             """
-
         )
 
         cursor.execute(
-
             """
-
             CREATE INDEX IF NOT EXISTS
-
             idx_financial_analyses_chat_id
-
             ON financial_analyses(chat_id)
-
             """
-
         )
 
         connection.commit()
 
         logger.info(
-
             "Geniosa PostgreSQL database initialized successfully."
-
         )
 
         return True
@@ -1773,19 +1754,13 @@ def init_db() -> bool:
         if connection is not None:
 
             try:
-
                 connection.rollback()
-
             except Exception:
-
                 pass
 
         logger.exception(
-
             "Database initialization failed: %s",
-
             exc
-
         )
 
         return False
@@ -1795,43 +1770,31 @@ def init_db() -> bool:
         if cursor is not None:
 
             try:
-
                 cursor.close()
-
             except Exception:
-
                 pass
 
         if connection is not None:
 
             try:
-
                 connection.close()
-
             except Exception:
-
                 pass
 
+
 # ============================================================
-
 # 2.3 — DATABASE STARTUP TEST
-
 # ============================================================
 
 def ensure_database_ready() -> bool:
-
     """
-
     Initialize the database and verify that it is reachable.
-
     """
 
     if not DATABASE_URL:
 
         logger.error(
-
             "DATABASE_URL is missing."
-
         )
 
         return False
@@ -1839,9 +1802,7 @@ def ensure_database_ready() -> bool:
     if not init_db():
 
         logger.error(
-
             "Database initialization failed."
-
         )
 
         return False
@@ -1849,26 +1810,24 @@ def ensure_database_ready() -> bool:
     if not database_is_available():
 
         logger.error(
-
             "Database availability check failed."
-
         )
 
         return False
 
     return True
 
+
 # ============================================================
-
 # 2.4 — PART 2 COMPLETION MARKER
-
 # ============================================================
 
 print(
-
     "GENIOSA 4.0 — PART 2/12 LOADED"
+)
 
-)# ============================================================
+
+# ============================================================
 # GENIOSA 4.0 — PART 3/12
 # Messages, persistent business memory and AI context
 # ============================================================
@@ -1894,20 +1853,27 @@ def save_message(
     message_text = text
 
     if message_text is None:
+
         message_text = content
 
     if message_text is None:
+
         message_text = ""
 
-    message_text = str(message_text).strip()
+    message_text = str(
+        message_text
+    ).strip()
 
-    role = str(role).strip().lower()
+    role = str(
+        role
+    ).strip().lower()
 
     if role not in {
         "user",
         "assistant",
         "system",
     }:
+
         role = "user"
 
     try:
@@ -1932,7 +1898,10 @@ def save_message(
         )
 
         if result:
-            return int(result["id"])
+
+            return int(
+                result["id"]
+            )
 
         return None
 
@@ -2021,7 +1990,10 @@ def format_conversation_history(
     )
 
     if not messages:
-        return "NO RECENT CONVERSATION HISTORY."
+
+        return (
+            "NO RECENT CONVERSATION HISTORY."
+        )
 
     lines = [
         "RECENT CONVERSATION:"
@@ -2044,13 +2016,16 @@ def format_conversation_history(
         ).strip()
 
         if not text_value:
+
             continue
 
         lines.append(
             f"{role}: {text_value}"
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2079,10 +2054,13 @@ def save_memory(
     ).strip()
 
     try:
+
         importance = int(
             importance
         )
+
     except Exception:
+
         importance = 5
 
     importance = max(
@@ -2094,6 +2072,7 @@ def save_memory(
     )
 
     if not memory:
+
         return None
 
     try:
@@ -2120,7 +2099,10 @@ def save_memory(
         )
 
         if result:
-            return int(result["id"])
+
+            return int(
+                result["id"]
+            )
 
         return None
 
@@ -2210,7 +2192,10 @@ def build_memory_context(
     )
 
     if not memories:
-        return "PERSISTENT BUSINESS MEMORY:\nNONE"
+
+        return (
+            "PERSISTENT BUSINESS MEMORY:\nNONE"
+        )
 
     lines = [
         "PERSISTENT BUSINESS MEMORY:"
@@ -2238,6 +2223,7 @@ def build_memory_context(
         )
 
         if not memory:
+
             continue
 
         lines.append(
@@ -2247,11 +2233,14 @@ def build_memory_context(
         )
 
     if len(lines) == 1:
+
         lines.append(
             "NONE"
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2283,7 +2272,9 @@ def delete_memory(
             commit=True,
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
@@ -2314,6 +2305,7 @@ def memories_summary(
     )
 
     if not memories:
+
         return (
             "🧠 ბიზნეს-მეხსიერება ცარიელია."
         )
@@ -2356,7 +2348,9 @@ def memories_summary(
             memory
         )
 
-        lines.append("")
+        lines.append(
+            ""
+        )
 
     return "\n".join(
         lines
@@ -2368,19 +2362,33 @@ def memories_summary(
 # ============================================================
 
 INDUSTRY_NAMES = {
+
     "construction": "მშენებლობა",
+
     "development": "დეველოპმენტი",
+
     "real_estate": "უძრავი ქონება",
+
     "hotel": "სასტუმრო ბიზნესი",
+
     "tourism": "ტურიზმი",
+
     "restaurant": "რესტორანი",
+
     "casino": "კაზინო / Gaming",
+
     "finance": "ფინანსები",
+
     "technology": "ტექნოლოგიები",
+
     "retail": "რიტეილი",
+
     "energy": "ენერგეტიკა",
+
     "infrastructure": "ინფრასტრუქტურა",
+
     "other": "სხვა",
+
 }
 
 
@@ -2392,7 +2400,10 @@ def industry_name(
     """
 
     if not industry:
-        return "არ არის მითითებული"
+
+        return (
+            "არ არის მითითებული"
+        )
 
     value = str(
         industry
@@ -2418,7 +2429,10 @@ def project_to_ai_context(
     """
 
     if not project:
-        return "NO PROJECT DATA."
+
+        return (
+            "NO PROJECT DATA."
+        )
 
     excluded = {
         "id",
@@ -2432,18 +2446,22 @@ def project_to_ai_context(
     for key, value in project.items():
 
         if key in excluded:
+
             continue
 
         if value is None:
+
             continue
 
         if isinstance(
             value,
             str
         ):
+
             value = value.strip()
 
             if not value:
+
                 continue
 
         lines.append(
@@ -2451,7 +2469,10 @@ def project_to_ai_context(
         )
 
     if not lines:
-        return "NO PROJECT DATA."
+
+        return (
+            "NO PROJECT DATA."
+        )
 
     return "\n".join(
         lines
@@ -2507,10 +2528,15 @@ def build_projects_context(
             exc
         )
 
-        return "ACTIVE PROJECTS:\nUNAVAILABLE"
+        return (
+            "ACTIVE PROJECTS:\nUNAVAILABLE"
+        )
 
     if not rows:
-        return "ACTIVE PROJECTS:\nNONE"
+
+        return (
+            "ACTIVE PROJECTS:\nNONE"
+        )
 
     lines = [
         "ACTIVE PROJECTS:"
@@ -2583,20 +2609,26 @@ def build_business_context(
     """
 
     sections = [
+
         build_memory_context(
             chat_id,
             limit=30,
         ),
+
         "",
+
         format_conversation_history(
             chat_id,
             limit=20,
         ),
+
         "",
+
         build_projects_context(
             chat_id,
             limit=20,
         ),
+
     ]
 
     return "\n".join(
@@ -2617,6 +2649,7 @@ def clean_context_text(
     """
 
     if value is None:
+
         return ""
 
     text_value = str(
@@ -2624,6 +2657,7 @@ def clean_context_text(
     ).strip()
 
     if len(text_value) <= max_length:
+
         return text_value
 
     return (
@@ -2662,6 +2696,7 @@ def build_full_ai_context(
 # ============================================================
 
 print(
+    
     "GENIOSA 4.0 — PART 3/12 LOADED"
 )# ============================================================
 
