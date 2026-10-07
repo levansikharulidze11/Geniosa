@@ -11267,7 +11267,7 @@ def telegram_get_updates(
     """
 
     params = {
-        "timeout": TELEGRAM_LONG_POLL_TIMEOUT,
+        "timeout": TELEGRAM_POLL_TIMEOUT,
         "allowed_updates": json.dumps(
             [
                 "message",
