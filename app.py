@@ -35,15 +35,8 @@ from fastapi.responses import JSONResponse
 APP_NAME = "Geniosa"
 APP_VERSION = "4.0"
 
-APP_ENV = os.getenv(
-    "APP_ENV",
-    "production",
-)
-
-TIMEZONE = os.getenv(
-    "TIMEZONE",
-    "Asia/Tbilisi",
-)
+APP_ENV = os.getenv("APP_ENV", "production")
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Tbilisi")
 
 
 # ------------------------------------------------------------
@@ -52,17 +45,10 @@ TIMEZONE = os.getenv(
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-logger = logging.getLogger(
-    APP_NAME
-)
+logger = logging.getLogger(APP_NAME)
 
 
 # ------------------------------------------------------------
@@ -81,15 +67,12 @@ try:
             "60",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     TELEGRAM_REQUEST_TIMEOUT = 60
 
 TELEGRAM_REQUEST_TIMEOUT = max(
     10,
-    min(
-        TELEGRAM_REQUEST_TIMEOUT,
-        600,
-    ),
+    min(TELEGRAM_REQUEST_TIMEOUT, 600),
 )
 
 TELEGRAM_API_BASE = os.getenv(
@@ -109,15 +92,12 @@ try:
             "1",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     TELEGRAM_POLL_INTERVAL = 1.0
 
 TELEGRAM_POLL_INTERVAL = max(
     0.1,
-    min(
-        TELEGRAM_POLL_INTERVAL,
-        30.0,
-    ),
+    min(TELEGRAM_POLL_INTERVAL, 30.0),
 )
 
 try:
@@ -127,15 +107,12 @@ try:
             "30",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     TELEGRAM_POLL_TIMEOUT = 30
 
 TELEGRAM_POLL_TIMEOUT = max(
     1,
-    min(
-        TELEGRAM_POLL_TIMEOUT,
-        50,
-    ),
+    min(TELEGRAM_POLL_TIMEOUT, 50),
 )
 
 
@@ -165,15 +142,12 @@ try:
             "120",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     GEMINI_TIMEOUT = 120
 
 GEMINI_TIMEOUT = max(
     10,
-    min(
-        GEMINI_TIMEOUT,
-        600,
-    ),
+    min(GEMINI_TIMEOUT, 600),
 )
 
 
@@ -193,15 +167,12 @@ try:
             "10",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     DATABASE_CONNECT_TIMEOUT = 10
 
 DATABASE_CONNECT_TIMEOUT = max(
     3,
-    min(
-        DATABASE_CONNECT_TIMEOUT,
-        60,
-    ),
+    min(DATABASE_CONNECT_TIMEOUT, 60),
 )
 
 
@@ -220,7 +191,7 @@ try:
         if OWNER_ID_RAW
         else None
     )
-except Exception:
+except (TypeError, ValueError):
     OWNER_ID = None
 
 
@@ -230,30 +201,21 @@ ALLOWED_CHAT_IDS_RAW = os.getenv(
 ).strip()
 
 
-def _parse_chat_ids(
-    raw_value: str,
-) -> set:
-    """
-    Parses comma-separated Telegram chat IDs.
-    """
-
+def _parse_chat_ids(raw_value: str) -> set:
     result = set()
 
     if not raw_value:
         return result
 
     for item in raw_value.split(","):
-
         item = item.strip()
 
         if not item:
             continue
 
         try:
-            result.add(
-                int(item)
-            )
-        except Exception:
+            result.add(int(item))
+        except (TypeError, ValueError):
             logger.warning(
                 "Invalid chat ID in ALLOWED_CHAT_IDS: %s",
                 item,
@@ -271,24 +233,10 @@ ALLOWED_CHAT_IDS = _parse_chat_ids(
 # Access control
 # ------------------------------------------------------------
 
-def is_chat_allowed(
-    chat_id: Any,
-) -> bool:
-    """
-    Determines whether a Telegram chat is allowed
-    to use Geniosa.
-
-    Priority:
-    1. OWNER_ID
-    2. ALLOWED_CHAT_IDS
-    3. If no restrictions are configured, allow access.
-    """
-
+def is_chat_allowed(chat_id: Any) -> bool:
     try:
-        normalized_chat_id = int(
-            chat_id
-        )
-    except Exception:
+        normalized_chat_id = int(chat_id)
+    except (TypeError, ValueError):
         return False
 
     if (
@@ -315,7 +263,7 @@ def is_chat_allowed(
 # ------------------------------------------------------------
 # Storage paths
 # IMPORTANT:
-# All filesystem paths are pathlib.Path objects.
+# Every filesystem path is pathlib.Path.
 # ------------------------------------------------------------
 
 BASE_DIR = Path(
@@ -324,53 +272,45 @@ BASE_DIR = Path(
     )
 )
 
-STORAGE_DIR = (
-    BASE_DIR / "storage"
-)
+STORAGE_DIR = BASE_DIR / "storage"
 
-UPLOADS_DIR = (
-    STORAGE_DIR / "uploads"
-)
+UPLOADS_DIR = STORAGE_DIR / "uploads"
 
-GENERATED_DIR = (
-    STORAGE_DIR / "generated"
-)
+GENERATED_DIR = STORAGE_DIR / "generated"
 
-TEMP_DIR = (
-    STORAGE_DIR / "temp"
-)
+TEMP_DIR = STORAGE_DIR / "temp"
 
-DOWNLOADS_DIR = (
-    TEMP_DIR / "downloads"
-)
+DOWNLOADS_DIR = TEMP_DIR / "downloads"
 
 
 # ------------------------------------------------------------
-# Create required directories
+# Create storage directories
 # ------------------------------------------------------------
 
-for directory in (
-    STORAGE_DIR,
-    UPLOADS_DIR,
-    GENERATED_DIR,
-    TEMP_DIR,
-    DOWNLOADS_DIR,
-):
+STORAGE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-    try:
+UPLOADS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-        directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+GENERATED_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-    except Exception as exc:
+TEMP_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-        logger.error(
-            "Could not create directory %s: %s",
-            directory,
-            exc,
-        )
+DOWNLOADS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
 # ------------------------------------------------------------
@@ -384,21 +324,16 @@ try:
             "25",
         )
     )
-except Exception:
+except (TypeError, ValueError):
     MAX_DOCUMENT_SIZE_MB = 25.0
 
 MAX_DOCUMENT_SIZE_MB = max(
     1.0,
-    min(
-        MAX_DOCUMENT_SIZE_MB,
-        50.0,
-    ),
+    min(MAX_DOCUMENT_SIZE_MB, 50.0),
 )
 
 MAX_DOCUMENT_SIZE_BYTES = int(
-    MAX_DOCUMENT_SIZE_MB
-    * 1024
-    * 1024
+    MAX_DOCUMENT_SIZE_MB * 1024 * 1024
 )
 
 
@@ -406,20 +341,22 @@ MAX_DOCUMENT_SIZE_BYTES = int(
 # PostgreSQL polling lock
 # ------------------------------------------------------------
 
-POLLING_LOCK_ID = int(
-    os.getenv(
-        "POLLING_LOCK_ID",
-        "406391204",
+try:
+    POLLING_LOCK_ID = int(
+        os.getenv(
+            "POLLING_LOCK_ID",
+            "406391204",
+        )
     )
-)
+except (TypeError, ValueError):
+    POLLING_LOCK_ID = 406391204
+
 
 POLLING_STOP = threading.Event()
 
 POLLING_THREAD = None
 
-POLLING_THREAD_LOCK = (
-    threading.Lock()
-)
+POLLING_THREAD_LOCK = threading.Lock()
 
 POLLING_LOCK_CONNECTION = None
 
@@ -443,27 +380,15 @@ app = FastAPI(
 # ------------------------------------------------------------
 
 def get_environment_status() -> Dict[str, Any]:
-    """
-    Returns current environment configuration status.
-    """
-
     return {
         "app": APP_NAME,
         "version": APP_VERSION,
         "environment": APP_ENV,
         "timezone": TIMEZONE,
-        "telegram": bool(
-            TELEGRAM_BOT_TOKEN
-        ),
-        "gemini": bool(
-            GEMINI_API_KEY
-        ),
-        "database": bool(
-            DATABASE_URL
-        ),
-        "owner_configured": (
-            OWNER_ID is not None
-        ),
+        "telegram": bool(TELEGRAM_BOT_TOKEN),
+        "gemini": bool(GEMINI_API_KEY),
+        "database": bool(DATABASE_URL),
+        "owner_configured": OWNER_ID is not None,
         "allowed_chat_ids_configured": bool(
             ALLOWED_CHAT_IDS
         ),
@@ -471,13 +396,6 @@ def get_environment_status() -> Dict[str, Any]:
 
 
 def validate_environment() -> Dict[str, Any]:
-    """
-    Validates required environment variables.
-
-    Returns booleans rather than raising during startup,
-    allowing Render logs to clearly show what is missing.
-    """
-
     status = get_environment_status()
 
     if not status["telegram"]:
@@ -503,57 +421,38 @@ def validate_environment() -> Dict[str, Any]:
 # ------------------------------------------------------------
 
 def get_db_connection():
-    """
-    Creates a PostgreSQL connection.
-    """
-
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is not configured."
         )
 
-    connection = psycopg2.connect(
+    return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=DATABASE_CONNECT_TIMEOUT,
     )
 
-    return connection
-
 
 def database_available() -> bool:
-    """
-    Checks whether PostgreSQL is reachable.
-    """
-
     connection = None
 
     try:
-
         connection = get_db_connection()
 
         with connection.cursor() as cursor:
-
-            cursor.execute(
-                "SELECT 1"
-            )
-
+            cursor.execute("SELECT 1")
             cursor.fetchone()
 
         return True
 
     except Exception as exc:
-
         logger.warning(
             "Database availability check failed: %s",
             exc,
         )
-
         return False
 
     finally:
-
-        if connection:
-
+        if connection is not None:
             try:
                 connection.close()
             except Exception:
@@ -564,13 +463,7 @@ def database_available() -> bool:
 # Telegram API
 # ------------------------------------------------------------
 
-def telegram_api_url(
-    method: str,
-) -> str:
-    """
-    Builds a Telegram Bot API URL.
-    """
-
+def telegram_api_url(method: str) -> str:
     method = str(
         method or ""
     ).strip().lstrip("/")
@@ -597,23 +490,15 @@ def telegram_request(
     payload: Optional[Dict[str, Any]] = None,
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Sends a request to the Telegram Bot API.
-    """
 
-    url = telegram_api_url(
-        method
-    )
+    url = telegram_api_url(method)
 
     if timeout is None:
         timeout = TELEGRAM_REQUEST_TIMEOUT
 
     timeout = max(
         5,
-        min(
-            int(timeout),
-            600,
-        ),
+        min(int(timeout), 600),
     )
 
     response = requests.post(
@@ -631,18 +516,12 @@ def telegram_request(
             "Telegram returned invalid JSON."
         ) from exc
 
-    if not isinstance(
-        data,
-        dict,
-    ):
+    if not isinstance(data, dict):
         raise RuntimeError(
             "Telegram returned an invalid response."
         )
 
-    if not data.get(
-        "ok",
-        False,
-    ):
+    if not data.get("ok", False):
         description = data.get(
             "description",
             "Unknown Telegram API error.",
@@ -662,9 +541,6 @@ def send_telegram_message(
     disable_web_page_preview: bool = True,
     **kwargs: Any,
 ) -> bool:
-    """
-    Sends a text message through Telegram.
-    """
 
     if chat_id is None:
         return False
@@ -688,12 +564,10 @@ def send_telegram_message(
         payload["parse_mode"] = parse_mode
 
     for key, value in kwargs.items():
-
         if value is not None:
             payload[key] = value
 
     try:
-
         telegram_request(
             "sendMessage",
             payload,
@@ -702,7 +576,6 @@ def send_telegram_message(
         return True
 
     except Exception as exc:
-
         logger.warning(
             "Could not send Telegram message: %s",
             exc,
@@ -715,15 +588,11 @@ def send_chat_action(
     chat_id: Any,
     action: str = "typing",
 ) -> bool:
-    """
-    Sends a Telegram chat action.
-    """
 
     if chat_id is None:
         return False
 
     try:
-
         telegram_request(
             "sendChatAction",
             {
@@ -735,7 +604,6 @@ def send_chat_action(
         return True
 
     except Exception as exc:
-
         logger.debug(
             "Could not send Telegram chat action: %s",
             exc,
@@ -745,28 +613,15 @@ def send_chat_action(
 
 
 def telegram_get_me() -> Optional[Dict[str, Any]]:
-    """
-    Returns Telegram bot information.
-    """
-
     try:
+        data = telegram_request("getMe")
 
-        data = telegram_request(
-            "getMe"
-        )
+        result = data.get("result")
 
-        result = data.get(
-            "result"
-        )
-
-        if isinstance(
-            result,
-            dict,
-        ):
+        if isinstance(result, dict):
             return result
 
     except Exception as exc:
-
         logger.warning(
             "Telegram getMe failed: %s",
             exc,
@@ -782,15 +637,10 @@ def telegram_get_me() -> Optional[Dict[str, Any]]:
 def gemini_api_url(
     model: Optional[str] = None,
 ) -> str:
-    """
-    Builds Gemini generateContent endpoint URL.
-    """
 
-    selected_model = (
-        str(
-            model or GEMINI_MODEL
-        ).strip()
-    )
+    selected_model = str(
+        model or GEMINI_MODEL
+    ).strip()
 
     if not selected_model:
         selected_model = GEMINI_MODEL
@@ -810,17 +660,12 @@ def safe_text(
     value: Any,
     default: str = "",
 ) -> str:
-    """
-    Converts a value into safe text.
-    """
 
     if value is None:
         return default
 
     try:
-        result = str(
-            value
-        )
+        result = str(value)
     except Exception:
         return default
 
@@ -830,23 +675,14 @@ def safe_text(
         .strip()
     )
 
-    return (
-        result
-        if result
-        else default
-    )
+    if result:
+        return result
+
+    return default
 
 
-def normalize_text(
-    value: Any,
-) -> str:
-    """
-    Normalizes whitespace and line endings.
-    """
-
-    text = safe_text(
-        value
-    )
+def normalize_text(value: Any) -> str:
+    text = safe_text(value)
 
     if not text:
         return ""
@@ -877,20 +713,12 @@ def normalize_text(
 
 
 def utc_now() -> datetime:
-    """
-    Returns timezone-aware UTC datetime.
-    """
-
     return datetime.now(
         timezone.utc
     )
 
 
 def generate_uuid() -> str:
-    """
-    Generates a UUID string.
-    """
-
     return str(
         uuid.uuid4()
     )
@@ -958,10 +786,7 @@ def health():
 # ------------------------------------------------------------
 
 try:
-
-    environment_status = (
-        validate_environment()
-    )
+    environment_status = validate_environment()
 
     logger.info(
         "%s %s configuration loaded.",
@@ -1000,20 +825,19 @@ try:
     )
 
 except Exception as exc:
-
     logger.exception(
         "Startup configuration logging failed: %s",
         exc,
     )
+
+
 # ============================================================
 # GENIOSA 4.0 — PART 1/12 LOADED
 # ============================================================
 
-print(
-    "GENIOSA 4.0 — PART 1/12 LOADED"
-)
-)
+print("GENIOSA 4.0 — PART 1/12 LOADED")
 
+)
 
 # ============================================================
 # GENIOSA 4.0 — PART 2/12
