@@ -15,6 +15,7 @@ import mimetypes
 import threading
 import traceback
 
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from fastapi.responses import JSONResponse
 
 
 # ============================================================
-# LOGGING
+# 1.1 — LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -40,26 +41,112 @@ logger = logging.getLogger("geniosa")
 
 
 # ============================================================
-# APPLICATION SETTINGS
+# 1.2 — APPLICATION SETTINGS
 # ============================================================
 
 APP_NAME = "Geniosa"
-
 APP_VERSION = "4.0"
 
 APP_ENV = os.getenv(
     "APP_ENV",
     "production",
-).strip()
+).strip() or "production"
 
 TIMEZONE = os.getenv(
     "TIMEZONE",
     "Asia/Tbilisi",
-).strip()
+).strip() or "Asia/Tbilisi"
 
 
 # ============================================================
-# TELEGRAM SETTINGS
+# 1.3 — SAFE ENVIRONMENT VALUE HELPERS
+# ============================================================
+
+def get_env_int(
+    name: str,
+    default: int,
+    minimum: Optional[int] = None,
+) -> int:
+    """
+    უსაფრთხოდ კითხულობს integer environment variable-ს.
+    არასწორი მნიშვნელობის შემთხვევაში იყენებს default-ს.
+    """
+
+    raw_value = os.getenv(name, "").strip()
+
+    if not raw_value:
+        value = default
+
+    else:
+        try:
+            value = int(raw_value)
+
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid integer environment variable %s=%r. "
+                "Using default=%s.",
+                name,
+                raw_value,
+                default,
+            )
+            value = default
+
+    if minimum is not None and value < minimum:
+        logger.warning(
+            "Environment variable %s=%s is below minimum=%s. "
+            "Using minimum value.",
+            name,
+            value,
+            minimum,
+        )
+        value = minimum
+
+    return value
+
+
+def get_env_float(
+    name: str,
+    default: float,
+    minimum: Optional[float] = None,
+) -> float:
+    """
+    უსაფრთხოდ კითხულობს float environment variable-ს.
+    """
+
+    raw_value = os.getenv(name, "").strip()
+
+    if not raw_value:
+        value = default
+
+    else:
+        try:
+            value = float(raw_value)
+
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid float environment variable %s=%r. "
+                "Using default=%s.",
+                name,
+                raw_value,
+                default,
+            )
+            value = default
+
+    if minimum is not None and value < minimum:
+        logger.warning(
+            "Environment variable %s=%s is below minimum=%s. "
+            "Using minimum value.",
+            name,
+            value,
+            minimum,
+        )
+        value = minimum
+
+    return value
+
+
+# ============================================================
+# 1.4 — TELEGRAM SETTINGS
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv(
@@ -67,11 +154,28 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     "",
 ).strip()
 
-TELEGRAM_REQUEST_TIMEOUT = int(
-    os.getenv(
-        "TELEGRAM_REQUEST_TIMEOUT",
-        "30",
-    )
+TELEGRAM_REQUEST_TIMEOUT = get_env_int(
+    "TELEGRAM_REQUEST_TIMEOUT",
+    30,
+    minimum=5,
+)
+
+TELEGRAM_FILE_TIMEOUT = get_env_int(
+    "TELEGRAM_FILE_TIMEOUT",
+    60,
+    minimum=5,
+)
+
+TELEGRAM_POLL_INTERVAL = get_env_float(
+    "TELEGRAM_POLL_INTERVAL",
+    2.0,
+    minimum=0.1,
+)
+
+TELEGRAM_POLL_TIMEOUT = get_env_int(
+    "TELEGRAM_POLL_TIMEOUT",
+    25,
+    minimum=1,
 )
 
 TELEGRAM_API_BASE = (
@@ -84,23 +188,9 @@ TELEGRAM_FILE_BASE = (
     + TELEGRAM_BOT_TOKEN
 )
 
-TELEGRAM_POLL_INTERVAL = float(
-    os.getenv(
-        "TELEGRAM_POLL_INTERVAL",
-        "2",
-    )
-)
-
-TELEGRAM_POLL_TIMEOUT = int(
-    os.getenv(
-        "TELEGRAM_POLL_TIMEOUT",
-        "25",
-    )
-)
-
 
 # ============================================================
-# GEMINI SETTINGS
+# 1.5 — GEMINI SETTINGS
 # ============================================================
 
 GEMINI_API_KEY = os.getenv(
@@ -110,23 +200,22 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash-lite",
-).strip()
+    "gemini-2.5-flash-lite",
+).strip() or "gemini-2.5-flash-lite"
 
 GEMINI_API_BASE = (
     "https://generativelanguage.googleapis.com/v1beta/models"
 )
 
-GEMINI_TIMEOUT = int(
-    os.getenv(
-        "GEMINI_TIMEOUT",
-        "120",
-    )
+GEMINI_TIMEOUT = get_env_int(
+    "GEMINI_TIMEOUT",
+    120,
+    minimum=10,
 )
 
 
 # ============================================================
-# DATABASE SETTINGS
+# 1.6 — DATABASE SETTINGS
 # ============================================================
 
 DATABASE_URL = os.getenv(
@@ -134,16 +223,15 @@ DATABASE_URL = os.getenv(
     "",
 ).strip()
 
-DATABASE_CONNECT_TIMEOUT = int(
-    os.getenv(
-        "DATABASE_CONNECT_TIMEOUT",
-        "10",
-    )
+DATABASE_CONNECT_TIMEOUT = get_env_int(
+    "DATABASE_CONNECT_TIMEOUT",
+    10,
+    minimum=2,
 )
 
 
 # ============================================================
-# OWNER SETTINGS
+# 1.7 — OWNER SETTINGS
 # ============================================================
 
 OWNER_ID_RAW = os.getenv(
@@ -151,17 +239,27 @@ OWNER_ID_RAW = os.getenv(
     "",
 ).strip()
 
-try:
-    OWNER_ID = int(
-        OWNER_ID_RAW
-    ) if OWNER_ID_RAW else None
+OWNER_ID: Optional[int] = None
 
-except ValueError:
-    OWNER_ID = None
+if OWNER_ID_RAW:
+
+    try:
+        OWNER_ID = int(
+            OWNER_ID_RAW
+        )
+
+    except (TypeError, ValueError):
+
+        logger.warning(
+            "Invalid OWNER_ID value: %r",
+            OWNER_ID_RAW,
+        )
+
+        OWNER_ID = None
 
 
 # ============================================================
-# STORAGE
+# 1.8 — STORAGE DIRECTORIES
 # ============================================================
 
 BASE_DIR = os.path.dirname(
@@ -188,30 +286,38 @@ TEMP_DIR = os.path.join(
     "temp",
 )
 
+# Compatibility alias used by later Geniosa parts.
+GENERATION_DIR = GENERATED_DIR
 
-os.makedirs(
-    STORAGE_DIR,
-    exist_ok=True,
-)
+# Compatibility alias used by Telegram file processing.
+DOWNLOAD_DIR = UPLOADS_DIR
 
-os.makedirs(
-    UPLOADS_DIR,
-    exist_ok=True,
-)
 
-os.makedirs(
-    GENERATED_DIR,
-    exist_ok=True,
-)
+def ensure_storage_directories() -> None:
+    """
+    ქმნის Geniosa-ს სამუშაო დირექტორიებს.
+    """
 
-os.makedirs(
-    TEMP_DIR,
-    exist_ok=True,
-)
+    directories = (
+        STORAGE_DIR,
+        UPLOADS_DIR,
+        GENERATED_DIR,
+        TEMP_DIR,
+    )
+
+    for directory in directories:
+
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+
+ensure_storage_directories()
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# 1.9 — FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
@@ -221,14 +327,12 @@ app = FastAPI(
 
 
 # ============================================================
-
-# GLOBAL POLLING STATE
-
+# 1.10 — GLOBAL TELEGRAM POLLING STATE
 # ============================================================
 
 POLLING_STOP = threading.Event()
 
-POLLING_THREAD = None
+POLLING_THREAD: Optional[threading.Thread] = None
 
 POLLING_THREAD_LOCK = threading.Lock()
 
@@ -238,27 +342,28 @@ POLLING_LOCK_ACQUIRED = False
 
 LAST_UPDATE_ID = 0
 
+# Compatibility variable used by later polling code.
+TELEGRAM_OFFSET = 0
+
 
 # ============================================================
-# DATABASE LOCK ID
+# 1.11 — DATABASE ADVISORY LOCK
 # ============================================================
-POLLING_LOCK_ID = int(
-    os.getenv(
-        "POLLING_LOCK_ID",
-        "406391202",
-    )
+
+POLLING_LOCK_ID = get_env_int(
+    "POLLING_LOCK_ID",
+    406391202,
 )
 
 
 # ============================================================
-# DOCUMENT SETTINGS
+# 1.12 — DOCUMENT SETTINGS
 # ============================================================
 
-MAX_DOCUMENT_SIZE_MB = int(
-    os.getenv(
-        "MAX_DOCUMENT_SIZE_MB",
-        "20",
-    )
+MAX_DOCUMENT_SIZE_MB = get_env_int(
+    "MAX_DOCUMENT_SIZE_MB",
+    20,
+    minimum=1,
 )
 
 MAX_DOCUMENT_SIZE_BYTES = (
@@ -267,9 +372,66 @@ MAX_DOCUMENT_SIZE_BYTES = (
     * 1024
 )
 
+MAX_DOCUMENT_AI_TEXT = get_env_int(
+    "MAX_DOCUMENT_AI_TEXT",
+    30000,
+    minimum=1000,
+)
+
+MAX_DOCUMENT_RECORDS = get_env_int(
+    "MAX_DOCUMENT_RECORDS",
+    50,
+    minimum=1,
+)
+
+MAX_EXCEL_ROWS_PER_SHEET = get_env_int(
+    "MAX_EXCEL_ROWS_PER_SHEET",
+    5000,
+    minimum=100,
+)
+
+SUPPORTED_DOCUMENT_TYPES = {
+    "pdf",
+    "docx",
+    "xlsx",
+    "xlsm",
+    "pptx",
+    "txt",
+    "csv",
+}
+
 
 # ============================================================
-# SECURITY / ACCESS
+# 1.13 — CRM / DATABASE LIMITS
+# ============================================================
+
+MAX_PROJECT_RECORDS = get_env_int(
+    "MAX_PROJECT_RECORDS",
+    50,
+    minimum=1,
+)
+
+MAX_INVESTOR_RECORDS = get_env_int(
+    "MAX_INVESTOR_RECORDS",
+    100,
+    minimum=1,
+)
+
+MAX_DEAL_RECORDS = get_env_int(
+    "MAX_DEAL_RECORDS",
+    100,
+    minimum=1,
+)
+
+MAX_GENERATED_ASSETS = get_env_int(
+    "MAX_GENERATED_ASSETS",
+    100,
+    minimum=1,
+)
+
+
+# ============================================================
+# 1.14 — SECURITY / ACCESS CONTROL
 # ============================================================
 
 ALLOWED_CHAT_IDS_RAW = os.getenv(
@@ -281,22 +443,23 @@ ALLOWED_CHAT_IDS = set()
 
 if ALLOWED_CHAT_IDS_RAW:
 
-    for value in ALLOWED_CHAT_IDS_RAW.split(","):
+    for raw_value in ALLOWED_CHAT_IDS_RAW.split(","):
 
-        value = value.strip()
+        value = raw_value.strip()
 
         if not value:
             continue
 
         try:
+
             ALLOWED_CHAT_IDS.add(
                 int(value)
             )
 
-        except ValueError:
+        except (TypeError, ValueError):
 
             logger.warning(
-                "Invalid ALLOWED_CHAT_IDS value: %s",
+                "Invalid ALLOWED_CHAT_IDS value: %r",
                 value,
             )
 
@@ -305,10 +468,13 @@ def is_chat_allowed(
     chat_id: Optional[int],
 ) -> bool:
     """
-    Проверяет, разрешён ли Telegram chat_id.
+    ამოწმებს Telegram chat_id-ს.
 
-    Если список ALLOWED_CHAT_IDS пустой,
-    доступ разрешён.
+    თუ ALLOWED_CHAT_IDS ცარიელია,
+    ბოტი მუშაობს ყველა chat_id-ზე.
+
+    თუ სია შევსებულია,
+    მხოლოდ მითითებული chat_id-ები დაიშვება.
     """
 
     if not ALLOWED_CHAT_IDS:
@@ -318,17 +484,22 @@ def is_chat_allowed(
         return False
 
     try:
+
         return int(chat_id) in ALLOWED_CHAT_IDS
 
     except (TypeError, ValueError):
+
         return False
 
 
 # ============================================================
-# ENVIRONMENT VALIDATION
+# 1.15 — ENVIRONMENT STATUS
 # ============================================================
 
 def get_environment_status() -> Dict[str, bool]:
+    """
+    აბრუნებს ძირითადი სერვისების კონფიგურაციის სტატუსს.
+    """
 
     return {
         "telegram": bool(
@@ -345,7 +516,7 @@ def get_environment_status() -> Dict[str, bool]:
 
 def validate_environment() -> Dict[str, bool]:
     """
-    Проверяет основные переменные окружения.
+    ამოწმებს აუცილებელ environment variables-ს.
     """
 
     status = get_environment_status()
@@ -353,34 +524,37 @@ def validate_environment() -> Dict[str, bool]:
     if not status["telegram"]:
 
         logger.warning(
-            "TELEGRAM_BOT_TOKEN is not configured"
+            "TELEGRAM_BOT_TOKEN is not configured."
         )
 
     if not status["gemini"]:
 
         logger.warning(
-            "GEMINI_API_KEY is not configured"
+            "GEMINI_API_KEY is not configured."
         )
 
     if not status["database"]:
 
         logger.warning(
-            "DATABASE_URL is not configured"
+            "DATABASE_URL is not configured."
         )
 
     return status
 
 
 # ============================================================
-# DATABASE CONNECTION
+# 1.16 — DATABASE CONNECTION
 # ============================================================
 
 def get_db_connection():
+    """
+    ქმნის PostgreSQL კავშირს.
+    """
 
     if not DATABASE_URL:
 
         raise RuntimeError(
-            "DATABASE_URL is not configured"
+            "DATABASE_URL is not configured."
         )
 
     return psycopg2.connect(
@@ -390,10 +564,13 @@ def get_db_connection():
 
 
 # ============================================================
-# DATABASE AVAILABILITY
+# 1.17 — DATABASE AVAILABILITY
 # ============================================================
 
 def database_available() -> bool:
+    """
+    ამოწმებს PostgreSQL-ის ხელმისაწვდომობას.
+    """
 
     if not DATABASE_URL:
         return False
@@ -435,12 +612,16 @@ def database_available() -> bool:
 
 
 # ============================================================
-# TELEGRAM API
+# 1.18 — TELEGRAM API URL
 # ============================================================
 
 def telegram_api_url(
     method: str,
 ) -> str:
+
+    method = str(
+        method or ""
+    ).strip().lstrip("/")
 
     return (
         TELEGRAM_API_BASE
@@ -449,16 +630,26 @@ def telegram_api_url(
     )
 
 
+# ============================================================
+# 1.19 — TELEGRAM API REQUEST
+# ============================================================
+
 def telegram_request(
     method: str,
     payload: Optional[Dict[str, Any]] = None,
     timeout: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Telegram Bot API-ს უნივერსალური POST wrapper.
+
+    აბრუნებს Telegram-ის სრულ response dictionary-ს
+    წარმატების შემთხვევაში.
+    """
 
     if not TELEGRAM_BOT_TOKEN:
 
         logger.error(
-            "Telegram bot token is not configured"
+            "Telegram bot token is not configured."
         )
 
         return None
@@ -490,7 +681,17 @@ def telegram_request(
 
             return None
 
-        data = response.json()
+        try:
+
+            data = response.json()
+
+        except ValueError:
+
+            logger.error(
+                "Telegram API returned invalid JSON."
+            )
+
+            return None
 
         if not data.get("ok"):
 
@@ -503,6 +704,15 @@ def telegram_request(
 
         return data
 
+    except requests.Timeout as exc:
+
+        logger.error(
+            "Telegram request timeout: %s",
+            exc,
+        )
+
+        return None
+
     except requests.RequestException as exc:
 
         logger.error(
@@ -514,7 +724,7 @@ def telegram_request(
 
     except Exception as exc:
 
-        logger.error(
+        logger.exception(
             "Telegram request unexpected error: %s",
             exc,
         )
@@ -523,7 +733,7 @@ def telegram_request(
 
 
 # ============================================================
-# TELEGRAM SEND MESSAGE
+# 1.20 — TELEGRAM SEND MESSAGE
 # ============================================================
 
 def send_telegram_message(
@@ -532,19 +742,26 @@ def send_telegram_message(
     parse_mode: Optional[str] = None,
     disable_web_page_preview: bool = True,
 ) -> bool:
+    """
+    აგზავნის ტექსტურ შეტყობინებას Telegram-ში.
+    """
+
+    if chat_id is None:
+        return False
 
     if not text:
         return False
 
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
+    payload: Dict[str, Any] = {
+        "chat_id": int(chat_id),
+        "text": str(text),
         "disable_web_page_preview": (
             disable_web_page_preview
         ),
     }
 
     if parse_mode:
+
         payload["parse_mode"] = parse_mode
 
     result = telegram_request(
@@ -559,18 +776,29 @@ def send_telegram_message(
 
 
 # ============================================================
-# TELEGRAM CHAT ACTION
+# 1.21 — TELEGRAM CHAT ACTION
 # ============================================================
 
 def send_chat_action(
     chat_id: int,
     action: str = "typing",
 ) -> bool:
+    """
+    აგზავნის Telegram chat action-ს.
+    """
+
+    if chat_id is None:
+        return False
+
+    action = (
+        str(action or "typing").strip()
+        or "typing"
+    )
 
     result = telegram_request(
         "sendChatAction",
         {
-            "chat_id": chat_id,
+            "chat_id": int(chat_id),
             "action": action,
         },
     )
@@ -582,10 +810,13 @@ def send_chat_action(
 
 
 # ============================================================
-# TELEGRAM BOT INFORMATION
+# 1.22 — TELEGRAM BOT INFORMATION
 # ============================================================
 
 def telegram_get_me() -> Optional[Dict[str, Any]]:
+    """
+    აბრუნებს Telegram bot-ის ინფორმაციას.
+    """
 
     result = telegram_request(
         "getMe",
@@ -601,12 +832,15 @@ def telegram_get_me() -> Optional[Dict[str, Any]]:
 
 
 # ============================================================
-# GEMINI API
+# 1.23 — GEMINI API URL
 # ============================================================
 
 def gemini_api_url(
     model: Optional[str] = None,
 ) -> str:
+    """
+    ქმნის Gemini generateContent endpoint URL-ს.
+    """
 
     selected_model = (
         model
@@ -622,12 +856,15 @@ def gemini_api_url(
 
 
 # ============================================================
-# BASIC TEXT UTILITIES
+# 1.24 — BASIC TEXT UTILITIES
 # ============================================================
 
 def safe_text(
     value: Any,
 ) -> str:
+    """
+    უსაფრთხოდ გარდაქმნის მნიშვნელობას ტექსტად.
+    """
 
     if value is None:
         return ""
@@ -638,6 +875,9 @@ def safe_text(
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    ამცირებს ზედმეტ whitespace-ს.
+    """
 
     text = safe_text(
         value
@@ -653,6 +893,9 @@ def normalize_text(
 
 
 def utc_now() -> datetime:
+    """
+    აბრუნებს მიმდინარე UTC datetime-ს.
+    """
 
     return datetime.now(
         timezone.utc
@@ -660,6 +903,9 @@ def utc_now() -> datetime:
 
 
 def generate_uuid() -> str:
+    """
+    ქმნის UUID-ს.
+    """
 
     return str(
         uuid.uuid4()
@@ -667,7 +913,7 @@ def generate_uuid() -> str:
 
 
 # ============================================================
-# FASTAPI ROOT
+# 1.25 — FASTAPI ROOT
 # ============================================================
 
 @app.get("/")
@@ -686,23 +932,31 @@ def root():
 
 
 # ============================================================
-# HEAD HEALTH CHECK
+# 1.26 — HEAD HEALTH CHECK
 # ============================================================
 
 @app.head("/")
 def root_head():
 
-    return None
+    return JSONResponse(
+        status_code=200,
+        content=None,
+    )
 
 
 # ============================================================
-# STATUS ENDPOINT
+# 1.27 — STATUS ENDPOINT
 # ============================================================
 
 @app.get("/status")
 def status():
 
     env = get_environment_status()
+
+    polling_alive = bool(
+        POLLING_THREAD
+        and POLLING_THREAD.is_alive()
+    )
 
     return {
         "service": APP_NAME,
@@ -713,16 +967,15 @@ def status():
         "gemini_configured": env["gemini"],
         "database_configured": env["database"],
         "gemini_model": GEMINI_MODEL,
-        "polling_thread_alive": (
-            POLLING_THREAD.is_alive()
-            if POLLING_THREAD
-            else False
+        "polling_thread_alive": polling_alive,
+        "allowed_chat_count": len(
+            ALLOWED_CHAT_IDS
         ),
     }
 
 
 # ============================================================
-# DATABASE HEALTH CHECK
+# 1.28 — DATABASE HEALTH CHECK
 # ============================================================
 
 @app.get("/health/database")
@@ -741,13 +994,13 @@ def database_health():
                 "ok"
                 if available
                 else "unavailable"
-            )
+            ),
         },
     )
 
 
 # ============================================================
-# GENERAL HEALTH CHECK
+# 1.29 — GENERAL HEALTH CHECK
 # ============================================================
 
 @app.get("/health")
@@ -788,7 +1041,7 @@ def health():
 
 
 # ============================================================
-# STARTUP CONFIGURATION LOG
+# 1.30 — STARTUP CONFIGURATION LOG
 # ============================================================
 
 def log_startup_configuration():
@@ -838,12 +1091,37 @@ def log_startup_configuration():
     )
 
     logger.info(
+        "Telegram file timeout=%s",
+        TELEGRAM_FILE_TIMEOUT,
+    )
+
+    logger.info(
+        "Telegram poll interval=%s",
+        TELEGRAM_POLL_INTERVAL,
+    )
+
+    logger.info(
+        "Telegram poll timeout=%s",
+        TELEGRAM_POLL_TIMEOUT,
+    )
+
+    logger.info(
+        "Maximum document size=%s MB",
+        MAX_DOCUMENT_SIZE_MB,
+    )
+
+    logger.info(
+        "Allowed chat IDs configured=%s",
+        len(ALLOWED_CHAT_IDS),
+    )
+
+    logger.info(
         "============================================================"
     )
 
 
 # ============================================================
-# INITIAL ENVIRONMENT CHECK
+# 1.31 — INITIAL ENVIRONMENT CHECK
 # ============================================================
 
 validate_environment()
@@ -852,7 +1130,7 @@ log_startup_configuration()
 
 
 # ============================================================
-# PART 1 COMPLETE
+# 1.32 — PART 1 COMPLETE
 # ============================================================
 
 print(
@@ -901,6 +1179,16 @@ def db_execute(
     fetchall: bool = False,
     commit: bool = False,
 ) -> Any:
+    """
+    Executes a PostgreSQL query using RealDictCursor.
+
+    fetchone=True  -> returns one row.
+    fetchall=True  -> returns all rows.
+    commit=True    -> commits transaction.
+
+    Database errors are logged and re-raised so callers
+    can handle them explicitly.
+    """
 
     connection = None
     cursor = None
@@ -947,7 +1235,7 @@ def db_execute(
         logger.error(
             "Database query failed: %s | Query: %s",
             exc,
-            query[:500],
+            safe_text(query)[:1000],
         )
 
         raise
@@ -972,7 +1260,38 @@ def db_execute(
 
 
 # ============================================================
-# 2.2 — DATABASE INITIALIZATION
+# 2.2 — SAFE COLUMN MIGRATION HELPER
+# ============================================================
+
+def _add_missing_columns(
+    cursor,
+    table_name: str,
+    columns: Dict[str, str],
+) -> None:
+    """
+    უსაფრთხოდ ამატებს ცხრილში დაკარგულ სვეტებს.
+
+    მნიშვნელოვანი:
+    არსებული მონაცემების მქონე ცხრილში ახალი NOT NULL
+    column-ის პირდაპირ დამატებამ შეიძლება migration
+    გააფუჭოს. ამიტომ migration-ის დროს სვეტები ემატება
+    nullable ფორმით, ხოლო საჭირო default მნიშვნელობები
+    ცალკე ივსება ქვემოთ.
+    """
+
+    for column_name, column_type in columns.items():
+
+        cursor.execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN IF NOT EXISTS
+            {column_name} {column_type}
+            """
+        )
+
+
+# ============================================================
+# 2.3 — DATABASE INITIALIZATION
 # ============================================================
 
 def init_db() -> bool:
@@ -981,7 +1300,9 @@ def init_db() -> bool:
     safe, non-destructive schema migrations.
 
     Existing database data is preserved.
-    This function can be executed repeatedly.
+
+    This function is intentionally idempotent and can
+    safely be executed repeatedly on application startup.
     """
 
     connection = None
@@ -996,7 +1317,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # MESSAGES
+        # 2.3.1 — MESSAGES
         # ====================================================
 
         cursor.execute(
@@ -1027,21 +1348,21 @@ def init_db() -> bool:
             "text": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in message_columns.items():
+        _add_missing_columns(
+            cursor,
+            "messages",
+            message_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE messages
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        # ----------------------------------------------------
+        # Legacy message migration
+        # ----------------------------------------------------
 
         cursor.execute(
             """
@@ -1057,12 +1378,12 @@ def init_db() -> bool:
             for row in (cursor.fetchall() or [])
         }
 
-        legacy_message_columns = [
+        legacy_message_columns = (
             "content",
             "message_text",
             "message",
             "body",
-        ]
+        )
 
         legacy_message_column = None
 
@@ -1102,6 +1423,7 @@ def init_db() -> bool:
             UPDATE messages
             SET role = 'user'
             WHERE role IS NULL
+               OR BTRIM(role) = ''
             """
         )
 
@@ -1110,11 +1432,12 @@ def init_db() -> bool:
             UPDATE messages
             SET chat_id = '0'
             WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
             """
         )
 
         # ====================================================
-        # BUSINESS MEMORY
+        # 2.3.2 — BUSINESS MEMORY
         # ====================================================
 
         cursor.execute(
@@ -1131,10 +1454,10 @@ def init_db() -> bool:
 
                 importance INTEGER DEFAULT 5,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1156,32 +1479,46 @@ def init_db() -> bool:
             ),
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in business_memory_columns.items():
+        _add_missing_columns(
+            cursor,
+            "business_memory",
+            business_memory_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE business_memory
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE business_memory
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE business_memory
+            SET memory = ''
+            WHERE memory IS NULL
+            """
+        )
 
         cursor.execute(
             """
             UPDATE business_memory
             SET category = 'general'
             WHERE category IS NULL
+               OR BTRIM(category) = ''
             """
         )
 
@@ -1202,7 +1539,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # PROJECTS
+        # 2.3.3 — PROJECTS
         # ====================================================
 
         cursor.execute(
@@ -1259,10 +1596,10 @@ def init_db() -> bool:
 
                 status TEXT DEFAULT 'active',
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1322,32 +1659,47 @@ def init_db() -> bool:
             ),
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in project_columns.items():
+        _add_missing_columns(
+            cursor,
+            "projects",
+            project_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE projects
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE projects
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE projects
+            SET name = 'Unnamed Project'
+            WHERE name IS NULL
+               OR BTRIM(name) = ''
+            """
+        )
 
         cursor.execute(
             """
             UPDATE projects
             SET status = 'active'
             WHERE status IS NULL
+               OR BTRIM(status) = ''
             """
         )
 
@@ -1360,7 +1712,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # DOCUMENTS
+        # 2.3.4 — DOCUMENTS
         # ====================================================
 
         cursor.execute(
@@ -1381,10 +1733,10 @@ def init_db() -> bool:
 
                 analysis TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1406,26 +1758,40 @@ def init_db() -> bool:
             "analysis": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in document_columns.items():
+        _add_missing_columns(
+            cursor,
+            "documents",
+            document_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE documents
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE documents
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE documents
+            SET filename = 'unknown'
+            WHERE filename IS NULL
+               OR BTRIM(filename) = ''
+            """
+        )
 
         cursor.execute(
             """
@@ -1436,7 +1802,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # INVESTORS
+        # 2.3.5 — INVESTORS
         # ====================================================
 
         cursor.execute(
@@ -1463,10 +1829,10 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1498,32 +1864,47 @@ def init_db() -> bool:
             "notes": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in investor_columns.items():
+        _add_missing_columns(
+            cursor,
+            "investors",
+            investor_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE investors
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE investors
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE investors
+            SET name = 'Unnamed Investor'
+            WHERE name IS NULL
+               OR BTRIM(name) = ''
+            """
+        )
 
         cursor.execute(
             """
             UPDATE investors
             SET status = 'new'
             WHERE status IS NULL
+               OR BTRIM(status) = ''
             """
         )
 
@@ -1536,7 +1917,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # DEALS
+        # 2.3.6 — DEALS
         # ====================================================
 
         cursor.execute(
@@ -1563,10 +1944,10 @@ def init_db() -> bool:
 
                 next_step TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1602,32 +1983,38 @@ def init_db() -> bool:
             "next_step": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in deal_columns.items():
+        _add_missing_columns(
+            cursor,
+            "deals",
+            deal_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE deals
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE deals
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
 
         cursor.execute(
             """
             UPDATE deals
             SET stage = 'new'
             WHERE stage IS NULL
+               OR BTRIM(stage) = ''
             """
         )
 
@@ -1640,7 +2027,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # RESEARCH
+        # 2.3.7 — RESEARCH
         # ====================================================
 
         cursor.execute(
@@ -1657,7 +2044,7 @@ def init_db() -> bool:
 
                 result TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1675,24 +2062,37 @@ def init_db() -> bool:
             "result": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in research_columns.items():
+        _add_missing_columns(
+            cursor,
+            "research",
+            research_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE research
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE research
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE research
+            SET query = ''
+            WHERE query IS NULL
+            """
+        )
 
         # ====================================================
-        # FINANCIAL ANALYSES
+        # 2.3.8 — FINANCIAL ANALYSES
         # ====================================================
 
         cursor.execute(
@@ -1711,7 +2111,7 @@ def init_db() -> bool:
 
                 result_data TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1731,24 +2131,29 @@ def init_db() -> bool:
             "result_data": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in financial_columns.items():
+        _add_missing_columns(
+            cursor,
+            "financial_analyses",
+            financial_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE financial_analyses
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE financial_analyses
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
 
         # ====================================================
-        # GENERATED ASSETS
+        # 2.3.9 — GENERATED ASSETS
         # ====================================================
 
         cursor.execute(
@@ -1767,7 +2172,7 @@ def init_db() -> bool:
 
                 description TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1787,24 +2192,38 @@ def init_db() -> bool:
             "description": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in generated_asset_columns.items():
+        _add_missing_columns(
+            cursor,
+            "generated_assets",
+            generated_asset_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE generated_assets
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE generated_assets
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE generated_assets
+            SET filename = 'unknown'
+            WHERE filename IS NULL
+               OR BTRIM(filename) = ''
+            """
+        )
 
         # ====================================================
-        # SECURITIES
+        # 2.3.10 — SECURITIES
         # ====================================================
 
         cursor.execute(
@@ -1831,10 +2250,10 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1864,26 +2283,40 @@ def init_db() -> bool:
             "notes": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in securities_columns.items():
+        _add_missing_columns(
+            cursor,
+            "securities",
+            securities_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE securities
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE securities
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE securities
+            SET symbol = 'UNKNOWN'
+            WHERE symbol IS NULL
+               OR BTRIM(symbol) = ''
+            """
+        )
 
         cursor.execute(
             """
@@ -1894,7 +2327,7 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # CRYPTO ASSETS
+        # 2.3.11 — CRYPTO ASSETS
         # ====================================================
 
         cursor.execute(
@@ -1917,10 +2350,10 @@ def init_db() -> bool:
 
                 notes TEXT,
 
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP,
 
-                updated_at TIMESTAMP NOT NULL
+                updated_at TIMESTAMP
                     DEFAULT CURRENT_TIMESTAMP
 
             )
@@ -1946,26 +2379,40 @@ def init_db() -> bool:
             "notes": "TEXT",
 
             "created_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
             "updated_at": (
-                "TIMESTAMP NOT NULL "
+                "TIMESTAMP "
                 "DEFAULT CURRENT_TIMESTAMP"
             ),
 
         }
 
-        for column_name, column_type in crypto_columns.items():
+        _add_missing_columns(
+            cursor,
+            "crypto_assets",
+            crypto_columns,
+        )
 
-            cursor.execute(
-                f"""
-                ALTER TABLE crypto_assets
-                ADD COLUMN IF NOT EXISTS
-                {column_name} {column_type}
-                """
-            )
+        cursor.execute(
+            """
+            UPDATE crypto_assets
+            SET chat_id = '0'
+            WHERE chat_id IS NULL
+               OR BTRIM(chat_id) = ''
+            """
+        )
+
+        cursor.execute(
+            """
+            UPDATE crypto_assets
+            SET symbol = 'UNKNOWN'
+            WHERE symbol IS NULL
+               OR BTRIM(symbol) = ''
+            """
+        )
 
         cursor.execute(
             """
@@ -1976,179 +2423,130 @@ def init_db() -> bool:
         )
 
         # ====================================================
-        # 2.3 — INDEXES
+        # 2.4 — INDEXES
         # ====================================================
 
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_messages_chat_id
-            ON messages(chat_id)
-            """
+        indexes = (
+
+            (
+                "idx_messages_chat_id",
+                "messages(chat_id)",
+            ),
+
+            (
+                "idx_messages_created_at",
+                "messages(created_at)",
+            ),
+
+            (
+                "idx_business_memory_chat_id",
+                "business_memory(chat_id)",
+            ),
+
+            (
+                "idx_business_memory_category",
+                "business_memory(category)",
+            ),
+
+            (
+                "idx_projects_chat_id",
+                "projects(chat_id)",
+            ),
+
+            (
+                "idx_projects_status",
+                "projects(status)",
+            ),
+
+            (
+                "idx_documents_chat_id",
+                "documents(chat_id)",
+            ),
+
+            (
+                "idx_documents_project_id",
+                "documents(project_id)",
+            ),
+
+            (
+                "idx_investors_chat_id",
+                "investors(chat_id)",
+            ),
+
+            (
+                "idx_investors_status",
+                "investors(status)",
+            ),
+
+            (
+                "idx_deals_chat_id",
+                "deals(chat_id)",
+            ),
+
+            (
+                "idx_deals_project_id",
+                "deals(project_id)",
+            ),
+
+            (
+                "idx_deals_investor_id",
+                "deals(investor_id)",
+            ),
+
+            (
+                "idx_research_chat_id",
+                "research(chat_id)",
+            ),
+
+            (
+                "idx_research_project_id",
+                "research(project_id)",
+            ),
+
+            (
+                "idx_financial_analyses_chat_id",
+                "financial_analyses(chat_id)",
+            ),
+
+            (
+                "idx_financial_analyses_project_id",
+                "financial_analyses(project_id)",
+            ),
+
+            (
+                "idx_generated_assets_chat_id",
+                "generated_assets(chat_id)",
+            ),
+
+            (
+                "idx_generated_assets_project_id",
+                "generated_assets(project_id)",
+            ),
+
+            (
+                "idx_securities_chat_id",
+                "securities(chat_id)",
+            ),
+
+            (
+                "idx_crypto_assets_chat_id",
+                "crypto_assets(chat_id)",
+            ),
+
         )
 
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_messages_created_at
-            ON messages(created_at)
-            """
-        )
+        for index_name, index_definition in indexes:
 
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_business_memory_chat_id
-            ON business_memory(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_business_memory_category
-            ON business_memory(category)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_projects_chat_id
-            ON projects(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_projects_status
-            ON projects(status)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_documents_chat_id
-            ON documents(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_documents_project_id
-            ON documents(project_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_investors_chat_id
-            ON investors(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_investors_status
-            ON investors(status)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_deals_chat_id
-            ON deals(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_deals_project_id
-            ON deals(project_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_deals_investor_id
-            ON deals(investor_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_research_chat_id
-            ON research(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_research_project_id
-            ON research(project_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_financial_analyses_chat_id
-            ON financial_analyses(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_financial_analyses_project_id
-            ON financial_analyses(project_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_generated_assets_chat_id
-            ON generated_assets(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_generated_assets_project_id
-            ON generated_assets(project_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_securities_chat_id
-            ON securities(chat_id)
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_crypto_assets_chat_id
-            ON crypto_assets(chat_id)
-            """
-        )
+            cursor.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS
+                {index_name}
+                ON {index_definition}
+                """
+            )
 
         # ====================================================
-        # 2.4 — COMMIT
+        # 2.5 — COMMIT
         # ====================================================
 
         connection.commit()
@@ -2196,7 +2594,7 @@ def init_db() -> bool:
 
 
 # ============================================================
-# 2.5 — DATABASE STARTUP TEST
+# 2.6 — DATABASE STARTUP TEST
 # ============================================================
 
 def ensure_database_ready() -> bool:
@@ -2236,14 +2634,12 @@ def ensure_database_ready() -> bool:
 
 
 # ============================================================
-# 2.6 — PART 2 COMPLETION MARKER
+# 2.7 — PART 2 COMPLETION MARKER
 # ============================================================
 
 print(
     "GENIOSA 4.0 — PART 2/12 LOADED"
 ) 
-
-
 # ============================================================
 # GENIOSA 4.0 — PART 3/12
 # Messages, persistent business memory and AI context
@@ -2251,7 +2647,44 @@ print(
 
 
 # ============================================================
-# 3.1 — SAVE MESSAGE
+# 3.1 — INTERNAL HELPERS
+# ============================================================
+
+def _normalize_chat_id(
+    chat_id: Any
+) -> str:
+
+    if chat_id is None:
+        return ""
+
+    return str(
+        chat_id
+    ).strip()
+
+
+def _safe_limit(
+    value: Any,
+    default: int = 20,
+    minimum: int = 1,
+    maximum: int = 100,
+) -> int:
+
+    try:
+        value = int(value)
+    except Exception:
+        value = default
+
+    return max(
+        minimum,
+        min(
+            value,
+            maximum,
+        )
+    )
+
+
+# ============================================================
+# 3.2 — SAVE MESSAGE
 # ============================================================
 
 def save_message(
@@ -2260,6 +2693,16 @@ def save_message(
     text: Optional[str] = None,
     content: Optional[str] = None,
 ) -> Optional[int]:
+
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        logger.warning(
+            "save_message called without chat_id"
+        )
+        return None
 
     message_text = text
 
@@ -2274,7 +2717,7 @@ def save_message(
     ).strip()
 
     role = str(
-        role
+        role or "user"
     ).strip().lower()
 
     if role not in {
@@ -2282,7 +2725,6 @@ def save_message(
         "assistant",
         "system",
     }:
-
         role = "user"
 
     try:
@@ -2298,7 +2740,7 @@ def save_message(
             RETURNING id
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
                 role,
                 message_text,
             ),
@@ -2306,26 +2748,33 @@ def save_message(
             commit=True,
         )
 
-        if result:
+        if not result:
+            return None
 
-            return int(
-                result["id"]
-            )
+        message_id = result.get(
+            "id"
+        )
 
-        return None
+        if message_id is None:
+            return None
+
+        return int(
+            message_id
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to save message: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 3.2 — GET RECENT MESSAGES
+# 3.3 — GET RECENT MESSAGES
 # ============================================================
 
 def get_recent_messages(
@@ -2333,15 +2782,21 @@ def get_recent_messages(
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
 
-    try:
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
 
-        safe_limit = max(
-            1,
-            min(
-                int(limit),
-                100,
-            )
-        )
+    if not normalized_chat_id:
+        return []
+
+    safe_limit = _safe_limit(
+        limit,
+        default=20,
+        minimum=1,
+        maximum=100,
+    )
+
+    try:
 
         rows = db_execute(
             f"""
@@ -2357,7 +2812,7 @@ def get_recent_messages(
             LIMIT {safe_limit}
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
             ),
             fetchall=True,
         )
@@ -2372,14 +2827,15 @@ def get_recent_messages(
 
         logger.error(
             "Failed to get recent messages: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return []
 
 
 # ============================================================
-# 3.3 — FORMAT CONVERSATION HISTORY
+# 3.4 — FORMAT CONVERSATION HISTORY
 # ============================================================
 
 def format_conversation_history(
@@ -2393,7 +2849,6 @@ def format_conversation_history(
     )
 
     if not messages:
-
         return (
             "NO RECENT CONVERSATION HISTORY."
         )
@@ -2404,18 +2859,31 @@ def format_conversation_history(
 
     for message in messages:
 
+        if not isinstance(
+            message,
+            dict,
+        ):
+            continue
+
         role = str(
             message.get(
                 "role",
-                "user"
+                "user",
             )
-        ).upper()
+        ).strip().upper()
+
+        if role not in {
+            "USER",
+            "ASSISTANT",
+            "SYSTEM",
+        }:
+            role = "USER"
 
         text_value = str(
             message.get(
                 "text",
-                ""
-            )
+                "",
+            ) or ""
         ).strip()
 
         if not text_value:
@@ -2425,13 +2893,18 @@ def format_conversation_history(
             f"{role}: {text_value}"
         )
 
+    if len(lines) == 1:
+        return (
+            "NO RECENT CONVERSATION HISTORY."
+        )
+
     return "\n".join(
         lines
     )
 
 
 # ============================================================
-# 3.4 — SAVE BUSINESS MEMORY
+# 3.5 — SAVE BUSINESS MEMORY
 # ============================================================
 
 def save_memory(
@@ -2441,6 +2914,16 @@ def save_memory(
     importance: int = 5,
 ) -> Optional[int]:
 
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        logger.warning(
+            "save_memory called without chat_id"
+        )
+        return None
+
     memory = str(
         memory or ""
     ).strip()
@@ -2449,14 +2932,14 @@ def save_memory(
         category or "general"
     ).strip()
 
-    try:
+    if not category:
+        category = "general"
 
+    try:
         importance = int(
             importance
         )
-
     except Exception:
-
         importance = 5
 
     importance = max(
@@ -2484,7 +2967,7 @@ def save_memory(
             RETURNING id
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
                 memory,
                 category,
                 importance,
@@ -2493,26 +2976,33 @@ def save_memory(
             commit=True,
         )
 
-        if result:
+        if not result:
+            return None
 
-            return int(
-                result["id"]
-            )
+        memory_id = result.get(
+            "id"
+        )
 
-        return None
+        if memory_id is None:
+            return None
+
+        return int(
+            memory_id
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to save business memory: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 3.5 — GET BUSINESS MEMORIES
+# 3.6 — GET BUSINESS MEMORIES
 # ============================================================
 
 def get_memories(
@@ -2520,15 +3010,21 @@ def get_memories(
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
 
-    try:
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
 
-        safe_limit = max(
-            1,
-            min(
-                int(limit),
-                100,
-            )
-        )
+    if not normalized_chat_id:
+        return []
+
+    safe_limit = _safe_limit(
+        limit,
+        default=30,
+        minimum=1,
+        maximum=100,
+    )
+
+    try:
 
         rows = db_execute(
             f"""
@@ -2549,7 +3045,7 @@ def get_memories(
             LIMIT {safe_limit}
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
             ),
             fetchall=True,
         )
@@ -2560,14 +3056,15 @@ def get_memories(
 
         logger.error(
             "Failed to get business memories: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return []
 
 
 # ============================================================
-# 3.6 — BUILD MEMORY CONTEXT
+# 3.7 — BUILD MEMORY CONTEXT
 # ============================================================
 
 def build_memory_context(
@@ -2581,7 +3078,6 @@ def build_memory_context(
     )
 
     if not memories:
-
         return (
             "PERSISTENT BUSINESS MEMORY:\nNONE"
         )
@@ -2592,27 +3088,51 @@ def build_memory_context(
 
     for item in memories:
 
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
         memory = str(
             item.get(
                 "memory",
-                ""
-            )
+                "",
+            ) or ""
         ).strip()
+
+        if not memory:
+            continue
 
         category = str(
             item.get(
                 "category",
-                "general"
-            )
+                "general",
+            ) or "general"
         ).strip()
+
+        if not category:
+            category = "general"
 
         importance = item.get(
             "importance",
-            5
+            5,
         )
 
-        if not memory:
-            continue
+        try:
+            importance = int(
+                importance
+            )
+        except Exception:
+            importance = 5
+
+        importance = max(
+            1,
+            min(
+                importance,
+                10,
+            )
+        )
 
         lines.append(
             f"- [{category}] "
@@ -2621,7 +3141,6 @@ def build_memory_context(
         )
 
     if len(lines) == 1:
-
         lines.append(
             "NONE"
         )
@@ -2632,13 +3151,38 @@ def build_memory_context(
 
 
 # ============================================================
-# 3.7 — DELETE BUSINESS MEMORY
+# 3.8 — DELETE BUSINESS MEMORY
 # ============================================================
 
 def delete_memory(
     chat_id: Any,
     memory_id: int,
 ) -> bool:
+
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    try:
+
+        normalized_memory_id = int(
+            memory_id
+        )
+
+    except Exception:
+
+        logger.warning(
+            "Invalid memory_id: %r",
+            memory_id,
+        )
+
+        return False
+
+    if normalized_memory_id <= 0:
+        return False
 
     try:
 
@@ -2650,8 +3194,8 @@ def delete_memory(
             RETURNING id
             """,
             (
-                int(memory_id),
-                str(chat_id),
+                normalized_memory_id,
+                normalized_chat_id,
             ),
             fetchone=True,
             commit=True,
@@ -2665,15 +3209,16 @@ def delete_memory(
 
         logger.error(
             "Failed to delete memory %s: %s",
-            memory_id,
-            exc
+            normalized_memory_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
 
 # ============================================================
-# 3.8 — MEMORY SUMMARY
+# 3.9 — MEMORY SUMMARY
 # ============================================================
 
 def memories_summary(
@@ -2683,11 +3228,15 @@ def memories_summary(
 
     memories = get_memories(
         chat_id,
-        limit=limit,
+        limit=_safe_limit(
+            limit,
+            default=50,
+            minimum=1,
+            maximum=100,
+        ),
     )
 
     if not memories:
-
         return (
             "🧠 ბიზნეს-მეხსიერება ცარიელია."
         )
@@ -2699,26 +3248,44 @@ def memories_summary(
 
     for item in memories:
 
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
         memory_id = item.get(
             "id"
         )
 
-        category = item.get(
-            "category",
-            "general"
-        )
+        category = str(
+            item.get(
+                "category",
+                "general",
+            ) or "general"
+        ).strip()
 
         importance = item.get(
             "importance",
-            5
+            5,
         )
+
+        try:
+            importance = int(
+                importance
+            )
+        except Exception:
+            importance = 5
 
         memory = str(
             item.get(
                 "memory",
-                ""
-            )
+                "",
+            ) or ""
         ).strip()
+
+        if not memory:
+            continue
 
         lines.append(
             f"#{memory_id} | "
@@ -2734,13 +3301,18 @@ def memories_summary(
             ""
         )
 
+    if len(lines) <= 2:
+        return (
+            "🧠 ბიზნეს-მეხსიერება ცარიელია."
+        )
+
     return "\n".join(
         lines
     ).strip()
 
 
 # ============================================================
-# 3.9 — INDUSTRY NAMES
+# 3.10 — INDUSTRY NAMES
 # ============================================================
 
 INDUSTRY_NAMES = {
@@ -2778,24 +3350,24 @@ def industry_name(
     industry: Optional[str]
 ) -> str:
 
-    if not industry:
-
-        return (
-            "არ არის მითითებული"
-        )
+    if industry is None:
+        return "არ არის მითითებული"
 
     value = str(
         industry
     ).strip()
 
+    if not value:
+        return "არ არის მითითებული"
+
     return INDUSTRY_NAMES.get(
         value.lower(),
-        value
+        value,
     )
 
 
 # ============================================================
-# 3.10 — PROJECT TO AI CONTEXT
+# 3.11 — PROJECT TO AI CONTEXT
 # ============================================================
 
 def project_to_ai_context(
@@ -2803,7 +3375,14 @@ def project_to_ai_context(
 ) -> str:
 
     if not project:
+        return (
+            "NO PROJECT DATA."
+        )
 
+    if not isinstance(
+        project,
+        dict,
+    ):
         return (
             "NO PROJECT DATA."
         )
@@ -2827,7 +3406,7 @@ def project_to_ai_context(
 
         if isinstance(
             value,
-            str
+            str,
         ):
 
             value = value.strip()
@@ -2840,7 +3419,6 @@ def project_to_ai_context(
         )
 
     if not lines:
-
         return (
             "NO PROJECT DATA."
         )
@@ -2851,13 +3429,29 @@ def project_to_ai_context(
 
 
 # ============================================================
-# 3.11 — BUILD PROJECTS CONTEXT
+# 3.12 — BUILD PROJECTS CONTEXT
 # ============================================================
 
 def build_projects_context(
     chat_id: Any,
     limit: int = 20,
 ) -> str:
+
+    normalized_chat_id = _normalize_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        return (
+            "ACTIVE PROJECTS:\nNONE"
+        )
+
+    safe_limit = _safe_limit(
+        limit,
+        default=20,
+        minimum=1,
+        maximum=50,
+    )
 
     try:
 
@@ -2875,12 +3469,12 @@ def build_projects_context(
             FROM projects
             WHERE chat_id = %s
             ORDER BY
-                updated_at DESC,
+                updated_at DESC NULLS LAST,
                 id DESC
-            LIMIT {max(1, min(int(limit), 50))}
+            LIMIT {safe_limit}
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
             ),
             fetchall=True,
         )
@@ -2891,7 +3485,8 @@ def build_projects_context(
 
         logger.error(
             "Failed to build projects context: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return (
@@ -2899,7 +3494,6 @@ def build_projects_context(
         )
 
     if not rows:
-
         return (
             "ACTIVE PROJECTS:\nNONE"
         )
@@ -2910,14 +3504,25 @@ def build_projects_context(
 
     for project in rows:
 
+        if not isinstance(
+            project,
+            dict,
+        ):
+            continue
+
         project_id = project.get(
             "id"
         )
 
-        name = project.get(
-            "name",
-            "Unnamed"
-        )
+        name = str(
+            project.get(
+                "name",
+                "Unnamed",
+            ) or "Unnamed"
+        ).strip()
+
+        if not name:
+            name = "Unnamed"
 
         industry = industry_name(
             project.get(
@@ -2925,9 +3530,14 @@ def build_projects_context(
             )
         )
 
-        location = project.get(
-            "location"
-        ) or "N/A"
+        location = str(
+            project.get(
+                "location"
+            ) or "N/A"
+        ).strip()
+
+        if not location:
+            location = "N/A"
 
         expected_profit = project.get(
             "expected_profit"
@@ -2941,9 +3551,14 @@ def build_projects_context(
             "expected_revenue"
         )
 
-        status = project.get(
-            "status"
-        ) or "active"
+        status = str(
+            project.get(
+                "status"
+            ) or "active"
+        ).strip()
+
+        if not status:
+            status = "active"
 
         lines.append(
             f"- ID {project_id}: "
@@ -2956,13 +3571,18 @@ def build_projects_context(
             f"profit={expected_profit}"
         )
 
+    if len(lines) == 1:
+        return (
+            "ACTIVE PROJECTS:\nNONE"
+        )
+
     return "\n".join(
         lines
     )
 
 
 # ============================================================
-# 3.12 — BUILD BUSINESS CONTEXT
+# 3.13 — BUILD BUSINESS CONTEXT
 # ============================================================
 
 def build_business_context(
@@ -2998,7 +3618,7 @@ def build_business_context(
 
 
 # ============================================================
-# 3.13 — SAFE TEXT NORMALIZATION
+# 3.14 — SAFE TEXT NORMALIZATION
 # ============================================================
 
 def clean_context_text(
@@ -3006,8 +3626,19 @@ def clean_context_text(
     max_length: int = 12000,
 ) -> str:
 
-    if value is None:
+    try:
+        max_length = int(
+            max_length
+        )
+    except Exception:
+        max_length = 12000
 
+    max_length = max(
+        1000,
+        max_length,
+    )
+
+    if value is None:
         return ""
 
     text_value = str(
@@ -3015,7 +3646,6 @@ def clean_context_text(
     ).strip()
 
     if len(text_value) <= max_length:
-
         return text_value
 
     return (
@@ -3026,7 +3656,7 @@ def clean_context_text(
 
 
 # ============================================================
-# 3.14 — FULL AI CONTEXT
+# 3.15 — FULL AI CONTEXT
 # ============================================================
 
 def build_full_ai_context(
@@ -3044,367 +3674,393 @@ def build_full_ai_context(
 
 
 # ============================================================
-# 3.15 — PART 3 COMPLETION MARKER
+# 3.16 — PART 3 COMPLETION MARKER
 # ============================================================
 
 print(
     "GENIOSA 4.0 — PART 3/12 LOADED"
-)# ============================================================
-
+)
+# ============================================================
 # GENIOSA 4.0 — PART 4/12
-
 # Projects CRM — create, read, update, delete and context
-
 # ============================================================
 
+
+# ============================================================
+# 4.1 — PROJECT CRM LIMITS
 # ============================================================
 
-# 4.1 — CREATE PROJECT
+MAX_PROJECT_RECORDS = 100
 
+
+# ============================================================
+# 4.2 — INTERNAL PROJECT HELPERS
+# ============================================================
+
+def _project_chat_id(
+    chat_id: Any
+) -> str:
+
+    if chat_id is None:
+        return ""
+
+    return str(
+        chat_id
+    ).strip()
+
+
+def _project_id(
+    project_id: Any
+) -> Optional[int]:
+
+    try:
+        value = int(
+            project_id
+        )
+    except Exception:
+        return None
+
+    if value <= 0:
+        return None
+
+    return value
+
+
+def _optional_project_text(
+    value: Any
+) -> Optional[str]:
+
+    if value is None:
+        return None
+
+    text_value = str(
+        value
+    ).strip()
+
+    return text_value or None
+
+
+def _optional_project_number(
+    value: Any
+) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
+
+    try:
+        number = float(
+            value
+        )
+    except Exception:
+        return None
+
+    if number != number:
+        return None
+
+    if number in (
+        float("inf"),
+        float("-inf"),
+    ):
+        return None
+
+    return number
+
+
+# ============================================================
+# 4.3 — CREATE PROJECT
 # ============================================================
 
 def create_project(
-
     chat_id: Any,
-
     name: str,
-
     industry: Optional[str] = None,
-
     location: Optional[str] = None,
-
     description: Optional[str] = None,
-
     land_area: Optional[float] = None,
-
     saleable_area: Optional[float] = None,
-
     construction_area: Optional[float] = None,
-
     total_area: Optional[float] = None,
-
     land_cost: Optional[float] = None,
-
     construction_cost: Optional[float] = None,
-
     operating_cost: Optional[float] = None,
-
     financing_cost: Optional[float] = None,
-
     other_cost: Optional[float] = None,
-
     total_cost: Optional[float] = None,
-
     revenue: Optional[float] = None,
-
     expected_revenue: Optional[float] = None,
-
     net_profit: Optional[float] = None,
-
     expected_profit: Optional[float] = None,
-
     investor_capital: Optional[float] = None,
-
     investor_profit: Optional[float] = None,
-
     investor_share: Optional[float] = None,
-
     notes: Optional[str] = None,
-
     status: str = "active",
-
 ) -> Optional[int]:
 
     """
-
     Create a new project in the CRM.
-
     """
 
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        logger.warning(
+            "create_project called without chat_id"
+        )
+        return None
+
     project_name = str(
-
         name or ""
-
     ).strip()
 
     if not project_name:
-
         return None
 
-    industry = (
-
-        str(industry).strip()
-
-        if industry is not None
-
-        else None
-
+    normalized_industry = (
+        _optional_project_text(
+            industry
+        )
     )
 
-    location = (
-
-        str(location).strip()
-
-        if location is not None
-
-        else None
-
+    normalized_location = (
+        _optional_project_text(
+            location
+        )
     )
 
-    description = (
-
-        str(description).strip()
-
-        if description is not None
-
-        else None
-
+    normalized_description = (
+        _optional_project_text(
+            description
+        )
     )
 
-    notes = (
-
-        str(notes).strip()
-
-        if notes is not None
-
-        else None
-
+    normalized_notes = (
+        _optional_project_text(
+            notes
+        )
     )
 
-    status = (
-
-        str(status or "active")
-
-        .strip()
-
-        .lower()
-
+    normalized_status = (
+        normalize_project_status(
+            status
+        )
     )
+
+    # --------------------------------------------------------
+    # Numeric normalization
+    # --------------------------------------------------------
+
+    numeric_fields = {
+        "land_area": land_area,
+        "saleable_area": saleable_area,
+        "construction_area": construction_area,
+        "total_area": total_area,
+        "land_cost": land_cost,
+        "construction_cost": construction_cost,
+        "operating_cost": operating_cost,
+        "financing_cost": financing_cost,
+        "other_cost": other_cost,
+        "total_cost": total_cost,
+        "revenue": revenue,
+        "expected_revenue": expected_revenue,
+        "net_profit": net_profit,
+        "expected_profit": expected_profit,
+        "investor_capital": investor_capital,
+        "investor_profit": investor_profit,
+        "investor_share": investor_share,
+    }
+
+    normalized_numbers = {}
+
+    for field_name, field_value in numeric_fields.items():
+
+        normalized_numbers[field_name] = (
+            _optional_project_number(
+                field_value
+            )
+        )
+
+    # --------------------------------------------------------
+    # Investor share validation
+    # --------------------------------------------------------
+
+    investor_share_value = (
+        normalized_numbers.get(
+            "investor_share"
+        )
+    )
+
+    if investor_share_value is not None:
+
+        if not 0 <= investor_share_value <= 100:
+
+            logger.warning(
+                "Invalid investor_share=%s for project '%s'",
+                investor_share_value,
+                project_name,
+            )
+
+            return None
 
     try:
 
         result = db_execute(
-
             """
-
             INSERT INTO projects (
-
                 chat_id,
-
                 name,
-
                 industry,
-
                 location,
-
                 description,
-
                 land_area,
-
                 saleable_area,
-
                 construction_area,
-
                 total_area,
-
                 land_cost,
-
                 construction_cost,
-
                 operating_cost,
-
                 financing_cost,
-
                 other_cost,
-
                 total_cost,
-
                 revenue,
-
                 expected_revenue,
-
                 net_profit,
-
                 expected_profit,
-
                 investor_capital,
-
                 investor_profit,
-
                 investor_share,
-
                 notes,
-
                 status
-
             )
-
             VALUES (
-
                 %s, %s, %s, %s, %s,
-
                 %s, %s, %s, %s,
-
                 %s, %s, %s, %s, %s, %s,
-
                 %s, %s,
-
                 %s, %s,
-
                 %s, %s, %s,
-
                 %s, %s
-
             )
-
             RETURNING id
-
             """,
-
             (
-
-                str(chat_id),
-
+                normalized_chat_id,
                 project_name,
+                normalized_industry,
+                normalized_location,
+                normalized_description,
 
-                industry,
+                normalized_numbers["land_area"],
+                normalized_numbers["saleable_area"],
+                normalized_numbers["construction_area"],
+                normalized_numbers["total_area"],
 
-                location,
+                normalized_numbers["land_cost"],
+                normalized_numbers["construction_cost"],
+                normalized_numbers["operating_cost"],
+                normalized_numbers["financing_cost"],
+                normalized_numbers["other_cost"],
+                normalized_numbers["total_cost"],
 
-                description,
+                normalized_numbers["revenue"],
+                normalized_numbers["expected_revenue"],
 
-                land_area,
+                normalized_numbers["net_profit"],
+                normalized_numbers["expected_profit"],
 
-                saleable_area,
+                normalized_numbers["investor_capital"],
+                normalized_numbers["investor_profit"],
+                normalized_numbers["investor_share"],
 
-                construction_area,
-
-                total_area,
-
-                land_cost,
-
-                construction_cost,
-
-                operating_cost,
-
-                financing_cost,
-
-                other_cost,
-
-                total_cost,
-
-                revenue,
-
-                expected_revenue,
-
-                net_profit,
-
-                expected_profit,
-
-                investor_capital,
-
-                investor_profit,
-
-                investor_share,
-
-                notes,
-
-                status,
-
+                normalized_notes,
+                normalized_status,
             ),
-
             fetchone=True,
-
             commit=True,
-
         )
 
-        if result:
+        if not result:
+            return None
 
-            return int(
+        project_id = result.get(
+            "id"
+        )
 
-                result["id"]
+        if project_id is None:
+            return None
 
-            )
-
-        return None
+        return int(
+            project_id
+        )
 
     except Exception as exc:
 
         logger.error(
-
             "Failed to create project: %s",
-
-            exc
-
+            exc,
+            exc_info=True,
         )
 
         return None
 
+
 # ============================================================
-
-# 4.2 — GET PROJECTS
-
+# 4.4 — GET PROJECTS
 # ============================================================
 
 def get_projects(
-
     chat_id: Any,
-
     limit: int = 50,
-
 ) -> List[Dict[str, Any]]:
 
     """
-
     Return projects belonging to the current chat.
-
     """
+
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        return []
 
     try:
 
-        safe_limit = max(
-
-            1,
-
-            min(
-
-                int(limit),
-
-                MAX_PROJECT_RECORDS,
-
-            )
-
+        safe_limit = _safe_limit(
+            limit,
+            default=50,
+            minimum=1,
+            maximum=MAX_PROJECT_RECORDS,
         )
 
+    except Exception:
+
+        safe_limit = 50
+
+    try:
+
         rows = db_execute(
-
             f"""
-
             SELECT *
-
             FROM projects
-
             WHERE chat_id = %s
-
             ORDER BY
-
-                updated_at DESC,
-
+                updated_at DESC NULLS LAST,
                 id DESC
-
             LIMIT {safe_limit}
-
             """,
-
             (
-
-                str(chat_id),
-
+                normalized_chat_id,
             ),
-
             fetchall=True,
-
         )
 
         return rows or []
@@ -3412,63 +4068,56 @@ def get_projects(
     except Exception as exc:
 
         logger.error(
-
             "Failed to get projects: %s",
-
-            exc
-
+            exc,
+            exc_info=True,
         )
 
         return []
 
+
 # ============================================================
-
-# 4.3 — GET SINGLE PROJECT
-
+# 4.5 — GET SINGLE PROJECT
 # ============================================================
 
 def get_project(
-
     chat_id: Any,
-
     project_id: int,
-
 ) -> Optional[Dict[str, Any]]:
 
     """
-
     Return one project belonging to the current chat.
-
     """
+
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    normalized_project_id = _project_id(
+        project_id
+    )
+
+    if not normalized_chat_id:
+        return None
+
+    if normalized_project_id is None:
+        return None
 
     try:
 
         result = db_execute(
-
             """
-
             SELECT *
-
             FROM projects
-
             WHERE id = %s
-
               AND chat_id = %s
-
             LIMIT 1
-
             """,
-
             (
-
-                int(project_id),
-
-                str(chat_id),
-
+                normalized_project_id,
+                normalized_chat_id,
             ),
-
             fetchone=True,
-
         )
 
         return result
@@ -3476,81 +4125,60 @@ def get_project(
     except Exception as exc:
 
         logger.error(
-
             "Failed to get project %s: %s",
-
-            project_id,
-
-            exc
-
+            normalized_project_id,
+            exc,
+            exc_info=True,
         )
 
         return None
 
+
 # ============================================================
-
-# 4.4 — FIND PROJECT BY NAME
-
+# 4.6 — FIND PROJECT BY NAME
 # ============================================================
 
 def find_project_by_name(
-
     chat_id: Any,
-
     name: str,
-
 ) -> Optional[Dict[str, Any]]:
 
     """
-
     Find a project using a partial name match.
-
     """
 
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
     search_name = str(
-
         name or ""
-
     ).strip()
 
-    if not search_name:
+    if not normalized_chat_id:
+        return None
 
+    if not search_name:
         return None
 
     try:
 
         result = db_execute(
-
             """
-
             SELECT *
-
             FROM projects
-
             WHERE chat_id = %s
-
               AND name ILIKE %s
-
             ORDER BY
-
-                updated_at DESC,
-
+                updated_at DESC NULLS LAST,
                 id DESC
-
             LIMIT 1
-
             """,
-
             (
-
-                str(chat_id),
-
+                normalized_chat_id,
                 f"%{search_name}%",
-
             ),
-
             fetchone=True,
-
         )
 
         return result
@@ -3558,40 +4186,44 @@ def find_project_by_name(
     except Exception as exc:
 
         logger.error(
-
             "Failed to find project '%s': %s",
-
             search_name,
-
-            exc
-
+            exc,
+            exc_info=True,
         )
 
         return None
 
+
 # ============================================================
-
-# 4.5 — UPDATE PROJECT
-
+# 4.7 — UPDATE PROJECT
 # ============================================================
 
 def update_project(
-
     chat_id: Any,
-
     project_id: int,
-
     **fields,
-
 ) -> bool:
 
     """
-
     Update allowed project fields.
 
     Only explicitly whitelisted columns can be modified.
-
     """
+
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    normalized_project_id = _project_id(
+        project_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_project_id is None:
+        return False
 
     allowed_fields = {
 
@@ -3644,228 +4276,248 @@ def update_project(
     }
 
     updates = []
-
     values = []
 
     for field_name, field_value in fields.items():
 
         if field_name not in allowed_fields:
-
             continue
 
-        if field_name == "name":
+        # ----------------------------------------------------
+        # Text fields
+        # ----------------------------------------------------
 
-            field_value = str(
+        if field_name in {
+            "name",
+            "industry",
+            "location",
+            "description",
+            "notes",
+        }:
 
-                field_value or ""
+            if field_name == "name":
 
-            ).strip()
+                normalized_value = str(
+                    field_value or ""
+                ).strip()
 
-            if not field_value:
+                if not normalized_value:
+                    continue
 
-                continue
+                field_value = normalized_value
+
+            else:
+
+                field_value = (
+                    _optional_project_text(
+                        field_value
+                    )
+                )
+
+        # ----------------------------------------------------
+        # Status
+        # ----------------------------------------------------
+
+        elif field_name == "status":
+
+            field_value = (
+                normalize_project_status(
+                    field_value
+                )
+            )
+
+        # ----------------------------------------------------
+        # Numeric fields
+        # ----------------------------------------------------
+
+        else:
+
+            field_value = (
+                _optional_project_number(
+                    field_value
+                )
+            )
+
+        # ----------------------------------------------------
+        # Investor share
+        # ----------------------------------------------------
+
+        if field_name == "investor_share":
+
+            if field_value is not None:
+
+                if not 0 <= field_value <= 100:
+
+                    logger.warning(
+                        "Invalid investor_share=%s "
+                        "for project %s",
+                        field_value,
+                        normalized_project_id,
+                    )
+
+                    return False
 
         updates.append(
-
             f"{field_name} = %s"
-
         )
 
         values.append(
-
             field_value
-
         )
 
     if not updates:
-
         return False
 
     updates.append(
-
         "updated_at = CURRENT_TIMESTAMP"
-
     )
 
     values.extend([
-
-        int(project_id),
-
-        str(chat_id),
-
+        normalized_project_id,
+        normalized_chat_id,
     ])
 
     query = f"""
-
         UPDATE projects
-
         SET {", ".join(updates)}
-
         WHERE id = %s
-
           AND chat_id = %s
-
         RETURNING id
-
     """
 
     try:
 
         result = db_execute(
-
             query,
-
             tuple(values),
-
             fetchone=True,
-
             commit=True,
-
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
-
             "Failed to update project %s: %s",
-
-            project_id,
-
-            exc
-
+            normalized_project_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
+
 # ============================================================
-
-# 4.6 — DELETE PROJECT
-
+# 4.8 — DELETE PROJECT
 # ============================================================
 
 def delete_project(
-
     chat_id: Any,
-
     project_id: int,
-
 ) -> bool:
 
     """
-
     Delete one project belonging to the current chat.
-
     """
+
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    normalized_project_id = _project_id(
+        project_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_project_id is None:
+        return False
 
     try:
 
         result = db_execute(
-
             """
-
             DELETE FROM projects
-
             WHERE id = %s
-
               AND chat_id = %s
-
             RETURNING id
-
             """,
-
             (
-
-                int(project_id),
-
-                str(chat_id),
-
+                normalized_project_id,
+                normalized_chat_id,
             ),
-
             fetchone=True,
-
             commit=True,
-
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
-
             "Failed to delete project %s: %s",
-
-            project_id,
-
-            exc
-
+            normalized_project_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
+
 # ============================================================
-
-# 4.7 — PROJECT SUMMARY
-
+# 4.9 — PROJECT SUMMARY
 # ============================================================
 
 def project_summary(
-
     project: Optional[Dict[str, Any]]
-
 ) -> str:
 
     """
-
     Convert a project record into a readable Telegram summary.
-
     """
 
     if not project:
-
         return "❌ პროექტი ვერ მოიძებნა."
 
     project_id = project.get(
-
         "id"
-
     )
 
-    name = project.get(
-
-        "name"
-
-    ) or "უსახელო პროექტი"
+    name = str(
+        project.get(
+            "name"
+        ) or "უსახელო პროექტ"
+    ).strip()
 
     industry = industry_name(
-
         project.get(
-
             "industry"
-
         )
-
     )
 
-    location = project.get(
+    location = str(
+        project.get(
+            "location"
+        ) or "არ არის მითითებული"
+    ).strip()
 
-        "location"
+    description = str(
+        project.get(
+            "description"
+        ) or ""
+    ).strip()
 
-    ) or "არ არის მითითებული"
-
-    description = project.get(
-
-        "description"
-
-    ) or ""
-
-    status = project.get(
-
-        "status"
-
-    ) or "active"
+    status = normalize_project_status(
+        project.get(
+            "status"
+        )
+    )
 
     lines = [
 
@@ -3884,19 +4536,13 @@ def project_summary(
     if description:
 
         lines.extend([
-
             "",
-
             "📝 აღწერა:",
-
-            str(description),
-
+            description,
         ])
 
     # --------------------------------------------------------
-
     # Areas
-
     # --------------------------------------------------------
 
     area_lines = []
@@ -3904,43 +4550,27 @@ def project_summary(
     area_fields = [
 
         (
-
             "land_area",
-
             "🌐 მიწის ფართობი",
-
             "მ²",
-
         ),
 
         (
-
             "construction_area",
-
             "🏗️ სამშენებლო ფართობი",
-
             "მ²",
-
         ),
 
         (
-
             "saleable_area",
-
             "🏷️ გასაყიდი ფართობი",
-
             "მ²",
-
         ),
 
         (
-
             "total_area",
-
             "📐 სრული ფართობი",
-
             "მ²",
-
         ),
 
     ]
@@ -3948,103 +4578,81 @@ def project_summary(
     for field_name, label, unit in area_fields:
 
         value = project.get(
-
             field_name
-
         )
 
-        if value is not None:
+        if value is None:
+            continue
 
-            area_lines.append(
+        try:
 
-                f"{label}: "
-
-                f"{format_number(value)} {unit}"
-
+            display_value = format_number(
+                value
             )
+
+        except Exception:
+
+            display_value = str(
+                value
+            )
+
+        area_lines.append(
+            f"{label}: "
+            f"{display_value} {unit}"
+        )
 
     if area_lines:
 
         lines.extend([
-
             "",
-
             "📐 ფართობები:",
-
             *area_lines,
-
         ])
 
     # --------------------------------------------------------
-
     # Financial information
-
     # --------------------------------------------------------
 
     financial_fields = [
 
         (
-
             "land_cost",
-
             "🌐 მიწის ღირებულება",
-
         ),
 
         (
-
             "construction_cost",
-
             "🏗️ მშენებლობის ღირებულება",
-
         ),
 
         (
-
             "operating_cost",
-
             "⚙️ საოპერაციო ხარჯი",
-
         ),
 
         (
-
             "financing_cost",
-
             "🏦 დაფინანსების ხარჯი",
-
         ),
 
         (
-
             "other_cost",
-
             "📦 სხვა ხარჯი",
-
         ),
 
         (
-
             "total_cost",
-
             "💰 სრული ღირებულება",
-
         ),
 
         (
-
             "expected_revenue",
-
             "📈 მოსალოდნელი შემოსავალი",
-
         ),
 
         (
-
             "expected_profit",
-
             "💵 მოსალოდნელი მოგება",
-
         ),
 
     ]
@@ -4054,37 +4662,39 @@ def project_summary(
     for field_name, label in financial_fields:
 
         value = project.get(
-
             field_name
-
         )
 
-        if value is not None:
+        if value is None:
+            continue
 
-            financial_lines.append(
+        try:
 
-                f"{label}: "
-
-                f"{format_money(value)}"
-
+            display_value = format_money(
+                value
             )
+
+        except Exception:
+
+            display_value = str(
+                value
+            )
+
+        financial_lines.append(
+            f"{label}: "
+            f"{display_value}"
+        )
 
     if financial_lines:
 
         lines.extend([
-
             "",
-
             "💰 ფინანსები:",
-
             *financial_lines,
-
         ])
 
     # --------------------------------------------------------
-
     # Investor structure
-
     # --------------------------------------------------------
 
     investor_lines = []
@@ -4092,33 +4702,21 @@ def project_summary(
     investor_fields = [
 
         (
-
             "investor_capital",
-
             "💼 ინვესტორის კაპიტალი",
-
             "money",
-
         ),
 
         (
-
             "investor_profit",
-
             "💵 ინვესტორის მოგება",
-
             "money",
-
         ),
 
         (
-
             "investor_share",
-
             "📊 ინვესტორის წილი",
-
             "percent",
-
         ),
 
     ]
@@ -4126,352 +4724,304 @@ def project_summary(
     for field_name, label, value_type in investor_fields:
 
         value = project.get(
-
             field_name
-
         )
 
         if value is None:
-
             continue
 
-        if value_type == "money":
+        try:
 
-            display_value = format_money(
+            if value_type == "money":
 
+                display_value = format_money(
+                    value
+                )
+
+            else:
+
+                display_value = (
+                    f"{format_number(value)}%"
+                )
+
+        except Exception:
+
+            display_value = str(
                 value
-
-            )
-
-        else:
-
-            display_value = (
-
-                f"{format_number(value)}%"
-
             )
 
         investor_lines.append(
-
             f"{label}: {display_value}"
-
         )
 
     if investor_lines:
 
         lines.extend([
-
             "",
-
             "🤝 ინვესტიცია:",
-
             *investor_lines,
-
         ])
 
-    notes = project.get(
+    # --------------------------------------------------------
+    # Notes
+    # --------------------------------------------------------
 
-        "notes"
-
-    )
+    notes = str(
+        project.get(
+            "notes"
+        ) or ""
+    ).strip()
 
     if notes:
 
         lines.extend([
-
             "",
-
             "📎 შენიშვნები:",
-
-            str(notes),
-
+            notes,
         ])
 
     return "\n".join(
-
         lines
-
     )
 
+
 # ============================================================
-
-# 4.8 — PROJECTS SUMMARY
-
+# 4.10 — PROJECTS SUMMARY
 # ============================================================
 
 def projects_summary(
-
     chat_id: Any
-
 ) -> str:
 
     """
-
     Compact project list for Telegram.
-
     """
 
     projects = get_projects(
-
         chat_id,
-
         limit=MAX_PROJECT_RECORDS,
-
     )
 
     if not projects:
 
         return (
-
             "🏗️ პროექტები ჯერ არ არის დამატებული."
-
         )
 
     lines = [
-
         "🏗️ GENIOSA — პროექტები",
-
         "",
-
     ]
 
     for project in projects:
 
+        if not isinstance(
+            project,
+            dict,
+        ):
+            continue
+
         project_id = project.get(
-
             "id"
-
         )
 
-        name = project.get(
+        name = str(
+            project.get(
+                "name"
+            ) or "უსახელო"
+        ).strip()
 
-            "name"
+        location = str(
+            project.get(
+                "location"
+            ) or "—"
+        ).strip()
 
-        ) or "უსახელო"
-
-        location = project.get(
-
-            "location"
-
-        ) or "—"
-
-        status = project.get(
-
-            "status"
-
-        ) or "active"
+        status = normalize_project_status(
+            project.get(
+                "status"
+            )
+        )
 
         expected_profit = project.get(
-
             "expected_profit"
-
         )
 
-        profit_text = (
+        if expected_profit is not None:
 
-            format_money(
+            try:
 
-                expected_profit
+                profit_text = format_money(
+                    expected_profit
+                )
 
-            )
+            except Exception:
 
-            if expected_profit is not None
+                profit_text = str(
+                    expected_profit
+                )
 
-            else "—"
+        else:
 
-        )
+            profit_text = "—"
 
         lines.append(
-
             f"#{project_id} — {name}"
-
         )
 
         lines.append(
-
             f"📍 {location} | "
-
             f"სტატუსი: {status}"
-
         )
 
         lines.append(
-
             f"💵 მოსალოდნელი მოგება: "
-
             f"{profit_text}"
-
         )
 
         lines.append("")
 
+    if len(lines) <= 2:
+
+        return (
+            "🏗️ პროექტები ჯერ არ არის დამატებული."
+        )
+
     return "\n".join(
-
         lines
-
     ).strip()
 
+
 # ============================================================
-
-# 4.9 — PROJECT DEAL IDS
-
+# 4.11 — PROJECT DEAL COUNT
 # ============================================================
 
 def get_project_deal_count(
-
     chat_id: Any,
-
     project_id: int,
-
 ) -> int:
 
     """
-
     Count deals connected to a project.
 
     Full deal operations are implemented in PART 5.
-
     """
+
+    normalized_chat_id = _project_chat_id(
+        chat_id
+    )
+
+    normalized_project_id = _project_id(
+        project_id
+    )
+
+    if not normalized_chat_id:
+        return 0
+
+    if normalized_project_id is None:
+        return 0
 
     try:
 
         result = db_execute(
-
             """
-
             SELECT COUNT(*) AS total
-
             FROM deals
-
             WHERE chat_id = %s
-
               AND project_id = %s
-
             """,
-
             (
-
-                str(chat_id),
-
-                int(project_id),
-
+                normalized_chat_id,
+                normalized_project_id,
             ),
-
             fetchone=True,
-
         )
 
         if not result:
-
             return 0
 
-        return int(
+        try:
 
-            result.get(
-
-                "total",
-
-                0
-
+            return int(
+                result.get(
+                    "total",
+                    0,
+                ) or 0
             )
 
-        )
+        except Exception:
+
+            return 0
 
     except Exception as exc:
 
         logger.error(
-
             "Failed to count project deals: %s",
-
-            exc
-
+            exc,
+            exc_info=True,
         )
 
         return 0
 
+
 # ============================================================
-
-# 4.10 — PROJECT CONTEXT
-
+# 4.12 — PROJECT CONTEXT
 # ============================================================
 
 def build_project_context(
-
     chat_id: Any,
-
     project_id: int,
-
 ) -> str:
 
     """
-
     Build detailed AI context for a specific project.
-
     """
 
     project = get_project(
-
         chat_id,
-
         project_id,
-
     )
 
     if not project:
-
         return "PROJECT NOT FOUND."
 
     context = project_to_ai_context(
-
         project
-
     )
 
     deal_count = get_project_deal_count(
-
         chat_id,
-
         project_id,
-
     )
 
     return (
-
         "SELECTED PROJECT:\n"
-
         f"{context}\n\n"
-
         f"CONNECTED DEALS: {deal_count}"
-
     )
 
+
 # ============================================================
-
-# 4.11 — PROJECT STATUS NORMALIZATION
-
+# 4.13 — PROJECT STATUS NORMALIZATION
 # ============================================================
 
 def normalize_project_status(
-
     value: Optional[str]
-
 ) -> str:
 
     """
-
     Normalize common project status values.
-
     """
 
-    if not value:
-
+    if value is None:
         return "active"
 
     text_value = str(
-
         value
-
     ).strip().lower()
+
+    if not text_value:
+        return "active"
 
     mapping = {
 
@@ -4506,50 +5056,45 @@ def normalize_project_status(
     }
 
     return mapping.get(
-
         text_value,
-
         text_value,
-
     )
 
+
 # ============================================================
-
-# 4.12 — PROJECT FIELD CALCULATIONS
-
+# 4.14 — PROJECT TOTAL COST
 # ============================================================
 
 def calculate_project_total_cost(
-
     project: Optional[Dict[str, Any]]
-
 ) -> float:
 
     """
+    Calculate total project cost.
 
-    Calculate total project cost from available cost components.
-
+    If total_cost is explicitly stored and valid,
+    it is treated as the authoritative value.
+    Otherwise cost components are summed.
     """
 
     if not project:
-
         return 0.0
 
     existing_total = project.get(
-
         "total_cost"
-
     )
 
     if existing_total is not None:
 
         try:
 
-            return float(
-
+            total_value = float(
                 existing_total
-
             )
+
+            if total_value == total_value:
+
+                return total_value
 
         except Exception:
 
@@ -4574,22 +5119,22 @@ def calculate_project_total_cost(
     for field_name in fields:
 
         value = project.get(
-
             field_name
-
         )
 
         if value is None:
-
             continue
 
         try:
 
-            total += float(
-
+            number = float(
                 value
-
             )
+
+            if number != number:
+                continue
+
+            total += number
 
         except Exception:
 
@@ -4597,188 +5142,256 @@ def calculate_project_total_cost(
 
     return total
 
-# ============================================================
-
-# 4.13 — CALCULATE PROJECT PROFIT
 
 # ============================================================
+# 4.15 — CALCULATE PROJECT REVENUE
+# ============================================================
 
-def calculate_project_profit(
-
+def calculate_project_revenue(
     project: Optional[Dict[str, Any]]
-
 ) -> float:
 
     """
-
-    Calculate project profit from expected revenue minus total cost.
-
+    Return expected project revenue.
     """
 
     if not project:
+        return 0.0
+
+    revenue = project.get(
+        "expected_revenue"
+    )
+
+    if revenue is None:
+
+        revenue = project.get(
+            "revenue"
+        )
+
+    if revenue is None:
+        return 0.0
+
+    try:
+
+        value = float(
+            revenue
+        )
+
+        if value != value:
+            return 0.0
+
+        return value
+
+    except Exception:
 
         return 0.0
 
+
+# ============================================================
+# 4.16 — CALCULATE PROJECT PROFIT
+# ============================================================
+
+def calculate_project_profit(
+    project: Optional[Dict[str, Any]]
+) -> float:
+
+    """
+    Calculate project profit from expected revenue
+    minus total cost.
+
+    If expected_profit is explicitly stored and valid,
+    it is treated as the authoritative value.
+    """
+
+    if not project:
+        return 0.0
+
     existing_profit = project.get(
-
         "expected_profit"
-
     )
 
     if existing_profit is not None:
 
         try:
 
-            return float(
-
+            profit_value = float(
                 existing_profit
-
             )
+
+            if profit_value == profit_value:
+
+                return profit_value
 
         except Exception:
 
             pass
 
-    revenue = (
-
-        project.get(
-
-            "expected_revenue"
-
-        )
-
-        if project.get(
-
-            "expected_revenue"
-
-        ) is not None
-
-        else project.get(
-
-            "revenue"
-
-        )
-
+    revenue = calculate_project_revenue(
+        project
     )
 
-    if revenue is None:
-
-        return 0.0
-
-    try:
-
-        revenue = float(
-
-            revenue
-
-        )
-
-    except Exception:
-
-        return 0.0
-
     total_cost = calculate_project_total_cost(
-
         project
-
     )
 
     return revenue - total_cost
 
+
 # ============================================================
-
-# 4.14 — PROJECT PROFIT MARGIN
-
+# 4.17 — PROJECT PROFIT MARGIN
 # ============================================================
 
 def calculate_project_margin(
-
     project: Optional[Dict[str, Any]]
-
 ) -> float:
 
     """
-
     Calculate expected profit margin as a percentage.
-
     """
 
     if not project:
-
         return 0.0
 
-    revenue = (
-
-        project.get(
-
-            "expected_revenue"
-
-        )
-
-        if project.get(
-
-            "expected_revenue"
-
-        ) is not None
-
-        else project.get(
-
-            "revenue"
-
-        )
-
+    revenue = calculate_project_revenue(
+        project
     )
 
-    if revenue is None:
-
-        return 0.0
-
-    try:
-
-        revenue = float(
-
-            revenue
-
-        )
-
-    except Exception:
-
-        return 0.0
-
     if revenue == 0:
-
         return 0.0
 
     profit = calculate_project_profit(
-
         project
-
     )
 
     return (
-
         profit / revenue
-
     ) * 100.0
 
+
 # ============================================================
-
-# 4.15 — PART 4 COMPLETION MARKER
-
+# 4.18 — PART 4 COMPLETION MARKER
 # ============================================================
 
 print(
-
     "GENIOSA 4.0 — PART 4/12 LOADED"
-
-)# ============================================================
+)
+# ============================================================
 # GENIOSA 4.0 — PART 5/12
 # Investors & Deals CRM
 # ============================================================
 
 
 # ============================================================
-# 5.1 — CREATE INVESTOR
+# 5.1 — CRM LIMITS
+# ============================================================
+
+MAX_INVESTOR_RECORDS = 100
+MAX_DEAL_RECORDS = 200
+
+
+# ============================================================
+# 5.2 — INTERNAL CRM HELPERS
+# ============================================================
+
+def _crm_chat_id(
+    chat_id: Any
+) -> str:
+
+    if chat_id is None:
+        return ""
+
+    return str(
+        chat_id
+    ).strip()
+
+
+def _crm_record_id(
+    record_id: Any
+) -> Optional[int]:
+
+    try:
+        value = int(
+            record_id
+        )
+    except Exception:
+        return None
+
+    if value <= 0:
+        return None
+
+    return value
+
+
+def _crm_optional_text(
+    value: Any
+) -> Optional[str]:
+
+    if value is None:
+        return None
+
+    text_value = str(
+        value
+    ).strip()
+
+    return text_value or None
+
+
+def _crm_optional_number(
+    value: Any
+) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
+
+    try:
+        number = float(
+            value
+        )
+    except Exception:
+        return None
+
+    if number != number:
+        return None
+
+    if number in (
+        float("inf"),
+        float("-inf"),
+    ):
+        return None
+
+    return number
+
+
+def _crm_safe_limit(
+    value: Any,
+    default: int,
+    maximum: int,
+) -> int:
+
+    try:
+        value = int(
+            value
+        )
+    except Exception:
+        value = default
+
+    return max(
+        1,
+        min(
+            value,
+            maximum,
+        )
+    )
+
+
+# ============================================================
+# 5.3 — CREATE INVESTOR
 # ============================================================
 
 def create_investor(
@@ -4792,9 +5405,17 @@ def create_investor(
     status: str = "new",
     notes: Optional[str] = None,
 ) -> Optional[int]:
+
     """
     Create a new investor in the CRM.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        return None
 
     investor_name = str(
         name or ""
@@ -4803,50 +5424,44 @@ def create_investor(
     if not investor_name:
         return None
 
-    company = (
-        str(company).strip()
-        if company is not None
-        else None
+    company = _crm_optional_text(
+        company
     )
 
-    country = (
-        str(country).strip()
-        if country is not None
-        else None
+    country = _crm_optional_text(
+        country
     )
 
-    contact = (
-        str(contact).strip()
-        if contact is not None
-        else None
+    contact = _crm_optional_text(
+        contact
     )
 
-    preferred_sector = (
-        str(preferred_sector).strip()
-        if preferred_sector is not None
-        else None
+    preferred_sector = _crm_optional_text(
+        preferred_sector
     )
 
-    notes = (
-        str(notes).strip()
-        if notes is not None
-        else None
+    notes = _crm_optional_text(
+        notes
     )
 
     status = str(
         status or "new"
     ).strip().lower()
 
-    try:
+    if not status:
+        status = "new"
 
-        if investment_capacity is not None:
-            investment_capacity = float(
-                investment_capacity
-            )
+    investment_capacity = (
+        _crm_optional_number(
+            investment_capacity
+        )
+    )
 
-    except Exception:
-
-        investment_capacity = None
+    if (
+        investment_capacity is not None
+        and investment_capacity < 0
+    ):
+        return None
 
     try:
 
@@ -4870,7 +5485,7 @@ def create_investor(
             RETURNING id
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
                 investor_name,
                 company,
                 country,
@@ -4884,44 +5499,58 @@ def create_investor(
             commit=True,
         )
 
-        if result:
-            return int(
-                result["id"]
-            )
+        if not result:
+            return None
 
-        return None
+        investor_id = result.get(
+            "id"
+        )
+
+        if investor_id is None:
+            return None
+
+        return int(
+            investor_id
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to create investor: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 5.2 — GET INVESTORS
+# 5.4 — GET INVESTORS
 # ============================================================
 
 def get_investors(
     chat_id: Any,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
+
     """
     Return investors belonging to the current chat.
     """
 
-    try:
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
 
-        safe_limit = max(
-            1,
-            min(
-                int(limit),
-                MAX_INVESTOR_RECORDS,
-            )
-        )
+    if not normalized_chat_id:
+        return []
+
+    safe_limit = _crm_safe_limit(
+        limit,
+        default=100,
+        maximum=MAX_INVESTOR_RECORDS,
+    )
+
+    try:
 
         rows = db_execute(
             f"""
@@ -4929,12 +5558,12 @@ def get_investors(
             FROM investors
             WHERE chat_id = %s
             ORDER BY
-                updated_at DESC,
+                updated_at DESC NULLS LAST,
                 id DESC
             LIMIT {safe_limit}
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
             ),
             fetchall=True,
         )
@@ -4945,23 +5574,39 @@ def get_investors(
 
         logger.error(
             "Failed to get investors: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return []
 
 
 # ============================================================
-# 5.3 — GET SINGLE INVESTOR
+# 5.5 — GET SINGLE INVESTOR
 # ============================================================
 
 def get_investor(
     chat_id: Any,
     investor_id: int,
 ) -> Optional[Dict[str, Any]]:
+
     """
     Return one investor belonging to the current chat.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_investor_id = _crm_record_id(
+        investor_id
+    )
+
+    if not normalized_chat_id:
+        return None
+
+    if normalized_investor_id is None:
+        return None
 
     try:
 
@@ -4974,8 +5619,8 @@ def get_investor(
             LIMIT 1
             """,
             (
-                int(investor_id),
-                str(chat_id),
+                normalized_investor_id,
+                normalized_chat_id,
             ),
             fetchone=True,
         )
@@ -4984,28 +5629,37 @@ def get_investor(
 
         logger.error(
             "Failed to get investor %s: %s",
-            investor_id,
-            exc
+            normalized_investor_id,
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 5.4 — FIND INVESTOR
+# 5.6 — FIND INVESTOR
 # ============================================================
 
 def find_investor(
     chat_id: Any,
     search_text: str,
 ) -> Optional[Dict[str, Any]]:
+
     """
     Search investor by name, company, country or contact.
     """
 
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
     value = str(
         search_text or ""
     ).strip()
+
+    if not normalized_chat_id:
+        return None
 
     if not value:
         return None
@@ -5026,13 +5680,12 @@ def find_investor(
                     OR contact ILIKE %s
                   )
             ORDER BY
-                updated_at DESC,
+                updated_at DESC NULLS LAST,
                 id DESC
             LIMIT 1
             """,
             (
-                str(chat_id),
-                pattern,
+                normalized_chat_id,
                 pattern,
                 pattern,
                 pattern,
@@ -5045,14 +5698,15 @@ def find_investor(
         logger.error(
             "Failed to find investor '%s': %s",
             value,
-            exc
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 5.5 — UPDATE INVESTOR
+# 5.7 — UPDATE INVESTOR
 # ============================================================
 
 def update_investor(
@@ -5060,9 +5714,24 @@ def update_investor(
     investor_id: int,
     **fields,
 ) -> bool:
+
     """
     Update allowed investor fields.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_investor_id = _crm_record_id(
+        investor_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_investor_id is None:
+        return False
 
     allowed_fields = {
         "name",
@@ -5076,7 +5745,6 @@ def update_investor(
     }
 
     updates = []
-
     values = []
 
     for field_name, field_value in fields.items():
@@ -5093,14 +5761,38 @@ def update_investor(
             if not field_value:
                 continue
 
-        if field_name == "investment_capacity":
+        elif field_name in {
+            "company",
+            "country",
+            "contact",
+            "preferred_sector",
+            "notes",
+        }:
 
-            try:
-                field_value = float(
-                    field_value
-                )
-            except Exception:
-                continue
+            field_value = _crm_optional_text(
+                field_value
+            )
+
+        elif field_name == "investment_capacity":
+
+            field_value = _crm_optional_number(
+                field_value
+            )
+
+            if (
+                field_value is not None
+                and field_value < 0
+            ):
+                return False
+
+        elif field_name == "status":
+
+            field_value = str(
+                field_value or "new"
+            ).strip().lower()
+
+            if not field_value:
+                field_value = "new"
 
         updates.append(
             f"{field_name} = %s"
@@ -5118,8 +5810,8 @@ def update_investor(
     )
 
     values.extend([
-        int(investor_id),
-        str(chat_id),
+        normalized_investor_id,
+        normalized_chat_id,
     ])
 
     query = f"""
@@ -5139,30 +5831,48 @@ def update_investor(
             commit=True,
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to update investor %s: %s",
-            investor_id,
-            exc
+            normalized_investor_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
 
 # ============================================================
-# 5.6 — DELETE INVESTOR
+# 5.8 — DELETE INVESTOR
 # ============================================================
 
 def delete_investor(
     chat_id: Any,
     investor_id: int,
 ) -> bool:
+
     """
     Delete one investor belonging to the current chat.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_investor_id = _crm_record_id(
+        investor_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_investor_id is None:
+        return False
 
     try:
 
@@ -5174,33 +5884,37 @@ def delete_investor(
             RETURNING id
             """,
             (
-                int(investor_id),
-                str(chat_id),
+                normalized_investor_id,
+                normalized_chat_id,
             ),
             fetchone=True,
             commit=True,
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to delete investor %s: %s",
-            investor_id,
-            exc
+            normalized_investor_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
 
 # ============================================================
-# 5.7 — FORMAT INVESTOR
+# 5.9 — FORMAT INVESTOR
 # ============================================================
 
 def format_investor(
     investor: Optional[Dict[str, Any]]
 ) -> str:
+
     """
     Format an investor for Telegram.
     """
@@ -5212,36 +5926,50 @@ def format_investor(
         "id"
     )
 
-    name = investor.get(
-        "name"
-    ) or "უცნობი"
+    name = str(
+        investor.get(
+            "name"
+        ) or "უცნობი"
+    ).strip()
 
-    company = investor.get(
-        "company"
+    company = _crm_optional_text(
+        investor.get(
+            "company"
+        )
     )
 
-    country = investor.get(
-        "country"
+    country = _crm_optional_text(
+        investor.get(
+            "country"
+        )
     )
 
-    contact = investor.get(
-        "contact"
+    contact = _crm_optional_text(
+        investor.get(
+            "contact"
+        )
     )
 
     capacity = investor.get(
         "investment_capacity"
     )
 
-    sector = investor.get(
-        "preferred_sector"
+    sector = _crm_optional_text(
+        investor.get(
+            "preferred_sector"
+        )
     )
 
-    status = investor.get(
-        "status"
-    ) or "new"
+    status = str(
+        investor.get(
+            "status"
+        ) or "new"
+    ).strip()
 
-    notes = investor.get(
-        "notes"
+    notes = _crm_optional_text(
+        investor.get(
+            "notes"
+        )
     )
 
     lines = [
@@ -5265,9 +5993,22 @@ def format_investor(
         )
 
     if capacity is not None:
+
+        try:
+
+            capacity_text = format_money(
+                capacity
+            )
+
+        except Exception:
+
+            capacity_text = str(
+                capacity
+            )
+
         lines.append(
             f"💰 საინვესტიციო შესაძლებლობა: "
-            f"{format_money(capacity)}"
+            f"{capacity_text}"
         )
 
     if sector:
@@ -5280,10 +6021,11 @@ def format_investor(
     )
 
     if notes:
+
         lines.extend([
             "",
             "📎 შენიშვნები:",
-            str(notes),
+            notes,
         ])
 
     return "\n".join(
@@ -5292,12 +6034,13 @@ def format_investor(
 
 
 # ============================================================
-# 5.8 — INVESTORS SUMMARY
+# 5.10 — INVESTORS SUMMARY
 # ============================================================
 
 def investors_summary(
     chat_id: Any
 ) -> str:
+
     """
     Compact investor list.
     """
@@ -5319,6 +6062,12 @@ def investors_summary(
     ]
 
     for investor in investors:
+
+        if not isinstance(
+            investor,
+            dict,
+        ):
+            continue
 
         investor_id = investor.get(
             "id"
@@ -5344,11 +6093,23 @@ def investors_summary(
             "investment_capacity"
         )
 
-        capacity_text = (
-            format_money(capacity)
-            if capacity is not None
-            else "—"
-        )
+        if capacity is not None:
+
+            try:
+
+                capacity_text = format_money(
+                    capacity
+                )
+
+            except Exception:
+
+                capacity_text = str(
+                    capacity
+                )
+
+        else:
+
+            capacity_text = "—"
 
         lines.append(
             f"#{investor_id} — {name}"
@@ -5372,7 +6133,7 @@ def investors_summary(
 
 
 # ============================================================
-# 5.9 — CREATE DEAL
+# 5.11 — CREATE DEAL
 # ============================================================
 
 def create_deal(
@@ -5386,85 +6147,110 @@ def create_deal(
     notes: Optional[str] = None,
     next_step: Optional[str] = None,
 ) -> Optional[int]:
+
     """
     Create a deal connecting a project and/or investor.
     """
 
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+        return None
+
     project_id_value = None
     investor_id_value = None
 
+    # --------------------------------------------------------
+    # Validate project
+    # --------------------------------------------------------
+
     if project_id is not None:
 
-        try:
-            project_id_value = int(
-                project_id
-            )
-        except Exception:
+        project_id_value = _crm_record_id(
+            project_id
+        )
+
+        if project_id_value is None:
             return None
 
         project = get_project(
-            chat_id,
+            normalized_chat_id,
             project_id_value,
         )
 
         if not project:
             return None
 
+    # --------------------------------------------------------
+    # Validate investor
+    # --------------------------------------------------------
+
     if investor_id is not None:
 
-        try:
-            investor_id_value = int(
-                investor_id
-            )
-        except Exception:
+        investor_id_value = _crm_record_id(
+            investor_id
+        )
+
+        if investor_id_value is None:
             return None
 
         investor = get_investor(
-            chat_id,
+            normalized_chat_id,
             investor_id_value,
         )
 
         if not investor:
             return None
 
-    try:
+    # --------------------------------------------------------
+    # Normalize numeric values
+    # --------------------------------------------------------
 
-        proposed_amount = (
-            float(proposed_amount)
-            if proposed_amount is not None
-            else None
-        )
+    proposed_amount = _crm_optional_number(
+        proposed_amount
+    )
 
-        proposed_share = (
-            float(proposed_share)
-            if proposed_share is not None
-            else None
-        )
+    proposed_share = _crm_optional_number(
+        proposed_share
+    )
 
-        valuation = (
-            float(valuation)
-            if valuation is not None
-            else None
-        )
+    valuation = _crm_optional_number(
+        valuation
+    )
 
-    except Exception:
+    if (
+        proposed_amount is not None
+        and proposed_amount < 0
+    ):
+        return None
 
+    if (
+        proposed_share is not None
+        and not 0 <= proposed_share <= 100
+    ):
+        return None
+
+    if (
+        valuation is not None
+        and valuation < 0
+    ):
         return None
 
     stage = str(
         stage or "new"
     ).strip().lower()
 
-    notes = (
-        str(notes).strip()
-        if notes is not None
-        else None
+    if not stage:
+        stage = "new"
+
+    notes = _crm_optional_text(
+        notes
     )
 
-    next_step = (
-        str(next_step).strip()
-        if next_step is not None
-        else None
+    next_step = _crm_optional_text(
+        next_step
     )
 
     try:
@@ -5490,7 +6276,7 @@ def create_deal(
             RETURNING id
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
                 project_id_value,
                 investor_id_value,
                 stage,
@@ -5504,44 +6290,58 @@ def create_deal(
             commit=True,
         )
 
-        if result:
-            return int(
-                result["id"]
-            )
+        if not result:
+            return None
 
-        return None
+        deal_id = result.get(
+            "id"
+        )
+
+        if deal_id is None:
+            return None
+
+        return int(
+            deal_id
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to create deal: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 5.10 — GET DEALS
+# 5.12 — GET DEALS
 # ============================================================
 
 def get_deals(
     chat_id: Any,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
+
     """
     Return deals with related project and investor names.
     """
 
-    try:
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
 
-        safe_limit = max(
-            1,
-            min(
-                int(limit),
-                MAX_DEAL_RECORDS,
-            )
-        )
+    if not normalized_chat_id:
+        return []
+
+    safe_limit = _crm_safe_limit(
+        limit,
+        default=100,
+        maximum=MAX_DEAL_RECORDS,
+    )
+
+    try:
 
         rows = db_execute(
             f"""
@@ -5559,12 +6359,12 @@ def get_deals(
                AND i.chat_id = d.chat_id
             WHERE d.chat_id = %s
             ORDER BY
-                d.updated_at DESC,
+                d.updated_at DESC NULLS LAST,
                 d.id DESC
             LIMIT {safe_limit}
             """,
             (
-                str(chat_id),
+                normalized_chat_id,
             ),
             fetchall=True,
         )
@@ -5575,23 +6375,39 @@ def get_deals(
 
         logger.error(
             "Failed to get deals: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return []
 
 
 # ============================================================
-# 5.11 — GET SINGLE DEAL
+# 5.13 — GET SINGLE DEAL
 # ============================================================
 
 def get_deal(
     chat_id: Any,
     deal_id: int,
 ) -> Optional[Dict[str, Any]]:
+
     """
     Return one deal with related CRM data.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_deal_id = _crm_record_id(
+        deal_id
+    )
+
+    if not normalized_chat_id:
+        return None
+
+    if normalized_deal_id is None:
+        return None
 
     try:
 
@@ -5614,8 +6430,8 @@ def get_deal(
             LIMIT 1
             """,
             (
-                int(deal_id),
-                str(chat_id),
+                normalized_deal_id,
+                normalized_chat_id,
             ),
             fetchone=True,
         )
@@ -5624,15 +6440,16 @@ def get_deal(
 
         logger.error(
             "Failed to get deal %s: %s",
-            deal_id,
-            exc
+            normalized_deal_id,
+            exc,
+            exc_info=True,
         )
 
         return None
 
 
 # ============================================================
-# 5.12 — UPDATE DEAL
+# 5.14 — UPDATE DEAL
 # ============================================================
 
 def update_deal(
@@ -5640,9 +6457,24 @@ def update_deal(
     deal_id: int,
     **fields,
 ) -> bool:
+
     """
     Update allowed deal fields.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_deal_id = _crm_record_id(
+        deal_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_deal_id is None:
+        return False
 
     allowed_fields = {
         "project_id",
@@ -5656,7 +6488,6 @@ def update_deal(
     }
 
     updates = []
-
     values = []
 
     for field_name, field_value in fields.items():
@@ -5668,35 +6499,52 @@ def update_deal(
 
             if field_value is not None:
 
-                try:
-                    field_value = int(
+                normalized_project_id = (
+                    _crm_record_id(
                         field_value
                     )
-                except Exception:
+                )
+
+                if normalized_project_id is None:
                     continue
 
                 if not get_project(
-                    chat_id,
-                    field_value,
+                    normalized_chat_id,
+                    normalized_project_id,
                 ):
                     continue
+
+                field_value = normalized_project_id
 
         elif field_name == "investor_id":
 
             if field_value is not None:
 
-                try:
-                    field_value = int(
+                normalized_investor_id = (
+                    _crm_record_id(
                         field_value
                     )
-                except Exception:
+                )
+
+                if normalized_investor_id is None:
                     continue
 
                 if not get_investor(
-                    chat_id,
-                    field_value,
+                    normalized_chat_id,
+                    normalized_investor_id,
                 ):
                     continue
+
+                field_value = normalized_investor_id
+
+        elif field_name == "stage":
+
+            field_value = str(
+                field_value or "new"
+            ).strip().lower()
+
+            if not field_value:
+                field_value = "new"
 
         elif field_name in {
             "proposed_amount",
@@ -5704,14 +6552,42 @@ def update_deal(
             "valuation",
         }:
 
-            if field_value is not None:
+            field_value = _crm_optional_number(
+                field_value
+            )
 
-                try:
-                    field_value = float(
-                        field_value
-                    )
-                except Exception:
-                    continue
+            if field_name == "proposed_amount":
+
+                if (
+                    field_value is not None
+                    and field_value < 0
+                ):
+                    return False
+
+            if field_name == "proposed_share":
+
+                if (
+                    field_value is not None
+                    and not 0 <= field_value <= 100
+                ):
+                    return False
+
+            if field_name == "valuation":
+
+                if (
+                    field_value is not None
+                    and field_value < 0
+                ):
+                    return False
+
+        elif field_name in {
+            "notes",
+            "next_step",
+        }:
+
+            field_value = _crm_optional_text(
+                field_value
+            )
 
         updates.append(
             f"{field_name} = %s"
@@ -5729,8 +6605,8 @@ def update_deal(
     )
 
     values.extend([
-        int(deal_id),
-        str(chat_id),
+        normalized_deal_id,
+        normalized_chat_id,
     ])
 
     query = f"""
@@ -5750,30 +6626,48 @@ def update_deal(
             commit=True,
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to update deal %s: %s",
-            deal_id,
-            exc
+            normalized_deal_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
 
 # ============================================================
-# 5.13 — DELETE DEAL
+# 5.15 — DELETE DEAL
 # ============================================================
 
 def delete_deal(
     chat_id: Any,
     deal_id: int,
 ) -> bool:
+
     """
     Delete one deal belonging to the current chat.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_deal_id = _crm_record_id(
+        deal_id
+    )
+
+    if not normalized_chat_id:
+        return False
+
+    if normalized_deal_id is None:
+        return False
 
     try:
 
@@ -5785,33 +6679,37 @@ def delete_deal(
             RETURNING id
             """,
             (
-                int(deal_id),
-                str(chat_id),
+                normalized_deal_id,
+                normalized_chat_id,
             ),
             fetchone=True,
             commit=True,
         )
 
-        return bool(result)
+        return bool(
+            result
+        )
 
     except Exception as exc:
 
         logger.error(
             "Failed to delete deal %s: %s",
-            deal_id,
-            exc
+            normalized_deal_id,
+            exc,
+            exc_info=True,
         )
 
         return False
 
 
 # ============================================================
-# 5.14 — FORMAT DEAL
+# 5.16 — FORMAT DEAL
 # ============================================================
 
 def format_deal(
     deal: Optional[Dict[str, Any]]
 ) -> str:
+
     """
     Format a deal for Telegram.
     """
@@ -5866,6 +6764,7 @@ def format_deal(
     ]
 
     if investor_company:
+
         lines.append(
             f"🏢 კომპანია: {investor_company}"
         )
@@ -5875,30 +6774,71 @@ def format_deal(
     )
 
     if proposed_amount is not None:
+
+        try:
+
+            amount_text = format_money(
+                proposed_amount
+            )
+
+        except Exception:
+
+            amount_text = str(
+                proposed_amount
+            )
+
         lines.append(
             f"💰 შეთავაზებული თანხა: "
-            f"{format_money(proposed_amount)}"
+            f"{amount_text}"
         )
 
     if proposed_share is not None:
+
+        try:
+
+            share_text = format_number(
+                proposed_share
+            )
+
+        except Exception:
+
+            share_text = str(
+                proposed_share
+            )
+
         lines.append(
             f"📈 შეთავაზებული წილი: "
-            f"{format_number(proposed_share)}%"
+            f"{share_text}%"
         )
 
     if valuation is not None:
+
+        try:
+
+            valuation_text = format_money(
+                valuation
+            )
+
+        except Exception:
+
+            valuation_text = str(
+                valuation
+            )
+
         lines.append(
             f"🏷️ შეფასება: "
-            f"{format_money(valuation)}"
+            f"{valuation_text}"
         )
 
     if next_step:
+
         lines.extend([
             "",
             f"➡️ შემდეგი ნაბიჯი: {next_step}",
         ])
 
     if notes:
+
         lines.extend([
             "",
             "📎 შენიშვნები:",
@@ -5911,12 +6851,13 @@ def format_deal(
 
 
 # ============================================================
-# 5.15 — DEALS SUMMARY
+# 5.17 — DEALS SUMMARY
 # ============================================================
 
 def deals_summary(
     chat_id: Any
 ) -> str:
+
     """
     Compact deal pipeline.
     """
@@ -5939,6 +6880,12 @@ def deals_summary(
 
     for deal in deals:
 
+        if not isinstance(
+            deal,
+            dict,
+        ):
+            continue
+
         deal_id = deal.get(
             "id"
         )
@@ -5959,11 +6906,23 @@ def deals_summary(
             "proposed_amount"
         )
 
-        amount_text = (
-            format_money(amount)
-            if amount is not None
-            else "—"
-        )
+        if amount is not None:
+
+            try:
+
+                amount_text = format_money(
+                    amount
+                )
+
+            except Exception:
+
+                amount_text = str(
+                    amount
+                )
+
+        else:
+
+            amount_text = "—"
 
         lines.append(
             f"#{deal_id} — "
@@ -5987,16 +6946,31 @@ def deals_summary(
 
 
 # ============================================================
-# 5.16 — GET PROJECT DEALS
+# 5.18 — GET PROJECT DEALS
 # ============================================================
 
 def get_project_deals(
     chat_id: Any,
     project_id: int,
 ) -> List[Dict[str, Any]]:
+
     """
     Return all deals connected to one project.
     """
+
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    normalized_project_id = _crm_record_id(
+        project_id
+    )
+
+    if not normalized_chat_id:
+        return []
+
+    if normalized_project_id is None:
+        return []
 
     try:
 
@@ -6013,12 +6987,12 @@ def get_project_deals(
             WHERE d.chat_id = %s
               AND d.project_id = %s
             ORDER BY
-                d.updated_at DESC,
+                d.updated_at DESC NULLS LAST,
                 d.id DESC
             """,
             (
-                str(chat_id),
-                int(project_id),
+                normalized_chat_id,
+                normalized_project_id,
             ),
             fetchall=True,
         )
@@ -6029,30 +7003,43 @@ def get_project_deals(
 
         logger.error(
             "Failed to get project deals: %s",
-            exc
+            exc,
+            exc_info=True,
         )
 
         return []
 
 
 # ============================================================
-# 5.17 — BUILD CRM CONTEXT
+# 5.19 — BUILD CRM CONTEXT
 # ============================================================
 
 def build_crm_context(
     chat_id: Any
 ) -> str:
+
     """
     Build compact investor and deal context for Gemini.
     """
 
+    normalized_chat_id = _crm_chat_id(
+        chat_id
+    )
+
+    if not normalized_chat_id:
+
+        return (
+            "INVESTOR CRM:\nNONE\n\n"
+            "DEAL PIPELINE:\nNONE"
+        )
+
     investors = get_investors(
-        chat_id,
+        normalized_chat_id,
         limit=50,
     )
 
     deals = get_deals(
-        chat_id,
+        normalized_chat_id,
         limit=50,
     )
 
@@ -6069,6 +7056,12 @@ def build_crm_context(
     else:
 
         for investor in investors:
+
+            if not isinstance(
+                investor,
+                dict,
+            ):
+                continue
 
             investor_id = investor.get(
                 "id"
@@ -6118,6 +7111,12 @@ def build_crm_context(
 
         for deal in deals:
 
+            if not isinstance(
+                deal,
+                dict,
+            ):
+                continue
+
             deal_id = deal.get(
                 "id"
             )
@@ -6157,69 +7156,255 @@ def build_crm_context(
 
 
 # ============================================================
-# 5.18 — ENHANCED FULL AI CONTEXT
+# 5.20 — ENHANCED FULL AI CONTEXT
 # ============================================================
 
 def build_full_ai_context(
     chat_id: Any
 ) -> str:
-    """
-    Combine memory, conversation, projects, investors and deals.
 
-    This replaces the lighter context builder from PART 3.
+    """
+    Combine memory, conversation, projects,
+    investors and deals.
+
+    This is the final full-context builder.
     """
 
     sections = [
+
         build_memory_context(
             chat_id,
             limit=30,
         ),
+
         "",
+
         format_conversation_history(
             chat_id,
             limit=20,
         ),
+
         "",
+
         build_projects_context(
             chat_id,
             limit=20,
         ),
+
         "",
+
         build_crm_context(
             chat_id
         ),
+
     ]
 
+    combined_context = "\n".join(
+        sections
+    ).strip()
+
     return clean_context_text(
-        "\n".join(
-            sections
-        ).strip(),
+        combined_context,
         max_length=40000,
     )
 
 
 # ============================================================
-# 5.19 — PART 5 COMPLETION MARKER
+# 5.21 — PART 5 COMPLETION MARKER
 # ============================================================
 
 print(
     "GENIOSA 4.0 — PART 5/12 LOADED"
-)# ============================================================
+)
+# ============================================================
 # GENIOSA 4.0 — PART 6/12
 # Document processing, extraction and document CRM
 # ============================================================
 
+from pathlib import Path
+import csv
+import io
 
-def detect_file_type(filename: str) -> str:
+
+# ------------------------------------------------------------
+# DOCUMENT LIMITS / SAFETY DEFAULTS
+# ------------------------------------------------------------
+
+SUPPORTED_DOCUMENT_TYPES = set(
+    globals().get(
+        "SUPPORTED_DOCUMENT_TYPES",
+        {
+            "pdf",
+            "docx",
+            "xlsx",
+            "xlsm",
+            "pptx",
+            "txt",
+            "csv",
+        },
+    )
+)
+
+MAX_EXCEL_ROWS_PER_SHEET = int(
+    globals().get(
+        "MAX_EXCEL_ROWS_PER_SHEET",
+        5000,
+    )
+)
+
+MAX_DOCUMENT_AI_TEXT = int(
+    globals().get(
+        "MAX_DOCUMENT_AI_TEXT",
+        120000,
+    )
+)
+
+MAX_DOCUMENT_RECORDS = int(
+    globals().get(
+        "MAX_DOCUMENT_RECORDS",
+        100,
+    )
+)
+
+MAX_DOCUMENT_FILE_SIZE_BYTES = int(
+    globals().get(
+        "MAX_DOCUMENT_SIZE_BYTES",
+        25 * 1024 * 1024,
+    )
+)
+
+
+# ------------------------------------------------------------
+# OPTIONAL LIBRARY IMPORTS
+# ------------------------------------------------------------
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
+
+
+try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+
+
+# ------------------------------------------------------------
+# INTERNAL DOCUMENT HELPERS
+# ------------------------------------------------------------
+
+def _safe_document_limit(
+    value: Any,
+    default: int,
+    maximum: int,
+) -> int:
+    """
+    Safely normalizes a document-related integer limit.
+    """
+    try:
+        result = int(value)
+    except Exception:
+        result = default
+
+    return max(
+        1,
+        min(result, maximum),
+    )
+
+
+def _truncate_document_text(
+    value: Any,
+    maximum: Optional[int] = None,
+) -> str:
+    """
+    Safely converts and truncates extracted text.
+    """
+    text_value = str(value or "").strip()
+
+    limit = _safe_document_limit(
+        maximum
+        if maximum is not None
+        else MAX_DOCUMENT_AI_TEXT,
+        MAX_DOCUMENT_AI_TEXT,
+        max(
+            MAX_DOCUMENT_AI_TEXT,
+            1,
+        ),
+    )
+
+    if len(text_value) > limit:
+        return text_value[:limit]
+
+    return text_value
+
+
+def _normalize_document_filename(
+    filename: Any,
+) -> str:
+    """
+    Prevents directory traversal through filenames.
+    """
+    raw_name = str(
+        filename or "document"
+    ).strip()
+
+    if not raw_name:
+        raw_name = "document"
+
+    safe_name = Path(raw_name).name
+
+    if not safe_name:
+        safe_name = "document"
+
+    return safe_name[:255]
+
+
+def _document_dependencies_error(
+    dependency_name: str,
+) -> RuntimeError:
+    """
+    Creates a consistent dependency error.
+    """
+    return RuntimeError(
+        f"Required document library is not installed: "
+        f"{dependency_name}"
+    )
+
+
+# ------------------------------------------------------------
+# FILE TYPE DETECTION
+# ------------------------------------------------------------
+
+def detect_file_type(
+    filename: str,
+) -> str:
     """
     Determines supported document type from file extension.
     """
-    name = str(filename or "").strip().lower()
+    name = str(
+        filename or ""
+    ).strip().lower()
 
     if "." not in name:
         return "unknown"
 
-    extension = name.rsplit(".", 1)[-1].strip()
+    extension = name.rsplit(
+        ".",
+        1,
+    )[-1].strip()
 
     if extension in SUPPORTED_DOCUMENT_TYPES:
         return extension
@@ -6227,81 +7412,196 @@ def detect_file_type(filename: str) -> str:
     return "unknown"
 
 
-def extract_pdf_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# PDF
+# ------------------------------------------------------------
+
+def extract_pdf_text(
+    filepath: str,
+) -> str:
     """
     Extracts text from a PDF file.
     """
     path = Path(filepath)
 
     if not path.exists():
-        raise FileNotFoundError(f"PDF file not found: {filepath}")
+        raise FileNotFoundError(
+            f"PDF file not found: {filepath}"
+        )
+
+    if PdfReader is None:
+        raise _document_dependencies_error(
+            "pypdf"
+        )
 
     reader = PdfReader(str(path))
     pages = []
+    total_length = 0
 
-    for index, page in enumerate(reader.pages, start=1):
+    for index, page in enumerate(
+        reader.pages,
+        start=1,
+    ):
         try:
-            text = page.extract_text() or ""
+            page_text = (
+                page.extract_text()
+                or ""
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to extract PDF page %s: %s",
                 index,
                 exc,
             )
-            text = ""
+            page_text = ""
 
-        text = str(text).strip()
+        page_text = str(
+            page_text
+        ).strip()
 
-        if text:
+        if not page_text:
+            continue
+
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - total_length
+        )
+
+        if remaining <= 0:
             pages.append(
-                f"--- PAGE {index} ---\n{text}"
+                "[DOCUMENT TEXT LIMIT REACHED]"
+            )
+            break
+
+        page_block = (
+            f"--- PAGE {index} ---\n"
+            f"{page_text}"
+        )
+
+        if len(page_block) > remaining:
+            page_block = (
+                page_block[:remaining]
+                + "\n[TEXT LIMIT REACHED]"
             )
 
-    return "\n\n".join(pages).strip()
+        pages.append(page_block)
+        total_length += len(page_block)
+
+        if total_length >= MAX_DOCUMENT_AI_TEXT:
+            break
+
+    return "\n\n".join(
+        pages
+    ).strip()
 
 
-def extract_docx_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# DOCX
+# ------------------------------------------------------------
+
+def extract_docx_text(
+    filepath: str,
+) -> str:
     """
     Extracts paragraphs and tables from DOCX.
     """
     path = Path(filepath)
 
     if not path.exists():
-        raise FileNotFoundError(f"DOCX file not found: {filepath}")
+        raise FileNotFoundError(
+            f"DOCX file not found: {filepath}"
+        )
+
+    if Document is None:
+        raise _document_dependencies_error(
+            "python-docx"
+        )
 
     document = Document(str(path))
     sections = []
+    current_length = 0
 
     for paragraph in document.paragraphs:
-        text = str(paragraph.text or "").strip()
-        if text:
-            sections.append(text)
+        text = str(
+            paragraph.text or ""
+        ).strip()
 
-    for table_index, table in enumerate(
-        document.tables,
-        start=1,
-    ):
-        rows = []
+        if not text:
+            continue
 
-        for row in table.rows:
-            cells = []
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - current_length
+        )
 
-            for cell in row.cells:
-                value = str(cell.text or "").strip()
-                cells.append(value)
+        if remaining <= 0:
+            break
 
-            rows.append(" | ".join(cells))
+        text = text[:remaining]
+        sections.append(text)
+        current_length += len(text)
 
-        if rows:
-            sections.append(
+    if current_length < MAX_DOCUMENT_AI_TEXT:
+        for table_index, table in enumerate(
+            document.tables,
+            start=1,
+        ):
+            rows = []
+
+            for row in table.rows:
+                cells = []
+
+                for cell in row.cells:
+                    value = str(
+                        cell.text or ""
+                    ).strip()
+
+                    cells.append(value)
+
+                rows.append(
+                    " | ".join(cells)
+                )
+
+            if not rows:
+                continue
+
+            table_block = (
                 f"--- TABLE {table_index} ---\n"
                 + "\n".join(rows)
             )
 
-    return "\n\n".join(sections).strip()
+            remaining = (
+                MAX_DOCUMENT_AI_TEXT
+                - current_length
+            )
+
+            if remaining <= 0:
+                break
+
+            table_block = table_block[
+                :remaining
+            ]
+
+            sections.append(
+                table_block
+            )
+
+            current_length += len(
+                table_block
+            )
+
+    return "\n\n".join(
+        sections
+    ).strip()
 
 
-def extract_excel_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# EXCEL
+# ------------------------------------------------------------
+
+def extract_excel_text(
+    filepath: str,
+) -> str:
     """
     Extracts readable worksheet data from XLSX/XLSM.
     """
@@ -6312,6 +7612,11 @@ def extract_excel_text(filepath: str) -> str:
             f"Excel file not found: {filepath}"
         )
 
+    if load_workbook is None:
+        raise _document_dependencies_error(
+            "openpyxl"
+        )
+
     workbook = load_workbook(
         filename=str(path),
         read_only=True,
@@ -6319,6 +7624,7 @@ def extract_excel_text(filepath: str) -> str:
     )
 
     sections = []
+    total_length = 0
 
     try:
         for worksheet in workbook.worksheets:
@@ -6326,11 +7632,14 @@ def extract_excel_text(filepath: str) -> str:
             row_count = 0
 
             for row in worksheet.iter_rows(
-                values_only=True
+                values_only=True,
             ):
                 row_count += 1
 
-                if row_count > MAX_EXCEL_ROWS_PER_SHEET:
+                if (
+                    row_count
+                    > MAX_EXCEL_ROWS_PER_SHEET
+                ):
                     rows.append(
                         "[ROW LIMIT REACHED]"
                     )
@@ -6351,19 +7660,72 @@ def extract_excel_text(filepath: str) -> str:
                         " | ".join(values)
                     )
 
-            if rows:
-                sections.append(
-                    f"--- SHEET: {worksheet.title} ---\n"
-                    + "\n".join(rows)
+                current_preview = "\n".join(
+                    rows
                 )
+
+                if (
+                    total_length
+                    + len(current_preview)
+                    >= MAX_DOCUMENT_AI_TEXT
+                ):
+                    rows.append(
+                        "[DOCUMENT TEXT LIMIT REACHED]"
+                    )
+                    break
+
+            if not rows:
+                continue
+
+            sheet_block = (
+                f"--- SHEET: {worksheet.title} ---\n"
+                + "\n".join(rows)
+            )
+
+            remaining = (
+                MAX_DOCUMENT_AI_TEXT
+                - total_length
+            )
+
+            if remaining <= 0:
+                sections.append(
+                    "[DOCUMENT TEXT LIMIT REACHED]"
+                )
+                break
+
+            sheet_block = sheet_block[
+                :remaining
+            ]
+
+            sections.append(
+                sheet_block
+            )
+
+            total_length += len(
+                sheet_block
+            )
+
+            if (
+                total_length
+                >= MAX_DOCUMENT_AI_TEXT
+            ):
+                break
 
     finally:
         workbook.close()
 
-    return "\n\n".join(sections).strip()
+    return "\n\n".join(
+        sections
+    ).strip()
 
 
-def extract_pptx_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# POWERPOINT
+# ------------------------------------------------------------
+
+def extract_pptx_text(
+    filepath: str,
+) -> str:
     """
     Extracts text from PowerPoint slides.
     """
@@ -6374,8 +7736,17 @@ def extract_pptx_text(filepath: str) -> str:
             f"PPTX file not found: {filepath}"
         )
 
-    presentation = Presentation(str(path))
+    if Presentation is None:
+        raise _document_dependencies_error(
+            "python-pptx"
+        )
+
+    presentation = Presentation(
+        str(path)
+    )
+
     sections = []
+    total_length = 0
 
     for slide_number, slide in enumerate(
         presentation.slides,
@@ -6385,7 +7756,10 @@ def extract_pptx_text(filepath: str) -> str:
 
         for shape in slide.shapes:
             try:
-                if not hasattr(shape, "text"):
+                if not hasattr(
+                    shape,
+                    "text",
+                ):
                     continue
 
                 value = str(
@@ -6397,21 +7771,61 @@ def extract_pptx_text(filepath: str) -> str:
 
             except Exception as exc:
                 logger.warning(
-                    "Failed to read PPTX shape on slide %s: %s",
+                    "Failed to read PPTX shape "
+                    "on slide %s: %s",
                     slide_number,
                     exc,
                 )
 
-        if texts:
+        if not texts:
+            continue
+
+        slide_block = (
+            f"--- SLIDE {slide_number} ---\n"
+            + "\n".join(texts)
+        )
+
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - total_length
+        )
+
+        if remaining <= 0:
             sections.append(
-                f"--- SLIDE {slide_number} ---\n"
-                + "\n".join(texts)
+                "[DOCUMENT TEXT LIMIT REACHED]"
             )
+            break
 
-    return "\n\n".join(sections).strip()
+        slide_block = slide_block[
+            :remaining
+        ]
+
+        sections.append(
+            slide_block
+        )
+
+        total_length += len(
+            slide_block
+        )
+
+        if (
+            total_length
+            >= MAX_DOCUMENT_AI_TEXT
+        ):
+            break
+
+    return "\n\n".join(
+        sections
+    ).strip()
 
 
-def extract_txt_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# TXT
+# ------------------------------------------------------------
+
+def extract_txt_text(
+    filepath: str,
+) -> str:
     """
     Reads common text encodings.
     """
@@ -6433,9 +7847,15 @@ def extract_txt_text(filepath: str) -> str:
 
     for encoding in encodings:
         try:
-            return path.read_text(
-                encoding=encoding
-            ).strip()
+            text_value = path.read_text(
+                encoding=encoding,
+                errors="strict",
+            )
+
+            return _truncate_document_text(
+                text_value
+            )
+
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
@@ -6446,7 +7866,13 @@ def extract_txt_text(filepath: str) -> str:
     return ""
 
 
-def extract_csv_text(filepath: str) -> str:
+# ------------------------------------------------------------
+# CSV
+# ------------------------------------------------------------
+
+def extract_csv_text(
+    filepath: str,
+) -> str:
     """
     Reads CSV content with common encodings.
     """
@@ -6468,9 +7894,57 @@ def extract_csv_text(filepath: str) -> str:
 
     for encoding in encodings:
         try:
-            return path.read_text(
-                encoding=encoding
-            ).strip()
+            raw_text = path.read_text(
+                encoding=encoding,
+                errors="strict",
+            )
+
+            output = io.StringIO()
+            writer = csv.writer(
+                output,
+                lineterminator="\n",
+            )
+
+            reader = csv.reader(
+                io.StringIO(raw_text)
+            )
+
+            row_count = 0
+
+            for row in reader:
+                row_count += 1
+
+                if (
+                    row_count
+                    > MAX_EXCEL_ROWS_PER_SHEET
+                ):
+                    writer.writerow(
+                        ["[ROW LIMIT REACHED]"]
+                    )
+                    break
+
+                writer.writerow(
+                    [
+                        str(value).strip()
+                        for value in row
+                    ]
+                )
+
+                if (
+                    output.tell()
+                    >= MAX_DOCUMENT_AI_TEXT
+                ):
+                    writer.writerow(
+                        [
+                            "[DOCUMENT TEXT LIMIT REACHED]"
+                        ]
+                    )
+                    break
+
+            return _truncate_document_text(
+                output.getvalue()
+            )
+
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
@@ -6480,6 +7954,10 @@ def extract_csv_text(filepath: str) -> str:
 
     return ""
 
+
+# ------------------------------------------------------------
+# UNIFIED EXTRACTION
+# ------------------------------------------------------------
 
 def extract_file_text(
     filepath: str,
@@ -6495,6 +7973,20 @@ def extract_file_text(
             f"File not found: {filepath}"
         )
 
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        file_size = 0
+
+    if (
+        file_size
+        > MAX_DOCUMENT_FILE_SIZE_BYTES
+    ):
+        raise ValueError(
+            "Document exceeds the maximum "
+            "allowed file size."
+        )
+
     detected_type = (
         file_type
         or detect_file_type(path.name)
@@ -6504,28 +7996,62 @@ def extract_file_text(
         detected_type or ""
     ).lower().strip()
 
+    if (
+        detected_type
+        not in SUPPORTED_DOCUMENT_TYPES
+    ):
+        raise ValueError(
+            f"Unsupported document type: "
+            f"{detected_type}"
+        )
+
     if detected_type == "pdf":
-        return extract_pdf_text(str(path))
+        text_value = extract_pdf_text(
+            str(path)
+        )
 
-    if detected_type == "docx":
-        return extract_docx_text(str(path))
+    elif detected_type == "docx":
+        text_value = extract_docx_text(
+            str(path)
+        )
 
-    if detected_type in {"xlsx", "xlsm"}:
-        return extract_excel_text(str(path))
+    elif detected_type in {
+        "xlsx",
+        "xlsm",
+    }:
+        text_value = extract_excel_text(
+            str(path)
+        )
 
-    if detected_type == "pptx":
-        return extract_pptx_text(str(path))
+    elif detected_type == "pptx":
+        text_value = extract_pptx_text(
+            str(path)
+        )
 
-    if detected_type == "txt":
-        return extract_txt_text(str(path))
+    elif detected_type == "txt":
+        text_value = extract_txt_text(
+            str(path)
+        )
 
-    if detected_type == "csv":
-        return extract_csv_text(str(path))
+    elif detected_type == "csv":
+        text_value = extract_csv_text(
+            str(path)
+        )
 
-    raise ValueError(
-        f"Unsupported document type: {detected_type}"
+    else:
+        raise ValueError(
+            f"Unsupported document type: "
+            f"{detected_type}"
+        )
+
+    return _truncate_document_text(
+        text_value
     )
 
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — CREATE
+# ------------------------------------------------------------
 
 def save_document_record(
     chat_id: Any,
@@ -6537,33 +8063,52 @@ def save_document_record(
     """
     Saves uploaded document metadata and extracted text.
     """
-    safe_filename = Path(
-        str(filename or "document")
-    ).name
+    safe_filename = _normalize_document_filename(
+        filename
+    )
 
     detected_type = (
-        file_type
-        or detect_file_type(safe_filename)
+        str(
+            file_type
+            or detect_file_type(
+                safe_filename
+            )
+        )
+        .lower()
+        .strip()
     )
 
-    text_value = (
-        str(extracted_text)
-        if extracted_text is not None
-        else ""
-    )
+    if (
+        detected_type
+        not in SUPPORTED_DOCUMENT_TYPES
+    ):
+        detected_type = detect_file_type(
+            safe_filename
+        )
 
-    if len(text_value) > MAX_DOCUMENT_AI_TEXT:
-        text_value = text_value[
-            :MAX_DOCUMENT_AI_TEXT
-        ]
+    text_value = _truncate_document_text(
+        extracted_text or ""
+    )
 
     project_id_value = None
 
     if project_id is not None:
         try:
-            project_id_value = int(project_id)
+            project_id_value = int(
+                project_id
+            )
+
+            if project_id_value <= 0:
+                return None
+
         except Exception:
-            project_id_value = None
+            return None
+
+        if not get_project(
+            chat_id,
+            project_id_value,
+        ):
+            return None
 
     try:
         result = db_execute(
@@ -6592,7 +8137,9 @@ def save_document_record(
         )
 
         if result:
-            return int(result["id"])
+            return int(
+                result["id"]
+            )
 
     except Exception as exc:
         logger.error(
@@ -6603,6 +8150,10 @@ def save_document_record(
     return None
 
 
+# ------------------------------------------------------------
+# DOCUMENT CRM — UPDATE ANALYSIS
+# ------------------------------------------------------------
+
 def update_document_analysis(
     chat_id: Any,
     document_id: int,
@@ -6612,6 +8163,22 @@ def update_document_analysis(
     Saves AI analysis for a document.
     """
     try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
+        analysis_value = str(
+            analysis or ""
+        ).strip()
+
+        if len(analysis_value) > MAX_DOCUMENT_AI_TEXT:
+            analysis_value = analysis_value[
+                :MAX_DOCUMENT_AI_TEXT
+            ]
+
         result = db_execute(
             """
             UPDATE documents
@@ -6623,8 +8190,8 @@ def update_document_analysis(
             RETURNING id
             """,
             (
-                str(analysis or ""),
-                int(document_id),
+                analysis_value,
+                safe_document_id,
                 str(chat_id),
             ),
             fetchone=True,
@@ -6642,19 +8209,40 @@ def update_document_analysis(
         return False
 
 
+# ------------------------------------------------------------
+# DOCUMENT CRM — PROJECT LINK
+# ------------------------------------------------------------
+
 def update_document_project(
     chat_id: Any,
     document_id: int,
     project_id: Optional[int],
 ) -> bool:
     """
-    Links a document to a project.
+    Links or unlinks a document to a project.
     """
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
+    except Exception:
+        return False
+
     project_id_value = None
 
     if project_id is not None:
         try:
-            project_id_value = int(project_id)
+            project_id_value = int(
+                project_id
+            )
+
+            if project_id_value <= 0:
+                return False
+
         except Exception:
             return False
 
@@ -6677,7 +8265,7 @@ def update_document_project(
             """,
             (
                 project_id_value,
-                int(document_id),
+                safe_document_id,
                 str(chat_id),
             ),
             fetchone=True,
@@ -6695,6 +8283,10 @@ def update_document_project(
         return False
 
 
+# ------------------------------------------------------------
+# DOCUMENT CRM — LIST
+# ------------------------------------------------------------
+
 def get_documents(
     chat_id: Any,
     limit: int = 50,
@@ -6703,12 +8295,10 @@ def get_documents(
     Returns documents belonging to a chat.
     """
     try:
-        safe_limit = max(
-            1,
-            min(
-                int(limit),
-                MAX_DOCUMENT_RECORDS,
-            ),
+        safe_limit = _safe_document_limit(
+            limit,
+            50,
+            MAX_DOCUMENT_RECORDS,
         )
 
         rows = db_execute(
@@ -6726,7 +8316,9 @@ def get_documents(
                 d.id DESC
             LIMIT {safe_limit}
             """,
-            (str(chat_id),),
+            (
+                str(chat_id),
+            ),
             fetchall=True,
         )
 
@@ -6740,6 +8332,10 @@ def get_documents(
         return []
 
 
+# ------------------------------------------------------------
+# DOCUMENT CRM — GET ONE
+# ------------------------------------------------------------
+
 def get_document(
     chat_id: Any,
     document_id: int,
@@ -6748,6 +8344,13 @@ def get_document(
     Returns one document owned by the chat.
     """
     try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return None
+
         return db_execute(
             """
             SELECT
@@ -6762,7 +8365,7 @@ def get_document(
             LIMIT 1
             """,
             (
-                int(document_id),
+                safe_document_id,
                 str(chat_id),
             ),
             fetchone=True,
@@ -6777,6 +8380,10 @@ def get_document(
         return None
 
 
+# ------------------------------------------------------------
+# DOCUMENT CRM — DELETE
+# ------------------------------------------------------------
+
 def delete_document(
     chat_id: Any,
     document_id: int,
@@ -6785,6 +8392,13 @@ def delete_document(
     Deletes one document record.
     """
     try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
         result = db_execute(
             """
             DELETE FROM documents
@@ -6793,7 +8407,7 @@ def delete_document(
             RETURNING id
             """,
             (
-                int(document_id),
+                safe_document_id,
                 str(chat_id),
             ),
             fetchone=True,
@@ -6810,6 +8424,10 @@ def delete_document(
         )
         return False
 
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — SUMMARY
+# ------------------------------------------------------------
 
 def documents_summary(
     chat_id: Any,
@@ -6834,15 +8452,20 @@ def documents_summary(
     ]
 
     for document in documents:
-        document_id = document.get("id")
+        document_id = document.get(
+            "id"
+        )
+
         filename = (
             document.get("filename")
             or "უცნობი ფაილი"
         )
+
         file_type = (
             document.get("file_type")
             or "unknown"
         )
+
         project_name = (
             document.get("project_name")
             or "პროექტთან მიბმული არაა"
@@ -6852,6 +8475,7 @@ def documents_summary(
             document.get("extracted_text")
             or ""
         )
+
         analysis = (
             document.get("analysis")
             or ""
@@ -6859,35 +8483,50 @@ def documents_summary(
 
         text_status = (
             "ამოღებულია"
-            if extracted_text.strip()
+            if str(
+                extracted_text
+            ).strip()
             else "ტექსტი არ არის"
         )
 
         analysis_status = (
             "გაანალიზებულია"
-            if analysis.strip()
+            if str(
+                analysis
+            ).strip()
             else "არ არის გაანალიზებული"
         )
 
         lines.append(
             f"#{document_id} — {filename}"
         )
+
         lines.append(
             f"📁 ტიპი: {file_type}"
         )
+
         lines.append(
             f"🏗️ პროექტი: {project_name}"
         )
+
         lines.append(
             f"📝 ტექსტი: {text_status}"
         )
+
         lines.append(
             f"🤖 AI: {analysis_status}"
         )
+
         lines.append("")
 
-    return "\n".join(lines).strip()
+    return "\n".join(
+        lines
+    ).strip()
 
+
+# ------------------------------------------------------------
+# DOCUMENT → AI CONTEXT
+# ------------------------------------------------------------
 
 def prepare_document_for_ai(
     document: Dict[str, Any],
@@ -6914,19 +8553,10 @@ def prepare_document_for_ai(
         or "not linked"
     )
 
-    extracted_text = (
+    extracted_text = _truncate_document_text(
         document.get("extracted_text")
         or ""
     )
-
-    extracted_text = str(
-        extracted_text
-    ).strip()
-
-    if len(extracted_text) > MAX_DOCUMENT_AI_TEXT:
-        extracted_text = extracted_text[
-            :MAX_DOCUMENT_AI_TEXT
-        ]
 
     if not extracted_text:
         extracted_text = (
@@ -6944,6 +8574,10 @@ def prepare_document_for_ai(
     )
 
 
+# ------------------------------------------------------------
+# DOCUMENT AI PROMPT
+# ------------------------------------------------------------
+
 def build_document_analysis_prompt(
     document: Dict[str, Any],
     chat_id: Any,
@@ -6951,12 +8585,21 @@ def build_document_analysis_prompt(
     """
     Builds a structured AI prompt for document analysis.
     """
-    document_context = prepare_document_for_ai(
-        document
+    document_context = (
+        prepare_document_for_ai(
+            document
+        )
     )
 
-    business_context = build_full_ai_context(
-        chat_id
+    business_context = (
+        build_full_ai_context(
+            chat_id
+        )
+    )
+
+    business_context = _truncate_document_text(
+        business_context,
+        maximum=40000,
     )
 
     return f"""
@@ -7008,6 +8651,10 @@ EXISTING GENIOSA BUSINESS CONTEXT
 """.strip()
 
 
+# ------------------------------------------------------------
+# DOCUMENT TEXT PREVIEW
+# ------------------------------------------------------------
+
 def document_text_preview(
     document: Optional[Dict[str, Any]],
     max_length: int = 1500,
@@ -7016,10 +8663,14 @@ def document_text_preview(
     Creates a short preview of extracted document text.
     """
     if not document:
-        return "❌ დოკუმენტი ვერ მოიძებნა."
+        return (
+            "❌ დოკუმენტი ვერ მოიძებნა."
+        )
 
     text_value = str(
-        document.get("extracted_text")
+        document.get(
+            "extracted_text"
+        )
         or ""
     ).strip()
 
@@ -7035,19 +8686,35 @@ def document_text_preview(
         text_value,
     ).strip()
 
+    try:
+        safe_length = int(
+            max_length
+        )
+    except Exception:
+        safe_length = 1500
+
     safe_length = max(
         100,
-        min(int(max_length), 10000),
+        min(
+            safe_length,
+            10000,
+        ),
     )
 
     if len(clean_value) > safe_length:
         return (
-            clean_value[:safe_length].rstrip()
+            clean_value[
+                :safe_length
+            ].rstrip()
             + "..."
         )
 
     return clean_value
 
+
+# ------------------------------------------------------------
+# DOCUMENT ANALYSIS SUMMARY
+# ------------------------------------------------------------
 
 def document_analysis_summary(
     document: Optional[Dict[str, Any]],
@@ -7056,9 +8723,14 @@ def document_analysis_summary(
     Returns a concise document analysis result.
     """
     if not document:
-        return "❌ დოკუმენტი ვერ მოიძებნა."
+        return (
+            "❌ დოკუმენტი ვერ მოიძებნა."
+        )
 
-    document_id = document.get("id")
+    document_id = document.get(
+        "id"
+    )
+
     filename = (
         document.get("filename")
         or "უცნობი ფაილი"
@@ -7083,7 +8755,1552 @@ def document_analysis_summary(
     )
 
 
-print("GENIOSA 4.0 — PART 6/12 LOADED")# ============================================================
+print(
+    "GENIOSA 4.0 — PART 6/12 LOADED"
+)
+# ============================================================
+# GENIOSA 4.0 — PART 6/12
+# Document processing, extraction and document CRM
+# ============================================================
+
+from pathlib import Path
+import csv
+import io
+
+
+# ------------------------------------------------------------
+# DOCUMENT LIMITS / SAFETY DEFAULTS
+# ------------------------------------------------------------
+
+SUPPORTED_DOCUMENT_TYPES = set(
+    globals().get(
+        "SUPPORTED_DOCUMENT_TYPES",
+        {
+            "pdf",
+            "docx",
+            "xlsx",
+            "xlsm",
+            "pptx",
+            "txt",
+            "csv",
+        },
+    )
+)
+
+MAX_EXCEL_ROWS_PER_SHEET = int(
+    globals().get(
+        "MAX_EXCEL_ROWS_PER_SHEET",
+        5000,
+    )
+)
+
+MAX_DOCUMENT_AI_TEXT = int(
+    globals().get(
+        "MAX_DOCUMENT_AI_TEXT",
+        120000,
+    )
+)
+
+MAX_DOCUMENT_RECORDS = int(
+    globals().get(
+        "MAX_DOCUMENT_RECORDS",
+        100,
+    )
+)
+
+MAX_DOCUMENT_FILE_SIZE_BYTES = int(
+    globals().get(
+        "MAX_DOCUMENT_SIZE_BYTES",
+        25 * 1024 * 1024,
+    )
+)
+
+
+# ------------------------------------------------------------
+# OPTIONAL LIBRARY IMPORTS
+# ------------------------------------------------------------
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
+
+
+try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+
+
+# ------------------------------------------------------------
+# INTERNAL DOCUMENT HELPERS
+# ------------------------------------------------------------
+
+def _safe_document_limit(
+    value: Any,
+    default: int,
+    maximum: int,
+) -> int:
+    """
+    Safely normalizes a document-related integer limit.
+    """
+    try:
+        result = int(value)
+    except Exception:
+        result = default
+
+    return max(
+        1,
+        min(result, maximum),
+    )
+
+
+def _truncate_document_text(
+    value: Any,
+    maximum: Optional[int] = None,
+) -> str:
+    """
+    Safely converts and truncates extracted text.
+    """
+    text_value = str(value or "").strip()
+
+    limit = _safe_document_limit(
+        maximum
+        if maximum is not None
+        else MAX_DOCUMENT_AI_TEXT,
+        MAX_DOCUMENT_AI_TEXT,
+        max(
+            MAX_DOCUMENT_AI_TEXT,
+            1,
+        ),
+    )
+
+    if len(text_value) > limit:
+        return text_value[:limit]
+
+    return text_value
+
+
+def _normalize_document_filename(
+    filename: Any,
+) -> str:
+    """
+    Prevents directory traversal through filenames.
+    """
+    raw_name = str(
+        filename or "document"
+    ).strip()
+
+    if not raw_name:
+        raw_name = "document"
+
+    safe_name = Path(raw_name).name
+
+    if not safe_name:
+        safe_name = "document"
+
+    return safe_name[:255]
+
+
+def _document_dependencies_error(
+    dependency_name: str,
+) -> RuntimeError:
+    """
+    Creates a consistent dependency error.
+    """
+    return RuntimeError(
+        f"Required document library is not installed: "
+        f"{dependency_name}"
+    )
+
+
+# ------------------------------------------------------------
+# FILE TYPE DETECTION
+# ------------------------------------------------------------
+
+def detect_file_type(
+    filename: str,
+) -> str:
+    """
+    Determines supported document type from file extension.
+    """
+    name = str(
+        filename or ""
+    ).strip().lower()
+
+    if "." not in name:
+        return "unknown"
+
+    extension = name.rsplit(
+        ".",
+        1,
+    )[-1].strip()
+
+    if extension in SUPPORTED_DOCUMENT_TYPES:
+        return extension
+
+    return "unknown"
+
+
+# ------------------------------------------------------------
+# PDF
+# ------------------------------------------------------------
+
+def extract_pdf_text(
+    filepath: str,
+) -> str:
+    """
+    Extracts text from a PDF file.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"PDF file not found: {filepath}"
+        )
+
+    if PdfReader is None:
+        raise _document_dependencies_error(
+            "pypdf"
+        )
+
+    reader = PdfReader(str(path))
+    pages = []
+    total_length = 0
+
+    for index, page in enumerate(
+        reader.pages,
+        start=1,
+    ):
+        try:
+            page_text = (
+                page.extract_text()
+                or ""
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to extract PDF page %s: %s",
+                index,
+                exc,
+            )
+            page_text = ""
+
+        page_text = str(
+            page_text
+        ).strip()
+
+        if not page_text:
+            continue
+
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - total_length
+        )
+
+        if remaining <= 0:
+            pages.append(
+                "[DOCUMENT TEXT LIMIT REACHED]"
+            )
+            break
+
+        page_block = (
+            f"--- PAGE {index} ---\n"
+            f"{page_text}"
+        )
+
+        if len(page_block) > remaining:
+            page_block = (
+                page_block[:remaining]
+                + "\n[TEXT LIMIT REACHED]"
+            )
+
+        pages.append(page_block)
+        total_length += len(page_block)
+
+        if total_length >= MAX_DOCUMENT_AI_TEXT:
+            break
+
+    return "\n\n".join(
+        pages
+    ).strip()
+
+
+# ------------------------------------------------------------
+# DOCX
+# ------------------------------------------------------------
+
+def extract_docx_text(
+    filepath: str,
+) -> str:
+    """
+    Extracts paragraphs and tables from DOCX.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"DOCX file not found: {filepath}"
+        )
+
+    if Document is None:
+        raise _document_dependencies_error(
+            "python-docx"
+        )
+
+    document = Document(str(path))
+    sections = []
+    current_length = 0
+
+    for paragraph in document.paragraphs:
+        text = str(
+            paragraph.text or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - current_length
+        )
+
+        if remaining <= 0:
+            break
+
+        text = text[:remaining]
+        sections.append(text)
+        current_length += len(text)
+
+    if current_length < MAX_DOCUMENT_AI_TEXT:
+        for table_index, table in enumerate(
+            document.tables,
+            start=1,
+        ):
+            rows = []
+
+            for row in table.rows:
+                cells = []
+
+                for cell in row.cells:
+                    value = str(
+                        cell.text or ""
+                    ).strip()
+
+                    cells.append(value)
+
+                rows.append(
+                    " | ".join(cells)
+                )
+
+            if not rows:
+                continue
+
+            table_block = (
+                f"--- TABLE {table_index} ---\n"
+                + "\n".join(rows)
+            )
+
+            remaining = (
+                MAX_DOCUMENT_AI_TEXT
+                - current_length
+            )
+
+            if remaining <= 0:
+                break
+
+            table_block = table_block[
+                :remaining
+            ]
+
+            sections.append(
+                table_block
+            )
+
+            current_length += len(
+                table_block
+            )
+
+    return "\n\n".join(
+        sections
+    ).strip()
+
+
+# ------------------------------------------------------------
+# EXCEL
+# ------------------------------------------------------------
+
+def extract_excel_text(
+    filepath: str,
+) -> str:
+    """
+    Extracts readable worksheet data from XLSX/XLSM.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Excel file not found: {filepath}"
+        )
+
+    if load_workbook is None:
+        raise _document_dependencies_error(
+            "openpyxl"
+        )
+
+    workbook = load_workbook(
+        filename=str(path),
+        read_only=True,
+        data_only=False,
+    )
+
+    sections = []
+    total_length = 0
+
+    try:
+        for worksheet in workbook.worksheets:
+            rows = []
+            row_count = 0
+
+            for row in worksheet.iter_rows(
+                values_only=True,
+            ):
+                row_count += 1
+
+                if (
+                    row_count
+                    > MAX_EXCEL_ROWS_PER_SHEET
+                ):
+                    rows.append(
+                        "[ROW LIMIT REACHED]"
+                    )
+                    break
+
+                values = []
+
+                for value in row:
+                    if value is None:
+                        values.append("")
+                    else:
+                        values.append(
+                            str(value).strip()
+                        )
+
+                if any(values):
+                    rows.append(
+                        " | ".join(values)
+                    )
+
+                current_preview = "\n".join(
+                    rows
+                )
+
+                if (
+                    total_length
+                    + len(current_preview)
+                    >= MAX_DOCUMENT_AI_TEXT
+                ):
+                    rows.append(
+                        "[DOCUMENT TEXT LIMIT REACHED]"
+                    )
+                    break
+
+            if not rows:
+                continue
+
+            sheet_block = (
+                f"--- SHEET: {worksheet.title} ---\n"
+                + "\n".join(rows)
+            )
+
+            remaining = (
+                MAX_DOCUMENT_AI_TEXT
+                - total_length
+            )
+
+            if remaining <= 0:
+                sections.append(
+                    "[DOCUMENT TEXT LIMIT REACHED]"
+                )
+                break
+
+            sheet_block = sheet_block[
+                :remaining
+            ]
+
+            sections.append(
+                sheet_block
+            )
+
+            total_length += len(
+                sheet_block
+            )
+
+            if (
+                total_length
+                >= MAX_DOCUMENT_AI_TEXT
+            ):
+                break
+
+    finally:
+        workbook.close()
+
+    return "\n\n".join(
+        sections
+    ).strip()
+
+
+# ------------------------------------------------------------
+# POWERPOINT
+# ------------------------------------------------------------
+
+def extract_pptx_text(
+    filepath: str,
+) -> str:
+    """
+    Extracts text from PowerPoint slides.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"PPTX file not found: {filepath}"
+        )
+
+    if Presentation is None:
+        raise _document_dependencies_error(
+            "python-pptx"
+        )
+
+    presentation = Presentation(
+        str(path)
+    )
+
+    sections = []
+    total_length = 0
+
+    for slide_number, slide in enumerate(
+        presentation.slides,
+        start=1,
+    ):
+        texts = []
+
+        for shape in slide.shapes:
+            try:
+                if not hasattr(
+                    shape,
+                    "text",
+                ):
+                    continue
+
+                value = str(
+                    shape.text or ""
+                ).strip()
+
+                if value:
+                    texts.append(value)
+
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read PPTX shape "
+                    "on slide %s: %s",
+                    slide_number,
+                    exc,
+                )
+
+        if not texts:
+            continue
+
+        slide_block = (
+            f"--- SLIDE {slide_number} ---\n"
+            + "\n".join(texts)
+        )
+
+        remaining = (
+            MAX_DOCUMENT_AI_TEXT
+            - total_length
+        )
+
+        if remaining <= 0:
+            sections.append(
+                "[DOCUMENT TEXT LIMIT REACHED]"
+            )
+            break
+
+        slide_block = slide_block[
+            :remaining
+        ]
+
+        sections.append(
+            slide_block
+        )
+
+        total_length += len(
+            slide_block
+        )
+
+        if (
+            total_length
+            >= MAX_DOCUMENT_AI_TEXT
+        ):
+            break
+
+    return "\n\n".join(
+        sections
+    ).strip()
+
+
+# ------------------------------------------------------------
+# TXT
+# ------------------------------------------------------------
+
+def extract_txt_text(
+    filepath: str,
+) -> str:
+    """
+    Reads common text encodings.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Text file not found: {filepath}"
+        )
+
+    encodings = [
+        "utf-8",
+        "utf-8-sig",
+        "cp1251",
+        "latin-1",
+    ]
+
+    last_error = None
+
+    for encoding in encodings:
+        try:
+            text_value = path.read_text(
+                encoding=encoding,
+                errors="strict",
+            )
+
+            return _truncate_document_text(
+                text_value
+            )
+
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+
+    return ""
+
+
+# ------------------------------------------------------------
+# CSV
+# ------------------------------------------------------------
+
+def extract_csv_text(
+    filepath: str,
+) -> str:
+    """
+    Reads CSV content with common encodings.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"CSV file not found: {filepath}"
+        )
+
+    encodings = [
+        "utf-8",
+        "utf-8-sig",
+        "cp1251",
+        "latin-1",
+    ]
+
+    last_error = None
+
+    for encoding in encodings:
+        try:
+            raw_text = path.read_text(
+                encoding=encoding,
+                errors="strict",
+            )
+
+            output = io.StringIO()
+            writer = csv.writer(
+                output,
+                lineterminator="\n",
+            )
+
+            reader = csv.reader(
+                io.StringIO(raw_text)
+            )
+
+            row_count = 0
+
+            for row in reader:
+                row_count += 1
+
+                if (
+                    row_count
+                    > MAX_EXCEL_ROWS_PER_SHEET
+                ):
+                    writer.writerow(
+                        ["[ROW LIMIT REACHED]"]
+                    )
+                    break
+
+                writer.writerow(
+                    [
+                        str(value).strip()
+                        for value in row
+                    ]
+                )
+
+                if (
+                    output.tell()
+                    >= MAX_DOCUMENT_AI_TEXT
+                ):
+                    writer.writerow(
+                        [
+                            "[DOCUMENT TEXT LIMIT REACHED]"
+                        ]
+                    )
+                    break
+
+            return _truncate_document_text(
+                output.getvalue()
+            )
+
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+
+    return ""
+
+
+# ------------------------------------------------------------
+# UNIFIED EXTRACTION
+# ------------------------------------------------------------
+
+def extract_file_text(
+    filepath: str,
+    file_type: Optional[str] = None,
+) -> str:
+    """
+    Unified document text extraction.
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"File not found: {filepath}"
+        )
+
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        file_size = 0
+
+    if (
+        file_size
+        > MAX_DOCUMENT_FILE_SIZE_BYTES
+    ):
+        raise ValueError(
+            "Document exceeds the maximum "
+            "allowed file size."
+        )
+
+    detected_type = (
+        file_type
+        or detect_file_type(path.name)
+    )
+
+    detected_type = str(
+        detected_type or ""
+    ).lower().strip()
+
+    if (
+        detected_type
+        not in SUPPORTED_DOCUMENT_TYPES
+    ):
+        raise ValueError(
+            f"Unsupported document type: "
+            f"{detected_type}"
+        )
+
+    if detected_type == "pdf":
+        text_value = extract_pdf_text(
+            str(path)
+        )
+
+    elif detected_type == "docx":
+        text_value = extract_docx_text(
+            str(path)
+        )
+
+    elif detected_type in {
+        "xlsx",
+        "xlsm",
+    }:
+        text_value = extract_excel_text(
+            str(path)
+        )
+
+    elif detected_type == "pptx":
+        text_value = extract_pptx_text(
+            str(path)
+        )
+
+    elif detected_type == "txt":
+        text_value = extract_txt_text(
+            str(path)
+        )
+
+    elif detected_type == "csv":
+        text_value = extract_csv_text(
+            str(path)
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported document type: "
+            f"{detected_type}"
+        )
+
+    return _truncate_document_text(
+        text_value
+    )
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — CREATE
+# ------------------------------------------------------------
+
+def save_document_record(
+    chat_id: Any,
+    filename: str,
+    file_type: Optional[str] = None,
+    extracted_text: Optional[str] = None,
+    project_id: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Saves uploaded document metadata and extracted text.
+    """
+    safe_filename = _normalize_document_filename(
+        filename
+    )
+
+    detected_type = (
+        str(
+            file_type
+            or detect_file_type(
+                safe_filename
+            )
+        )
+        .lower()
+        .strip()
+    )
+
+    if (
+        detected_type
+        not in SUPPORTED_DOCUMENT_TYPES
+    ):
+        detected_type = detect_file_type(
+            safe_filename
+        )
+
+    text_value = _truncate_document_text(
+        extracted_text or ""
+    )
+
+    project_id_value = None
+
+    if project_id is not None:
+        try:
+            project_id_value = int(
+                project_id
+            )
+
+            if project_id_value <= 0:
+                return None
+
+        except Exception:
+            return None
+
+        if not get_project(
+            chat_id,
+            project_id_value,
+        ):
+            return None
+
+    try:
+        result = db_execute(
+            """
+            INSERT INTO documents (
+                chat_id,
+                project_id,
+                filename,
+                file_type,
+                extracted_text
+            )
+            VALUES (
+                %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                str(chat_id),
+                project_id_value,
+                safe_filename,
+                detected_type,
+                text_value,
+            ),
+            fetchone=True,
+            commit=True,
+        )
+
+        if result:
+            return int(
+                result["id"]
+            )
+
+    except Exception as exc:
+        logger.error(
+            "Failed to save document record: %s",
+            exc,
+        )
+
+    return None
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — UPDATE ANALYSIS
+# ------------------------------------------------------------
+
+def update_document_analysis(
+    chat_id: Any,
+    document_id: int,
+    analysis: str,
+) -> bool:
+    """
+    Saves AI analysis for a document.
+    """
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
+        analysis_value = str(
+            analysis or ""
+        ).strip()
+
+        if len(analysis_value) > MAX_DOCUMENT_AI_TEXT:
+            analysis_value = analysis_value[
+                :MAX_DOCUMENT_AI_TEXT
+            ]
+
+        result = db_execute(
+            """
+            UPDATE documents
+            SET
+                analysis = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND chat_id = %s
+            RETURNING id
+            """,
+            (
+                analysis_value,
+                safe_document_id,
+                str(chat_id),
+            ),
+            fetchone=True,
+            commit=True,
+        )
+
+        return bool(result)
+
+    except Exception as exc:
+        logger.error(
+            "Failed to update document analysis %s: %s",
+            document_id,
+            exc,
+        )
+        return False
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — PROJECT LINK
+# ------------------------------------------------------------
+
+def update_document_project(
+    chat_id: Any,
+    document_id: int,
+    project_id: Optional[int],
+) -> bool:
+    """
+    Links or unlinks a document to a project.
+    """
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
+    except Exception:
+        return False
+
+    project_id_value = None
+
+    if project_id is not None:
+        try:
+            project_id_value = int(
+                project_id
+            )
+
+            if project_id_value <= 0:
+                return False
+
+        except Exception:
+            return False
+
+        if not get_project(
+            chat_id,
+            project_id_value,
+        ):
+            return False
+
+    try:
+        result = db_execute(
+            """
+            UPDATE documents
+            SET
+                project_id = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND chat_id = %s
+            RETURNING id
+            """,
+            (
+                project_id_value,
+                safe_document_id,
+                str(chat_id),
+            ),
+            fetchone=True,
+            commit=True,
+        )
+
+        return bool(result)
+
+    except Exception as exc:
+        logger.error(
+            "Failed to update document project %s: %s",
+            document_id,
+            exc,
+        )
+        return False
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — LIST
+# ------------------------------------------------------------
+
+def get_documents(
+    chat_id: Any,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Returns documents belonging to a chat.
+    """
+    try:
+        safe_limit = _safe_document_limit(
+            limit,
+            50,
+            MAX_DOCUMENT_RECORDS,
+        )
+
+        rows = db_execute(
+            f"""
+            SELECT
+                d.*,
+                p.name AS project_name
+            FROM documents d
+            LEFT JOIN projects p
+                ON p.id = d.project_id
+               AND p.chat_id = d.chat_id
+            WHERE d.chat_id = %s
+            ORDER BY
+                d.updated_at DESC,
+                d.id DESC
+            LIMIT {safe_limit}
+            """,
+            (
+                str(chat_id),
+            ),
+            fetchall=True,
+        )
+
+        return rows or []
+
+    except Exception as exc:
+        logger.error(
+            "Failed to get documents: %s",
+            exc,
+        )
+        return []
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — GET ONE
+# ------------------------------------------------------------
+
+def get_document(
+    chat_id: Any,
+    document_id: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns one document owned by the chat.
+    """
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return None
+
+        return db_execute(
+            """
+            SELECT
+                d.*,
+                p.name AS project_name
+            FROM documents d
+            LEFT JOIN projects p
+                ON p.id = d.project_id
+               AND p.chat_id = d.chat_id
+            WHERE d.id = %s
+              AND d.chat_id = %s
+            LIMIT 1
+            """,
+            (
+                safe_document_id,
+                str(chat_id),
+            ),
+            fetchone=True,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Failed to get document %s: %s",
+            document_id,
+            exc,
+        )
+        return None
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — DELETE
+# ------------------------------------------------------------
+
+def delete_document(
+    chat_id: Any,
+    document_id: int,
+) -> bool:
+    """
+    Deletes one document record.
+    """
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+        if safe_document_id <= 0:
+            return False
+
+        result = db_execute(
+            """
+            DELETE FROM documents
+            WHERE id = %s
+              AND chat_id = %s
+            RETURNING id
+            """,
+            (
+                safe_document_id,
+                str(chat_id),
+            ),
+            fetchone=True,
+            commit=True,
+        )
+
+        return bool(result)
+
+    except Exception as exc:
+        logger.error(
+            "Failed to delete document %s: %s",
+            document_id,
+            exc,
+        )
+        return False
+
+
+# ------------------------------------------------------------
+# DOCUMENT CRM — SUMMARY
+# ------------------------------------------------------------
+
+def documents_summary(
+    chat_id: Any,
+) -> str:
+    """
+    Human-readable document list.
+    """
+    documents = get_documents(
+        chat_id,
+        limit=MAX_DOCUMENT_RECORDS,
+    )
+
+    if not documents:
+        return (
+            "📄 GENIOSA — დოკუმენტები\n\n"
+            "დოკუმენტები ჯერ არ არის ატვირთული."
+        )
+
+    lines = [
+        "📄 GENIOSA — დოკუმენტები",
+        "",
+    ]
+
+    for document in documents:
+        document_id = document.get(
+            "id"
+        )
+
+        filename = (
+            document.get("filename")
+            or "უცნობი ფაილი"
+        )
+
+        file_type = (
+            document.get("file_type")
+            or "unknown"
+        )
+
+        project_name = (
+            document.get("project_name")
+            or "პროექტთან მიბმული არაა"
+        )
+
+        extracted_text = (
+            document.get("extracted_text")
+            or ""
+        )
+
+        analysis = (
+            document.get("analysis")
+            or ""
+        )
+
+        text_status = (
+            "ამოღებულია"
+            if str(
+                extracted_text
+            ).strip()
+            else "ტექსტი არ არის"
+        )
+
+        analysis_status = (
+            "გაანალიზებულია"
+            if str(
+                analysis
+            ).strip()
+            else "არ არის გაანალიზებული"
+        )
+
+        lines.append(
+            f"#{document_id} — {filename}"
+        )
+
+        lines.append(
+            f"📁 ტიპი: {file_type}"
+        )
+
+        lines.append(
+            f"🏗️ პროექტი: {project_name}"
+        )
+
+        lines.append(
+            f"📝 ტექსტი: {text_status}"
+        )
+
+        lines.append(
+            f"🤖 AI: {analysis_status}"
+        )
+
+        lines.append("")
+
+    return "\n".join(
+        lines
+    ).strip()
+
+
+# ------------------------------------------------------------
+# DOCUMENT → AI CONTEXT
+# ------------------------------------------------------------
+
+def prepare_document_for_ai(
+    document: Dict[str, Any],
+) -> str:
+    """
+    Prepares a document's extracted content
+    for Gemini analysis.
+    """
+    if not document:
+        return ""
+
+    filename = (
+        document.get("filename")
+        or "document"
+    )
+
+    file_type = (
+        document.get("file_type")
+        or "unknown"
+    )
+
+    project_name = (
+        document.get("project_name")
+        or "not linked"
+    )
+
+    extracted_text = _truncate_document_text(
+        document.get("extracted_text")
+        or ""
+    )
+
+    if not extracted_text:
+        extracted_text = (
+            "[No readable text was extracted "
+            "from this document.]"
+        )
+
+    return (
+        "DOCUMENT INFORMATION\n"
+        f"Filename: {filename}\n"
+        f"Type: {file_type}\n"
+        f"Project: {project_name}\n\n"
+        "DOCUMENT CONTENT\n"
+        f"{extracted_text}"
+    )
+
+
+# ------------------------------------------------------------
+# DOCUMENT AI PROMPT
+# ------------------------------------------------------------
+
+def build_document_analysis_prompt(
+    document: Dict[str, Any],
+    chat_id: Any,
+) -> str:
+    """
+    Builds a structured AI prompt for document analysis.
+    """
+    document_context = (
+        prepare_document_for_ai(
+            document
+        )
+    )
+
+    business_context = (
+        build_full_ai_context(
+            chat_id
+        )
+    )
+
+    business_context = _truncate_document_text(
+        business_context,
+        maximum=40000,
+    )
+
+    return f"""
+You are Geniosa 4.0, a professional business,
+investment, real-estate and financial intelligence
+assistant.
+
+Analyze the uploaded document carefully.
+
+Your analysis must be practical, structured and
+decision-oriented.
+
+Identify when applicable:
+
+1. Executive summary
+2. Main facts and figures
+3. Project or company information
+4. Financial data
+5. Revenue and cost assumptions
+6. Investment requirements
+7. Profitability
+8. Risks
+9. Opportunities
+10. Missing or suspicious information
+11. Important contradictions
+12. Recommended next steps
+
+If the document contains financial information,
+calculate or verify the important figures when
+possible.
+
+Do not invent facts that are not present.
+
+Clearly distinguish:
+- information directly stated in the document
+- reasonable calculations
+- assumptions
+- recommendations
+
+Answer in the same language as the user's request.
+If the user writes in Georgian, answer in Georgian.
+If the user writes in Russian, answer in Russian.
+If the user writes in English, answer in English.
+
+{document_context}
+
+EXISTING GENIOSA BUSINESS CONTEXT
+{business_context}
+""".strip()
+
+
+# ------------------------------------------------------------
+# DOCUMENT TEXT PREVIEW
+# ------------------------------------------------------------
+
+def document_text_preview(
+    document: Optional[Dict[str, Any]],
+    max_length: int = 1500,
+) -> str:
+    """
+    Creates a short preview of extracted document text.
+    """
+    if not document:
+        return (
+            "❌ დოკუმენტი ვერ მოიძებნა."
+        )
+
+    text_value = str(
+        document.get(
+            "extracted_text"
+        )
+        or ""
+    ).strip()
+
+    if not text_value:
+        return (
+            "📄 დოკუმენტიდან ტექსტის ამოღება "
+            "ვერ მოხერხდა."
+        )
+
+    clean_value = re.sub(
+        r"\s+",
+        " ",
+        text_value,
+    ).strip()
+
+    try:
+        safe_length = int(
+            max_length
+        )
+    except Exception:
+        safe_length = 1500
+
+    safe_length = max(
+        100,
+        min(
+            safe_length,
+            10000,
+        ),
+    )
+
+    if len(clean_value) > safe_length:
+        return (
+            clean_value[
+                :safe_length
+            ].rstrip()
+            + "..."
+        )
+
+    return clean_value
+
+
+# ------------------------------------------------------------
+# DOCUMENT ANALYSIS SUMMARY
+# ------------------------------------------------------------
+
+def document_analysis_summary(
+    document: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Returns a concise document analysis result.
+    """
+    if not document:
+        return (
+            "❌ დოკუმენტი ვერ მოიძებნა."
+        )
+
+    document_id = document.get(
+        "id"
+    )
+
+    filename = (
+        document.get("filename")
+        or "უცნობი ფაილი"
+    )
+
+    analysis = str(
+        document.get("analysis")
+        or ""
+    ).strip()
+
+    if not analysis:
+        return (
+            f"📄 დოკუმენტი #{document_id}\n"
+            f"📎 {filename}\n\n"
+            "🤖 AI ანალიზი ჯერ არ არის შესრულებული."
+        )
+
+    return (
+        f"📄 დოკუმენტი #{document_id}\n"
+        f"📎 {filename}\n\n"
+        f"{analysis}"
+    )
+
+
+print(
+    "GENIOSA 4.0 — PART 6/12 LOADED"
+)
+# ============================================================
 # GENIOSA 4.0 — PART 7/12
 # Gemini AI engine, prompts, context and memory automation
 # ============================================================
@@ -7100,7 +10317,7 @@ def extract_gemini_text(
 
     candidates = response_data.get("candidates") or []
 
-    if not candidates:
+    if not isinstance(candidates, list):
         return ""
 
     parts = []
@@ -7110,7 +10327,14 @@ def extract_gemini_text(
             continue
 
         content = candidate.get("content") or {}
+
+        if not isinstance(content, dict):
+            continue
+
         content_parts = content.get("parts") or []
+
+        if not isinstance(content_parts, list):
+            continue
 
         for part in content_parts:
             if not isinstance(part, dict):
@@ -7118,14 +10342,19 @@ def extract_gemini_text(
 
             text_value = part.get("text")
 
+            if text_value is None:
+                continue
+
+            text_value = str(
+                text_value
+            ).strip()
+
             if text_value:
                 parts.append(
-                    str(text_value).strip()
+                    text_value
                 )
 
-    return "\n".join(
-        part for part in parts if part
-    ).strip()
+    return "\n".join(parts).strip()
 
 
 def extract_gemini_error(
@@ -7141,17 +10370,96 @@ def extract_gemini_error(
             message = error_data.get("message")
 
             if message:
-                return str(message).strip()
+                return str(
+                    message
+                ).strip()[:2000]
 
             status = error_data.get("status")
 
             if status:
-                return str(status).strip()
+                return str(
+                    status
+                ).strip()[:500]
+
+            code = error_data.get("code")
+
+            if code:
+                return (
+                    f"Gemini API error code: {code}"
+                )
+
+        direct_message = response_data.get(
+            "message"
+        )
+
+        if direct_message:
+            return str(
+                direct_message
+            ).strip()[:2000]
 
     if response_data:
-        return str(response_data)[:2000]
+        return str(
+            response_data
+        )[:2000]
 
     return "Unknown Gemini API error."
+
+
+def _safe_generation_temperature(
+    temperature: Any,
+    default: float = 0.35,
+) -> float:
+    """
+    Normalizes Gemini temperature.
+    """
+    try:
+        value = float(
+            temperature
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        value = default
+
+    if not (-1000000 < value < 1000000):
+        value = default
+
+    return max(
+        0.0,
+        min(
+            1.0,
+            value,
+        ),
+    )
+
+
+def _safe_max_output_tokens(
+    value: Any,
+    default: int = 8192,
+) -> int:
+    """
+    Normalizes Gemini output token limit.
+    """
+    try:
+        tokens = int(
+            value
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        tokens = default
+
+    return max(
+        256,
+        min(
+            tokens,
+            32768,
+        ),
+    )
 
 
 def gemini_generate(
@@ -7161,7 +10469,8 @@ def gemini_generate(
     max_output_tokens: int = 8192,
 ) -> str:
     """
-    Sends a text prompt to Gemini and returns generated text.
+    Sends a text prompt to Gemini and returns
+    generated text.
     """
     if not GEMINI_API_KEY:
         return (
@@ -7169,7 +10478,9 @@ def gemini_generate(
             "კონფიგურირებული."
         )
 
-    prompt_text = str(prompt or "").strip()
+    prompt_text = str(
+        prompt or ""
+    ).strip()
 
     if not prompt_text:
         return (
@@ -7177,13 +10488,33 @@ def gemini_generate(
             "ტექსტი ცარიელია."
         )
 
-    selected_model = (
+    selected_model = str(
         model
         or GEMINI_MODEL
         or "gemini-2.5-flash-lite"
     ).strip()
 
-    url = gemini_url(selected_model)
+    if not selected_model:
+        return (
+            "❌ Gemini მოდელი "
+            "კონფიგურირებული არ არის."
+        )
+
+    url = gemini_api_url(
+        selected_model
+    )
+
+    generation_temperature = (
+        _safe_generation_temperature(
+            temperature
+        )
+    )
+
+    output_tokens = (
+        _safe_max_output_tokens(
+            max_output_tokens
+        )
+    )
 
     payload = {
         "contents": [
@@ -7197,18 +10528,8 @@ def gemini_generate(
             }
         ],
         "generationConfig": {
-            "temperature": float(
-                max(0.0, min(1.0, temperature))
-            ),
-            "maxOutputTokens": int(
-                max(
-                    256,
-                    min(
-                        max_output_tokens,
-                        32768,
-                    ),
-                )
-            ),
+            "temperature": generation_temperature,
+            "maxOutputTokens": output_tokens,
         },
     }
 
@@ -7222,17 +10543,26 @@ def gemini_generate(
             url,
             headers=headers,
             json=payload,
-            timeout=120,
+            timeout=GEMINI_TIMEOUT,
         )
 
         try:
             response_data = response.json()
+
         except Exception:
             response_data = {
-                "error": response.text[:4000]
+                "error": (
+                    response.text[:4000]
+                    if response.text
+                    else "Empty Gemini response."
+                )
             }
 
-        if response.status_code != 200:
+        if not (
+            200
+            <= response.status_code
+            < 300
+        ):
             error_message = extract_gemini_error(
                 response_data
             )
@@ -7259,12 +10589,28 @@ def gemini_generate(
         finish_reason = ""
 
         try:
-            finish_reason = str(
-                response_data["candidates"][0]
-                .get("finishReason", "")
+            candidates = (
+                response_data.get(
+                    "candidates"
+                ) or []
             )
+
+            if candidates:
+                first_candidate = candidates[0]
+
+                if isinstance(
+                    first_candidate,
+                    dict,
+                ):
+                    finish_reason = str(
+                        first_candidate.get(
+                            "finishReason",
+                            "",
+                        )
+                    ).strip()
+
         except Exception:
-            pass
+            finish_reason = ""
 
         if finish_reason:
             logger.warning(
@@ -7437,9 +10783,25 @@ def build_ai_prompt(
         user_message or ""
     ).strip()
 
-    context = build_full_ai_context(
-        chat_id
-    )
+    if not message_text:
+        return (
+            ai_system_prompt()
+            + "\n\nUSER'S CURRENT REQUEST:\n"
+            + "No request provided."
+        )
+
+    try:
+        context = build_full_ai_context(
+            chat_id
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Failed to build AI context: %s",
+            exc,
+        )
+
+        context = ""
 
     extra = str(
         extra_context or ""
@@ -7467,7 +10829,9 @@ def build_ai_prompt(
         "Provide the best practical answer.",
     ])
 
-    return "\n".join(prompt_parts).strip()
+    return "\n".join(
+        prompt_parts
+    ).strip()
 
 
 def process_ai_text(
@@ -7476,7 +10840,9 @@ def process_ai_text(
     """
     Cleans AI output before sending it to Telegram.
     """
-    value = str(text or "").strip()
+    value = str(
+        text or ""
+    ).strip()
 
     if not value:
         return (
@@ -7502,7 +10868,7 @@ def extract_memory_candidates(
     ai_response: str,
 ) -> List[Tuple[str, str, int]]:
     """
-    Detects simple long-term business facts
+    Detects explicit long-term business facts
     that are useful to store in memory.
 
     Returns:
@@ -7546,40 +10912,45 @@ def extract_memory_candidates(
         for keyword in project_keywords
     )
 
-    if explicit_memory:
-        memory_text = user_text
+    if not explicit_memory:
+        return candidates
 
-        if len(memory_text) > 2000:
-            memory_text = memory_text[:2000].strip()
+    memory_text = user_text
 
-        category = "business"
-
-        if (
-            "ინვესტორ" in normalized
-            or "investor" in normalized
-            or "инвестор" in normalized
-        ):
-            category = "investor"
-
-        elif (
-            "პროექტ" in normalized
-            or "project" in normalized
-        ):
-            category = "project"
-
-        elif (
-            "კომპანი" in normalized
-            or "company" in normalized
-        ):
-            category = "company"
-
-        candidates.append(
-            (
-                memory_text,
-                category,
-                8,
-            )
+    if len(memory_text) > 2000:
+        memory_text = (
+            memory_text[:2000]
+            .strip()
         )
+
+    category = "business"
+
+    if (
+        "ინვესტორ" in normalized
+        or "investor" in normalized
+        or "инвестор" in normalized
+    ):
+        category = "investor"
+
+    elif (
+        "პროექტ" in normalized
+        or "project" in normalized
+    ):
+        category = "project"
+
+    elif (
+        "კომპანი" in normalized
+        or "company" in normalized
+    ):
+        category = "company"
+
+    candidates.append(
+        (
+            memory_text,
+            category,
+            8,
+        )
+    )
 
     return candidates
 
@@ -7600,18 +10971,25 @@ def maybe_save_important_memory(
 
     saved_count = 0
 
-    for memory_text, category, importance in candidates:
+    for (
+        memory_text,
+        category,
+        importance,
+    ) in candidates:
+
         if not memory_text:
             continue
 
         try:
-            save_memory(
+            saved = save_memory(
                 chat_id=chat_id,
                 memory=memory_text,
                 category=category,
                 importance=importance,
             )
-            saved_count += 1
+
+            if saved is not False:
+                saved_count += 1
 
         except Exception as exc:
             logger.error(
@@ -7656,10 +11034,13 @@ def ask_geniosa(
             raw_response
         )
 
-        if response_text.startswith(
-            "❌ Gemini"
-        ) or response_text.startswith(
-            "❌ AI"
+        if (
+            response_text.startswith(
+                "❌ Gemini"
+            )
+            or response_text.startswith(
+                "❌ AI"
+            )
         ):
             return response_text
 
@@ -7688,13 +11069,44 @@ def analyze_document_with_ai(
     document_id: int,
 ) -> str:
     """
-    Loads a document, sends it to Gemini,
-    and stores the analysis.
+    Loads a stored document, sends it to Gemini,
+    and stores the resulting analysis.
     """
-    document = get_document(
-        chat_id,
-        document_id,
-    )
+    try:
+        safe_document_id = int(
+            document_id
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return (
+            "❌ დოკუმენტის ID არასწორია."
+        )
+
+    if safe_document_id <= 0:
+        return (
+            "❌ დოკუმენტის ID არასწორია."
+        )
+
+    try:
+        document = get_document(
+            chat_id,
+            safe_document_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to load document %s: %s",
+            safe_document_id,
+            exc,
+        )
+
+        return (
+            "❌ დოკუმენტის მონაცემების "
+            "წაკითხვა ვერ მოხერხდა."
+        )
 
     if not document:
         return (
@@ -7712,14 +11124,28 @@ def analyze_document_with_ai(
             "ვერ მოიძებნა."
         )
 
-    prompt = build_document_analysis_prompt(
-        document=document,
-        chat_id=chat_id,
-    )
+    try:
+        prompt = build_document_analysis_prompt(
+            document=document,
+            chat_id=chat_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to build document prompt "
+            "for document %s: %s",
+            safe_document_id,
+            exc,
+        )
+
+        return (
+            "❌ დოკუმენტის AI ანალიზის "
+            "მომზადება ვერ მოხერხდა."
+        )
 
     analysis = gemini_generate(
         prompt=prompt,
-        temperature=0.2,
+        temperature=0.20,
         max_output_tokens=12000,
     )
 
@@ -7730,32 +11156,93 @@ def analyze_document_with_ai(
     if analysis.startswith("❌"):
         return analysis
 
-    saved = update_document_analysis(
-        chat_id=chat_id,
-        document_id=document_id,
-        analysis=analysis,
-    )
+    try:
+        saved = update_document_analysis(
+            chat_id=chat_id,
+            document_id=safe_document_id,
+            analysis=analysis,
+        )
 
-    if not saved:
-        logger.warning(
-            "Document analysis generated but "
-            "could not be saved. document_id=%s",
-            document_id,
+        if not saved:
+            logger.warning(
+                "Document analysis generated but "
+                "could not be saved. document_id=%s",
+                safe_document_id,
+            )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to save document analysis "
+            "for document %s: %s",
+            safe_document_id,
+            exc,
         )
 
     return analysis
 
 
-print("GENIOSA 4.0 — PART 7/12 LOADED")# ============================================================
+print(
+    "GENIOSA 4.0 — PART 7/12 LOADED"
+)
+
+
+# ============================================================
 # GENIOSA 4.0 — PART 8/12
 # Telegram files, photos and multimodal AI analysis
 # ============================================================
 
 
+DOWNLOAD_DIR = Path(
+    globals().get(
+        "DOWNLOAD_DIR",
+        TEMP_DIR / "downloads",
+    )
+)
+
+DOWNLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+TELEGRAM_FILE_TIMEOUT = int(
+    globals().get(
+        "TELEGRAM_FILE_TIMEOUT",
+        max(
+            60,
+            int(TELEGRAM_REQUEST_TIMEOUT),
+        ),
+    )
+)
+
+
+SUPPORTED_DOCUMENT_TYPES = set(
+    globals().get(
+        "SUPPORTED_DOCUMENT_TYPES",
+        {
+            "pdf",
+            "docx",
+            "xlsx",
+            "pptx",
+            "txt",
+            "csv",
+        },
+    )
+)
+
+
+MAX_FILE_DOWNLOAD_BYTES = int(
+    globals().get(
+        "MAX_DOCUMENT_SIZE_BYTES",
+        25 * 1024 * 1024,
+    )
+)
+
+
 def telegram_api_request(
     method: str,
     payload: Optional[Dict[str, Any]] = None,
-    timeout: int = TELEGRAM_REQUEST_TIMEOUT,
+    timeout: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Generic Telegram Bot API request.
@@ -7766,30 +11253,76 @@ def telegram_api_request(
         )
         return None
 
-    request_payload = payload or {}
+    method_name = str(
+        method or ""
+    ).strip()
+
+    if not method_name:
+        return None
+
+    request_payload = (
+        payload
+        if isinstance(
+            payload,
+            dict,
+        )
+        else {}
+    )
+
+    request_timeout = (
+        TELEGRAM_REQUEST_TIMEOUT
+        if timeout is None
+        else max(
+            5,
+            int(timeout),
+        )
+    )
 
     try:
         response = requests.post(
-            telegram_url(method),
+            telegram_api_url(
+                method_name
+            ),
             json=request_payload,
-            timeout=timeout,
+            timeout=request_timeout,
         )
 
         if response.status_code != 200:
             logger.error(
                 "Telegram API HTTP %s for %s: %s",
                 response.status_code,
-                method,
+                method_name,
                 response.text[:2000],
             )
             return None
 
-        data = response.json()
+        try:
+            data = response.json()
+
+        except Exception as exc:
+            logger.error(
+                "Telegram returned invalid JSON "
+                "for %s: %s",
+                method_name,
+                exc,
+            )
+            return None
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            logger.error(
+                "Telegram returned invalid response "
+                "type for %s.",
+                method_name,
+            )
+            return None
 
         if not data.get("ok"):
             logger.error(
                 "Telegram API error for %s: %s",
-                method,
+                method_name,
                 data,
             )
             return None
@@ -7799,14 +11332,14 @@ def telegram_api_request(
     except requests.Timeout:
         logger.error(
             "Telegram API timeout for %s",
-            method,
+            method_name,
         )
         return None
 
     except requests.RequestException as exc:
         logger.error(
             "Telegram API request failed for %s: %s",
-            method,
+            method_name,
             exc,
         )
         return None
@@ -7814,7 +11347,7 @@ def telegram_api_request(
     except Exception as exc:
         logger.exception(
             "Unexpected Telegram API error for %s: %s",
-            method,
+            method_name,
             exc,
         )
         return None
@@ -7844,12 +11377,49 @@ def telegram_get_file(
     if not data:
         return None
 
-    result = data.get("result")
+    result = data.get(
+        "result"
+    )
 
-    if not isinstance(result, dict):
+    if not isinstance(
+        result,
+        dict,
+    ):
         return None
 
     return result
+
+
+def _safe_download_filename(
+    original_name: str,
+    fallback_name: str,
+) -> str:
+    """
+    Produces a filesystem-safe filename.
+    """
+    value = str(
+        original_name or ""
+    ).strip()
+
+    if not value:
+        value = fallback_name
+
+    value = Path(value).name
+
+    safe_name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        value,
+    )
+
+    safe_name = safe_name.strip(
+        "._"
+    )
+
+    if not safe_name:
+        safe_name = fallback_name
+
+    return safe_name[:180]
 
 
 def telegram_download_file(
@@ -7859,16 +11429,28 @@ def telegram_download_file(
 ) -> Optional[str]:
     """
     Downloads a Telegram file into local storage.
+
+    The download is streamed and limited by the configured
+    maximum document size.
     """
+    safe_file_id = str(
+        file_id or ""
+    ).strip()
+
+    if not safe_file_id:
+        return None
+
     file_info = telegram_get_file(
-        file_id
+        safe_file_id
     )
 
     if not file_info:
         return None
 
     file_path = str(
-        file_info.get("file_path") or ""
+        file_info.get(
+            "file_path"
+        ) or ""
     ).strip()
 
     if not file_path:
@@ -7877,36 +11459,56 @@ def telegram_download_file(
         )
         return None
 
+    telegram_file_size = file_info.get(
+        "file_size"
+    )
+
+    try:
+        if telegram_file_size is not None:
+            if int(
+                telegram_file_size
+            ) > MAX_FILE_DOWNLOAD_BYTES:
+                logger.warning(
+                    "Telegram file exceeds "
+                    "maximum allowed size: %s",
+                    telegram_file_size,
+                )
+                return None
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pass
+
     target_dir = (
-        destination_dir
+        Path(destination_dir)
         if destination_dir is not None
         else DOWNLOAD_DIR
     )
 
-    target_dir = Path(target_dir)
-    target_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    original_name = (
-        filename
-        or Path(file_path).name
-        or f"telegram_{file_id}"
-    )
-
-    safe_name = re.sub(
-        r"[^A-Za-z0-9._-]+",
-        "_",
-        str(original_name),
-    ).strip("._")
-
-    if not safe_name:
-        safe_name = (
-            f"telegram_{file_id}"
+    try:
+        target_dir.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-    timestamp = int(time.time() * 1000)
+    except Exception as exc:
+        logger.error(
+            "Could not create download directory: %s",
+            exc,
+        )
+        return None
+
+    safe_name = _safe_download_filename(
+        filename
+        or Path(file_path).name,
+        f"telegram_{safe_file_id}",
+    )
+
+    timestamp = int(
+        time.time() * 1000
+    )
 
     destination = (
         target_dir
@@ -7914,10 +11516,16 @@ def telegram_download_file(
     )
 
     download_url = (
-        f"https://api.telegram.org/file/"
+        f"{TELEGRAM_FILE_BASE.rstrip('/')}/"
         f"bot{TELEGRAM_BOT_TOKEN}/"
-        f"{file_path}"
+        f"{file_path.lstrip('/')}"
     )
+
+    temporary_destination = Path(
+        f"{destination}.part"
+    )
+
+    total_downloaded = 0
 
     try:
         response = requests.get(
@@ -7934,26 +11542,76 @@ def telegram_download_file(
             )
             return None
 
-        with destination.open(
+        content_length = response.headers.get(
+            "Content-Length"
+        )
+
+        try:
+            if (
+                content_length
+                and int(content_length)
+                > MAX_FILE_DOWNLOAD_BYTES
+            ):
+                logger.warning(
+                    "Telegram response file is too large: %s",
+                    content_length,
+                )
+                return None
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            pass
+
+        with temporary_destination.open(
             "wb"
         ) as output_file:
+
             for chunk in response.iter_content(
                 chunk_size=1024 * 1024
             ):
-                if chunk:
-                    output_file.write(chunk)
+                if not chunk:
+                    continue
+
+                total_downloaded += len(
+                    chunk
+                )
+
+                if (
+                    total_downloaded
+                    > MAX_FILE_DOWNLOAD_BYTES
+                ):
+                    logger.warning(
+                        "Telegram file exceeded "
+                        "maximum size while downloading."
+                    )
+
+                    return None
+
+                output_file.write(
+                    chunk
+                )
+
+        if (
+            not temporary_destination.exists()
+            or total_downloaded <= 0
+        ):
+            return None
+
+        temporary_destination.replace(
+            destination
+        )
 
         if not destination.exists():
             return None
 
         if destination.stat().st_size <= 0:
-            try:
-                destination.unlink()
-            except Exception:
-                pass
             return None
 
-        return str(destination)
+        return str(
+            destination
+        )
 
     except requests.Timeout:
         logger.error(
@@ -7974,6 +11632,13 @@ def telegram_download_file(
             exc,
         )
         return None
+
+    finally:
+        try:
+            if temporary_destination.exists():
+                temporary_destination.unlink()
+        except Exception:
+            pass
 
 
 def guess_mime_type(
@@ -8000,6 +11665,18 @@ def guess_mime_type(
         ".txt": "text/plain",
         ".csv": "text/csv",
         ".json": "application/json",
+        ".docx": (
+            "application/vnd.openxmlformats-"
+            "officedocument.wordprocessingml.document"
+        ),
+        ".xlsx": (
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
+        ),
+        ".pptx": (
+            "application/vnd.openxmlformats-"
+            "officedocument.presentationml.presentation"
+        ),
     }
 
     return mime_map.get(
@@ -8014,15 +11691,28 @@ def encode_file_base64(
     """
     Encodes a local file into base64.
     """
-    path = Path(filepath)
+    path = Path(
+        filepath
+    )
 
     if not path.exists():
         return None
 
     try:
+        if not path.is_file():
+            return None
+
         data = path.read_bytes()
 
         if not data:
+            return None
+
+        if len(data) > MAX_FILE_DOWNLOAD_BYTES:
+            logger.warning(
+                "File exceeds maximum size "
+                "for base64 encoding: %s",
+                filepath,
+            )
             return None
 
         return base64.b64encode(
@@ -8046,7 +11736,7 @@ def gemini_generate_multimodal(
     max_output_tokens: int = 8192,
 ) -> str:
     """
-    Sends text + image/file bytes to Gemini.
+    Sends text + file bytes to Gemini.
     """
     if not GEMINI_API_KEY:
         return (
@@ -8063,11 +11753,38 @@ def gemini_generate_multimodal(
             "❌ AI მოთხოვნა ცარიელია."
         )
 
-    path = Path(filepath)
+    path = Path(
+        filepath
+    )
 
     if not path.exists():
         return (
             "❌ ფაილი ვერ მოიძებნა."
+        )
+
+    if not path.is_file():
+        return (
+            "❌ მითითებული ობიექტი ფაილი არ არის."
+        )
+
+    try:
+        file_size = path.stat().st_size
+
+        if file_size <= 0:
+            return (
+                "❌ ფაილი ცარიელია."
+            )
+
+        if file_size > MAX_FILE_DOWNLOAD_BYTES:
+            return (
+                "❌ ფაილი დასაშვებ ზომაზე "
+                "დიდია."
+            )
+
+    except Exception:
+        return (
+            "❌ ფაილის ზომის შემოწმება "
+            "ვერ მოხერხდა."
         )
 
     encoded_data = encode_file_base64(
@@ -8080,19 +11797,46 @@ def gemini_generate_multimodal(
             "ვერ მოხერხდა."
         )
 
-    detected_mime = (
+    detected_mime = str(
         mime_type
-        or guess_mime_type(str(path))
-    )
+        or guess_mime_type(
+            str(path)
+        )
+    ).strip()
 
-    selected_model = (
+    if not detected_mime:
+        detected_mime = (
+            "application/octet-stream"
+        )
+
+    selected_model = str(
         model
         or GEMINI_MODEL
         or "gemini-2.5-flash-lite"
     ).strip()
 
-    url = gemini_url(
+    if not selected_model:
+        return (
+            "❌ Gemini მოდელი "
+            "კონფიგურირებული არ არის."
+        )
+
+    url = gemini_api_url(
         selected_model
+    )
+
+    generation_temperature = (
+        _safe_generation_temperature(
+            temperature,
+            default=0.25,
+        )
+    )
+
+    output_tokens = (
+        _safe_max_output_tokens(
+            max_output_tokens,
+            default=8192,
+        )
     )
 
     payload = {
@@ -8113,24 +11857,8 @@ def gemini_generate_multimodal(
             }
         ],
         "generationConfig": {
-            "temperature": float(
-                max(
-                    0.0,
-                    min(
-                        1.0,
-                        temperature,
-                    ),
-                )
-            ),
-            "maxOutputTokens": int(
-                max(
-                    256,
-                    min(
-                        max_output_tokens,
-                        32768,
-                    ),
-                )
-            ),
+            "temperature": generation_temperature,
+            "maxOutputTokens": output_tokens,
         },
     }
 
@@ -8144,17 +11872,26 @@ def gemini_generate_multimodal(
             url,
             headers=headers,
             json=payload,
-            timeout=120,
+            timeout=GEMINI_TIMEOUT,
         )
 
         try:
             response_data = response.json()
+
         except Exception:
             response_data = {
-                "error": response.text[:4000]
+                "error": (
+                    response.text[:4000]
+                    if response.text
+                    else "Empty Gemini response."
+                )
             }
 
-        if response.status_code != 200:
+        if not (
+            200
+            <= response.status_code
+            < 300
+        ):
             error_message = extract_gemini_error(
                 response_data
             )
@@ -8179,6 +11916,39 @@ def gemini_generate_multimodal(
         if generated_text:
             return generated_text
 
+        finish_reason = ""
+
+        try:
+            candidates = (
+                response_data.get(
+                    "candidates"
+                ) or []
+            )
+
+            if candidates:
+                first_candidate = candidates[0]
+
+                if isinstance(
+                    first_candidate,
+                    dict,
+                ):
+                    finish_reason = str(
+                        first_candidate.get(
+                            "finishReason",
+                            "",
+                        )
+                    ).strip()
+
+        except Exception:
+            pass
+
+        if finish_reason:
+            logger.warning(
+                "Gemini multimodal returned "
+                "no text. Finish reason: %s",
+                finish_reason,
+            )
+
         return (
             "❌ Gemini-მ მულტიმედიურ "
             "ფაილზე პასუხი ვერ დააბრუნა."
@@ -8190,8 +11960,8 @@ def gemini_generate_multimodal(
         )
 
         return (
-            "❌ სურათის ანალიზისას "
-            "დრო ამოიწურა."
+            "❌ სურათის ან ფაილის "
+            "ანალიზისას დრო ამოიწურა."
         )
 
     except requests.RequestException as exc:
@@ -8201,8 +11971,8 @@ def gemini_generate_multimodal(
         )
 
         return (
-            "❌ სურათის ანალიზისას "
-            "კავშირის შეცდომა მოხდა."
+            "❌ სურათის ან ფაილის "
+            "ანალიზისას კავშირის შეცდომა მოხდა."
         )
 
     except Exception as exc:
@@ -8212,8 +11982,8 @@ def gemini_generate_multimodal(
         )
 
         return (
-            "❌ სურათის ანალიზისას "
-            "მოულოდნელი შეცდომა მოხდა."
+            "❌ სურათის ან ფაილის "
+            "ანალიზისას მოულოდნელი შეცდომა მოხდა."
         )
 
 
@@ -8225,20 +11995,57 @@ def analyze_image_with_ai(
     """
     Analyzes a Telegram image using Gemini.
     """
-    path = Path(filepath)
+    path = Path(
+        filepath
+    )
 
     if not path.exists():
         return (
             "❌ სურათი ვერ მოიძებნა."
         )
 
+    if not path.is_file():
+        return (
+            "❌ მითითებული ობიექტი "
+            "სურათი არ არის."
+        )
+
+    try:
+        if path.stat().st_size <= 0:
+            return (
+                "❌ სურათი ცარიელია."
+            )
+
+        if (
+            path.stat().st_size
+            > MAX_FILE_DOWNLOAD_BYTES
+        ):
+            return (
+                "❌ სურათი დასაშვებ ზომაზე "
+                "დიდია."
+            )
+
+    except Exception:
+        return (
+            "❌ სურათის ზომის შემოწმება "
+            "ვერ მოხერხდა."
+        )
+
     caption = str(
         user_caption or ""
     ).strip()
 
-    context = build_full_ai_context(
-        chat_id
-    )
+    try:
+        context = build_full_ai_context(
+            chat_id
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Failed to build image AI context: %s",
+            exc,
+        )
+        context = ""
 
     prompt = f"""
 You are Geniosa 4.0, a professional
@@ -8283,7 +12090,7 @@ USER CAPTION:
 {caption or "No caption provided."}
 
 GENIOSA BUSINESS CONTEXT:
-{context}
+{context or "No stored context."}
 """.strip()
 
     result = gemini_generate_multimodal(
@@ -8292,7 +12099,7 @@ GENIOSA BUSINESS CONTEXT:
         mime_type=guess_mime_type(
             str(path)
         ),
-        temperature=0.2,
+        temperature=0.20,
         max_output_tokens=10000,
     )
 
@@ -8314,7 +12121,9 @@ def analyze_document_file(
     Extracts a document, stores it in CRM
     and returns document ID + extracted text.
     """
-    path = Path(filepath)
+    path = Path(
+        filepath
+    )
 
     if not path.exists():
         return (
@@ -8322,10 +12131,47 @@ def analyze_document_file(
             "❌ ფაილი ვერ მოიძებნა.",
         )
 
-    safe_filename = (
+    if not path.is_file():
+        return (
+            None,
+            "❌ მითითებული ობიექტი "
+            "ფაილი არ არის.",
+        )
+
+    try:
+        file_size = path.stat().st_size
+
+    except Exception:
+        return (
+            None,
+            "❌ ფაილის ზომის წაკითხვა "
+            "ვერ მოხერხდა.",
+        )
+
+    if file_size <= 0:
+        return (
+            None,
+            "❌ ფაილი ცარიელია.",
+        )
+
+    if file_size > MAX_FILE_DOWNLOAD_BYTES:
+        return (
+            None,
+            "❌ დოკუმენტი დასაშვებ ზომაზე "
+            "დიდია.",
+        )
+
+    safe_filename = str(
         filename
         or path.name
-    )
+    ).strip()
+
+    if not safe_filename:
+        safe_filename = path.name
+
+    safe_filename = Path(
+        safe_filename
+    ).name
 
     file_type = detect_file_type(
         safe_filename
@@ -8336,6 +12182,16 @@ def analyze_document_file(
             None,
             "❌ ამ ტიპის დოკუმენტი "
             "ჯერ არ არის მხარდაჭერილი.",
+        )
+
+    if (
+        SUPPORTED_DOCUMENT_TYPES
+        and file_type not in SUPPORTED_DOCUMENT_TYPES
+    ):
+        return (
+            None,
+            "❌ ამ ტიპის დოკუმენტი "
+            "არ არის მხარდაჭერილი.",
         )
 
     try:
@@ -8388,6 +12244,9 @@ def file_size_mb(
             filepath
         ).stat().st_size
 
+        if size < 0:
+            return 0.0
+
         return float(
             size / (1024 * 1024)
         )
@@ -8406,10 +12265,13 @@ def cleanup_temp_file(
         return
 
     try:
-        path = Path(filepath)
+        path = Path(
+            filepath
+        )
 
         if path.exists():
-            path.unlink()
+            if path.is_file():
+                path.unlink()
 
     except Exception as exc:
         logger.warning(
@@ -8419,39 +12281,116 @@ def cleanup_temp_file(
         )
 
 
-print("GENIOSA 4.0 — PART 8/12 LOADED")# ============================================================
+print(
+    "GENIOSA 4.0 — PART 8/12 LOADED"
+)
+# ============================================================
 # GENIOSA 4.0 — PART 9/12
 # Financial analysis and investment calculations
 # ============================================================
 
 
-def safe_float(value: Any) -> Optional[float]:
+def safe_float(
+    value: Any,
+) -> Optional[float]:
     """
     Safely converts a value to float.
+    Supports common financial number formats.
     """
     if value is None:
         return None
 
-    if isinstance(value, bool):
+    if isinstance(
+        value,
+        bool,
+    ):
         return None
 
     try:
-        if isinstance(value, str):
+        if isinstance(
+            value,
+            str,
+        ):
             cleaned = value.strip()
-            cleaned = cleaned.replace(",", "")
-            cleaned = cleaned.replace("$", "")
-            cleaned = cleaned.replace("€", "")
-            cleaned = cleaned.replace("₾", "")
 
             if not cleaned:
                 return None
 
-            return float(cleaned)
+            cleaned = cleaned.replace(
+                ",",
+                "",
+            )
 
-        return float(value)
+            cleaned = cleaned.replace(
+                "$",
+                "",
+            )
 
-    except (TypeError, ValueError):
+            cleaned = cleaned.replace(
+                "€",
+                "",
+            )
+
+            cleaned = cleaned.replace(
+                "₾",
+                "",
+            )
+
+            cleaned = cleaned.replace(
+                "ლარი",
+                "",
+            )
+
+            cleaned = cleaned.strip()
+
+            if not cleaned:
+                return None
+
+            result = float(
+                cleaned
+            )
+
+        else:
+            result = float(
+                value
+            )
+
+        if result != result:
+            return None
+
+        if result == float("inf"):
+            return None
+
+        if result == float("-inf"):
+            return None
+
+        return result
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
         return None
+
+
+def _safe_percentage(
+    value: Any,
+) -> Optional[float]:
+    """
+    Safely converts a value to a percentage.
+    """
+    result = safe_float(
+        value
+    )
+
+    if result is None:
+        return None
+
+    if result < 0 or result > 100:
+        return None
+
+    return result
 
 
 def calculate_revenue_from_area(
@@ -8462,8 +12401,13 @@ def calculate_revenue_from_area(
     Calculates revenue from saleable area
     and average selling price per m².
     """
-    area = safe_float(saleable_area)
-    price = safe_float(sale_price_per_m2)
+    area = safe_float(
+        saleable_area
+    )
+
+    price = safe_float(
+        sale_price_per_m2
+    )
 
     if area is None or price is None:
         return None
@@ -8481,8 +12425,13 @@ def calculate_construction_cost(
     """
     Calculates construction cost.
     """
-    area = safe_float(construction_area)
-    price = safe_float(construction_price_per_m2)
+    area = safe_float(
+        construction_area
+    )
+
+    price = safe_float(
+        construction_price_per_m2
+    )
 
     if area is None or price is None:
         return None
@@ -8501,7 +12450,10 @@ def calculate_total_cost_from_components(
     other_cost: Any = 0,
 ) -> float:
     """
-    Calculates total project cost from cost components.
+    Calculates total project cost from
+    individual cost components.
+
+    Negative cost components are ignored.
     """
     components = [
         land_cost,
@@ -8514,7 +12466,9 @@ def calculate_total_cost_from_components(
     total = 0.0
 
     for component in components:
-        value = safe_float(component)
+        value = safe_float(
+            component
+        )
 
         if value is not None and value > 0:
             total += value
@@ -8529,13 +12483,24 @@ def calculate_net_profit(
     """
     Calculates net profit.
     """
-    revenue_value = safe_float(revenue)
-    cost_value = safe_float(total_cost)
+    revenue_value = safe_float(
+        revenue
+    )
 
-    if revenue_value is None or cost_value is None:
+    cost_value = safe_float(
+        total_cost
+    )
+
+    if (
+        revenue_value is None
+        or cost_value is None
+    ):
         return None
 
-    return revenue_value - cost_value
+    return (
+        revenue_value
+        - cost_value
+    )
 
 
 def calculate_profit_margin(
@@ -8543,19 +12508,29 @@ def calculate_profit_margin(
     profit: Any,
 ) -> Optional[float]:
     """
-    Calculates profit margin as percentage of revenue.
+    Calculates profit margin as percentage
+    of revenue.
     """
-    revenue_value = safe_float(revenue)
-    profit_value = safe_float(profit)
+    revenue_value = safe_float(
+        revenue
+    )
 
-    if revenue_value is None:
+    profit_value = safe_float(
+        profit
+    )
+
+    if (
+        revenue_value is None
+        or profit_value is None
+    ):
         return None
 
-    if revenue_value == 0:
+    if revenue_value <= 0:
         return None
 
     return (
-        profit_value / revenue_value
+        profit_value
+        / revenue_value
     ) * 100
 
 
@@ -8566,17 +12541,26 @@ def calculate_roi(
     """
     Calculates ROI based on invested capital.
     """
-    investment_value = safe_float(investment)
-    profit_value = safe_float(profit)
+    investment_value = safe_float(
+        investment
+    )
 
-    if investment_value is None:
+    profit_value = safe_float(
+        profit
+    )
+
+    if (
+        investment_value is None
+        or profit_value is None
+    ):
         return None
 
-    if investment_value == 0:
+    if investment_value <= 0:
         return None
 
     return (
-        profit_value / investment_value
+        profit_value
+        / investment_value
     ) * 100
 
 
@@ -8586,12 +12570,20 @@ def calculate_investor_profit(
 ) -> Optional[float]:
     """
     Calculates investor profit from net profit
-    and ownership/profit share percentage.
+    and investor profit-share percentage.
     """
-    profit_value = safe_float(net_profit)
-    share_value = safe_float(investor_share)
+    profit_value = safe_float(
+        net_profit
+    )
 
-    if profit_value is None or share_value is None:
+    share_value = _safe_percentage(
+        investor_share
+    )
+
+    if (
+        profit_value is None
+        or share_value is None
+    ):
         return None
 
     return (
@@ -8608,13 +12600,24 @@ def calculate_operator_profit(
     """
     Calculates remaining operator/company profit.
     """
-    profit_value = safe_float(net_profit)
-    share_value = safe_float(investor_share)
+    profit_value = safe_float(
+        net_profit
+    )
 
-    if profit_value is None or share_value is None:
+    share_value = _safe_percentage(
+        investor_share
+    )
+
+    if (
+        profit_value is None
+        or share_value is None
+    ):
         return None
 
-    operator_share = 100 - share_value
+    operator_share = (
+        100.0
+        - share_value
+    )
 
     return (
         profit_value
@@ -8630,16 +12633,30 @@ def calculate_break_even_price(
     """
     Calculates break-even selling price per m².
     """
-    cost_value = safe_float(total_cost)
-    area_value = safe_float(saleable_area)
+    cost_value = safe_float(
+        total_cost
+    )
 
-    if cost_value is None or area_value is None:
+    area_value = safe_float(
+        saleable_area
+    )
+
+    if (
+        cost_value is None
+        or area_value is None
+    ):
         return None
 
-    if area_value <= 0:
+    if (
+        cost_value < 0
+        or area_value <= 0
+    ):
         return None
 
-    return cost_value / area_value
+    return (
+        cost_value
+        / area_value
+    )
 
 
 def calculate_required_revenue(
@@ -8651,23 +12668,44 @@ def calculate_required_revenue(
     a target profit margin.
 
     Example:
-    cost = 10M
-    target margin = 20%
-    required revenue = 12.5M
+        cost = 10M
+        target margin = 20%
+        required revenue = 12.5M
     """
-    cost_value = safe_float(total_cost)
+    cost_value = safe_float(
+        total_cost
+    )
+
     margin_value = safe_float(
         target_profit_margin
     )
 
-    if cost_value is None or margin_value is None:
+    if (
+        cost_value is None
+        or margin_value is None
+    ):
         return None
 
-    if margin_value < 0 or margin_value >= 100:
+    if cost_value < 0:
         return None
 
-    return cost_value / (
-        1 - margin_value / 100
+    if (
+        margin_value < 0
+        or margin_value >= 100
+    ):
+        return None
+
+    denominator = (
+        1
+        - margin_value / 100
+    )
+
+    if denominator <= 0:
+        return None
+
+    return (
+        cost_value
+        / denominator
     )
 
 
@@ -8675,59 +12713,112 @@ def calculate_project_sensitivity(
     saleable_area: Any,
     total_cost: Any,
     base_price: Any,
-    price_changes: Optional[List[float]] = None,
+    price_changes: Optional[
+        List[float]
+    ] = None,
 ) -> List[Dict[str, float]]:
     """
-    Creates a simple sales-price sensitivity table.
-    """
-    area = safe_float(saleable_area)
-    cost = safe_float(total_cost)
-    price = safe_float(base_price)
+    Creates a sales-price sensitivity table.
 
-    if area is None or cost is None or price is None:
+    Negative prices are excluded.
+    """
+    area = safe_float(
+        saleable_area
+    )
+
+    cost = safe_float(
+        total_cost
+    )
+
+    price = safe_float(
+        base_price
+    )
+
+    if (
+        area is None
+        or cost is None
+        or price is None
+    ):
         return []
 
-    if area <= 0 or price < 0:
+    if (
+        area <= 0
+        or cost < 0
+        or price < 0
+    ):
         return []
 
     changes = (
         price_changes
         if price_changes is not None
-        else [-20, -10, 0, 10, 20]
+        else [
+            -20,
+            -10,
+            0,
+            10,
+            20,
+        ]
     )
 
     results = []
 
     for change in changes:
-        try:
-            change_value = float(change)
-        except (TypeError, ValueError):
+
+        change_value = safe_float(
+            change
+        )
+
+        if change_value is None:
             continue
 
         adjusted_price = (
             price
-            * (1 + change_value / 100)
+            * (
+                1
+                + change_value / 100
+            )
         )
 
-        revenue = area * adjusted_price
-        profit = revenue - cost
-        margin = (
-            (profit / revenue) * 100
-            if revenue != 0
-            else None
+        if adjusted_price < 0:
+            continue
+
+        revenue = (
+            area
+            * adjusted_price
         )
+
+        profit = (
+            revenue
+            - cost
+        )
+
+        margin = None
+
+        if revenue > 0:
+            margin = (
+                profit
+                / revenue
+            ) * 100
 
         results.append(
             {
-                "price_change": change_value,
-                "price_per_m2": adjusted_price,
-                "revenue": revenue,
-                "profit": profit,
-                "margin": (
-                    float(margin)
-                    if margin is not None
-                    else 0.0
+                "price_change": float(
+                    change_value
                 ),
+                "price_per_m2": float(
+                    adjusted_price
+                ),
+                "revenue": float(
+                    revenue
+                ),
+                "profit": float(
+                    profit
+                ),
+                "margin": float(
+                    margin
+                )
+                if margin is not None
+                else 0.0,
             }
         )
 
@@ -8736,14 +12827,21 @@ def calculate_project_sensitivity(
 
 def analyze_project_financials(
     project: Dict[str, Any],
-    sale_price_per_m2: Optional[float] = None,
-    investor_share: Optional[float] = None,
+    sale_price_per_m2: Optional[
+        float
+    ] = None,
+    investor_share: Optional[
+        float
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Performs a complete financial analysis
     of a project record.
     """
-    if not project:
+    if not isinstance(
+        project,
+        dict,
+    ):
         return {
             "success": False,
             "error": "Project not found.",
@@ -8755,57 +12853,70 @@ def analyze_project_financials(
     )
 
     saleable_area = safe_float(
-        project.get("saleable_area")
+        project.get(
+            "saleable_area"
+        )
     )
 
     construction_area = safe_float(
-        project.get("construction_area")
+        project.get(
+            "construction_area"
+        )
     )
 
-    land_cost = safe_float(
-        project.get("land_cost")
-    ) or 0.0
+    land_cost = (
+        safe_float(
+            project.get(
+                "land_cost"
+            )
+        )
+        or 0.0
+    )
 
-    construction_cost = safe_float(
-        project.get("construction_cost")
-    ) or 0.0
+    construction_cost = (
+        safe_float(
+            project.get(
+                "construction_cost"
+            )
+        )
+        or 0.0
+    )
 
-    operating_cost = safe_float(
-        project.get("operating_cost")
-    ) or 0.0
+    operating_cost = (
+        safe_float(
+            project.get(
+                "operating_cost"
+            )
+        )
+        or 0.0
+    )
 
-    financing_cost = safe_float(
-        project.get("financing_cost")
-    ) or 0.0
+    financing_cost = (
+        safe_float(
+            project.get(
+                "financing_cost"
+            )
+        )
+        or 0.0
+    )
 
-    other_cost = safe_float(
-        project.get("other_cost")
-    ) or 0.0
+    other_cost = (
+        safe_float(
+            project.get(
+                "other_cost"
+            )
+        )
+        or 0.0
+    )
 
     stored_total_cost = safe_float(
-        project.get("total_cost")
+        project.get(
+            "total_cost"
+        )
     )
 
-    stored_revenue = safe_float(
-        project.get("revenue")
-    )
-
-    stored_expected_revenue = safe_float(
-        project.get("expected_revenue")
-    )
-
-    stored_profit = safe_float(
-        project.get("net_profit")
-    )
-
-    stored_expected_profit = safe_float(
-        project.get("expected_profit")
-    )
-
-    total_cost = (
-        stored_total_cost
-        if stored_total_cost is not None
-        else calculate_total_cost_from_components(
+    calculated_component_total = (
+        calculate_total_cost_from_components(
             land_cost=land_cost,
             construction_cost=construction_cost,
             operating_cost=operating_cost,
@@ -8814,10 +12925,39 @@ def analyze_project_financials(
         )
     )
 
-    revenue = (
-        stored_revenue
-        if stored_revenue is not None
-        else stored_expected_revenue
+    if stored_total_cost is not None:
+        total_cost = max(
+            0.0,
+            stored_total_cost,
+        )
+
+    else:
+        total_cost = (
+            calculated_component_total
+        )
+
+    stored_revenue = safe_float(
+        project.get(
+            "revenue"
+        )
+    )
+
+    stored_expected_revenue = safe_float(
+        project.get(
+            "expected_revenue"
+        )
+    )
+
+    stored_profit = safe_float(
+        project.get(
+            "net_profit"
+        )
+    )
+
+    stored_expected_profit = safe_float(
+        project.get(
+            "expected_profit"
+        )
     )
 
     selected_price = safe_float(
@@ -8826,60 +12966,98 @@ def analyze_project_financials(
 
     if (
         selected_price is not None
+        and selected_price < 0
+    ):
+        selected_price = None
+
+    if (
+        selected_price is not None
         and saleable_area is not None
+        and saleable_area > 0
     ):
         revenue = (
             saleable_area
             * selected_price
         )
 
-    if revenue is None:
+    elif stored_revenue is not None:
+        revenue = max(
+            0.0,
+            stored_revenue,
+        )
+
+    elif stored_expected_revenue is not None:
+        revenue = max(
+            0.0,
+            stored_expected_revenue,
+        )
+
+    else:
         revenue = 0.0
 
     calculated_profit = (
-        revenue - total_cost
+        revenue
+        - total_cost
     )
 
-    profit = (
-        stored_profit
-        if (
-            stored_profit is not None
-            and sale_price_per_m2 is None
-        )
-        else calculated_profit
-    )
+    if (
+        selected_price is None
+        and stored_profit is not None
+    ):
+        profit = stored_profit
+
+    else:
+        profit = calculated_profit
 
     margin = calculate_profit_margin(
         revenue,
         profit,
     )
 
-    investor_share_value = safe_float(
-        investor_share
-    )
+    investor_share_value = None
+
+    if investor_share is not None:
+        investor_share_value = _safe_percentage(
+            investor_share
+        )
 
     if investor_share_value is None:
-        investor_share_value = safe_float(
-            project.get("investor_share")
+        investor_share_value = _safe_percentage(
+            project.get(
+                "investor_share"
+            )
         )
 
     investor_profit = None
     operator_profit = None
 
     if investor_share_value is not None:
-        investor_profit = calculate_investor_profit(
-            profit,
-            investor_share_value,
+
+        investor_profit = (
+            calculate_investor_profit(
+                profit,
+                investor_share_value,
+            )
         )
 
-        operator_profit = calculate_operator_profit(
-            profit,
-            investor_share_value,
+        operator_profit = (
+            calculate_operator_profit(
+                profit,
+                investor_share_value,
+            )
         )
 
     investor_capital = safe_float(
-        project.get("investor_capital")
+        project.get(
+            "investor_capital"
+        )
     )
+
+    if (
+        investor_capital is not None
+        and investor_capital <= 0
+    ):
+        investor_capital = None
 
     investor_roi = None
 
@@ -8894,10 +13072,15 @@ def analyze_project_financials(
 
     break_even_price = None
 
-    if saleable_area is not None:
-        break_even_price = calculate_break_even_price(
-            total_cost,
-            saleable_area,
+    if (
+        saleable_area is not None
+        and saleable_area > 0
+    ):
+        break_even_price = (
+            calculate_break_even_price(
+                total_cost,
+                saleable_area,
+            )
         )
 
     construction_cost_per_m2 = None
@@ -8905,6 +13088,7 @@ def analyze_project_financials(
     if (
         construction_area is not None
         and construction_area > 0
+        and construction_cost >= 0
     ):
         construction_cost_per_m2 = (
             construction_cost
@@ -8916,6 +13100,7 @@ def analyze_project_financials(
     if (
         saleable_area is not None
         and saleable_area > 0
+        and revenue >= 0
     ):
         revenue_per_saleable_m2 = (
             revenue
@@ -8926,17 +13111,22 @@ def analyze_project_financials(
 
     if (
         saleable_area is not None
+        and saleable_area > 0
         and selected_price is not None
     ):
-        sensitivity = calculate_project_sensitivity(
-            saleable_area=saleable_area,
-            total_cost=total_cost,
-            base_price=selected_price,
+        sensitivity = (
+            calculate_project_sensitivity(
+                saleable_area=saleable_area,
+                total_cost=total_cost,
+                base_price=selected_price,
+            )
         )
 
     return {
         "success": True,
-        "project_name": project_name,
+        "project_name": str(
+            project_name
+        ),
         "saleable_area": saleable_area,
         "construction_area": construction_area,
         "land_cost": land_cost,
@@ -8944,6 +13134,9 @@ def analyze_project_financials(
         "operating_cost": operating_cost,
         "financing_cost": financing_cost,
         "other_cost": other_cost,
+        "component_total_cost": (
+            calculated_component_total
+        ),
         "total_cost": total_cost,
         "revenue": revenue,
         "profit": profit,
@@ -8956,14 +13149,18 @@ def analyze_project_financials(
             construction_cost_per_m2
         ),
         "break_even_price": break_even_price,
-        "investor_share": investor_share_value,
+        "investor_share": (
+            investor_share_value
+        ),
         "investor_capital": investor_capital,
         "investor_profit": investor_profit,
         "investor_roi": investor_roi,
         "operator_profit": operator_profit,
+        "stored_revenue": stored_revenue,
         "stored_expected_revenue": (
             stored_expected_revenue
         ),
+        "stored_profit": stored_profit,
         "stored_expected_profit": (
             stored_expected_profit
         ),
@@ -8978,54 +13175,81 @@ def financial_analysis_text(
     Converts financial analysis into
     a readable Telegram response.
     """
-    if not analysis:
+    if not isinstance(
+        analysis,
+        dict,
+    ):
         return (
-            "❌ ფინანსური ანალიზი ვერ შესრულდა."
+            "❌ ფინანსური ანალიზი "
+            "ვერ შესრულდა."
         )
 
-    if not analysis.get("success"):
+    if not analysis.get(
+        "success"
+    ):
         return (
-            "❌ ფინანსური ანალიზი ვერ შესრულდა.\n"
+            "❌ ფინანსური ანალიზი "
+            "ვერ შესრულდა.\n"
             f"{analysis.get('error', '')}"
         )
 
     project_name = (
-        analysis.get("project_name")
+        analysis.get(
+            "project_name"
+        )
         or "პროექტი"
     )
 
     total_cost = analysis.get(
         "total_cost"
     )
+
     revenue = analysis.get(
         "revenue"
     )
+
     profit = analysis.get(
         "profit"
     )
+
     margin = analysis.get(
         "margin"
     )
+
     break_even_price = analysis.get(
         "break_even_price"
     )
-    construction_cost_per_m2 = analysis.get(
-        "construction_cost_per_m2"
+
+    construction_cost_per_m2 = (
+        analysis.get(
+            "construction_cost_per_m2"
+        )
     )
-    sale_price_per_m2 = analysis.get(
-        "sale_price_per_m2"
+
+    sale_price_per_m2 = (
+        analysis.get(
+            "sale_price_per_m2"
+        )
     )
+
     investor_share = analysis.get(
         "investor_share"
     )
+
     investor_capital = analysis.get(
         "investor_capital"
     )
+
     investor_profit = analysis.get(
         "investor_profit"
     )
+
     investor_roi = analysis.get(
         "investor_roi"
+    )
+
+    operator_profit = analysis.get(
+        "operator_profit"
     )
 
     lines = [
@@ -9034,35 +13258,44 @@ def financial_analysis_text(
         f"🏗️ პროექტი: {project_name}",
         "",
         "💰 ძირითადი მაჩვენებლები:",
-        f"• ჯამური ღირებულება: "
-        f"{format_money(total_cost)}",
-        f"• შემოსავალი: "
-        f"{format_money(revenue)}",
-        f"• წმინდა მოგება: "
-        f"{format_money(profit)}",
+        (
+            "• ჯამური ღირებულება: "
+            f"{format_money(total_cost)}"
+        ),
+        (
+            "• შემოსავალი: "
+            f"{format_money(revenue)}"
+        ),
+        (
+            "• წმინდა მოგება: "
+            f"{format_money(profit)}"
+        ),
     ]
 
     if margin is not None:
         lines.append(
-            f"• მოგების მარჟა: "
+            "• მოგების მარჟა: "
             f"{format_number(margin)}%"
         )
 
     if sale_price_per_m2 is not None:
         lines.append(
-            f"• გაყიდვის ფასი: "
+            "• გაყიდვის ფასი: "
             f"{format_money(sale_price_per_m2)}/მ²"
         )
 
     if break_even_price is not None:
         lines.append(
-            f"• Break-even ფასი: "
+            "• Break-even ფასი: "
             f"{format_money(break_even_price)}/მ²"
         )
 
-    if construction_cost_per_m2 is not None:
+    if (
+        construction_cost_per_m2
+        is not None
+    ):
         lines.append(
-            f"• მშენებლობის ღირებულება: "
+            "• მშენებლობის ღირებულება: "
             f"{format_money(construction_cost_per_m2)}/მ²"
         )
 
@@ -9070,29 +13303,39 @@ def financial_analysis_text(
         lines.extend([
             "",
             "👤 ინვესტორი:",
-            f"• წილი: "
-            f"{format_number(investor_share)}%",
+            (
+                "• წილი: "
+                f"{format_number(investor_share)}%"
+            ),
         ])
 
     if investor_capital is not None:
         lines.append(
-            f"• ინვესტირებული კაპიტალი: "
+            "• ინვესტირებული კაპიტალი: "
             f"{format_money(investor_capital)}"
         )
 
     if investor_profit is not None:
         lines.append(
-            f"• ინვესტორის მოგება: "
+            "• ინვესტორის მოგება: "
             f"{format_money(investor_profit)}"
         )
 
     if investor_roi is not None:
         lines.append(
-            f"• ინვესტორის ROI: "
+            "• ინვესტორის ROI: "
             f"{format_number(investor_roi)}%"
         )
 
-    return "\n".join(lines)
+    if operator_profit is not None:
+        lines.append(
+            "• ოპერატორის/კომპანიის მოგება: "
+            f"{format_money(operator_profit)}"
+        )
+
+    return "\n".join(
+        lines
+    )
 
 
 def save_financial_analysis(
@@ -9104,7 +13347,10 @@ def save_financial_analysis(
     """
     Saves financial analysis to database.
     """
-    if not analysis:
+    if not isinstance(
+        analysis,
+        dict,
+    ):
         return None
 
     project_id_value = None
@@ -9114,8 +13360,23 @@ def save_financial_analysis(
             project_id_value = int(
                 project_id
             )
-        except Exception:
+
+            if project_id_value <= 0:
+                project_id_value = None
+
+        except (
+            TypeError,
+            ValueError,
+        ):
             project_id_value = None
+
+    analysis_type_value = str(
+        analysis_type
+        or "project"
+    ).strip()
+
+    if not analysis_type_value:
+        analysis_type_value = "project"
 
     input_data = {
         "project_name": analysis.get(
@@ -9135,6 +13396,9 @@ def save_financial_analysis(
         ),
         "investor_capital": analysis.get(
             "investor_capital"
+        ),
+        "total_cost": analysis.get(
+            "total_cost"
         ),
     }
 
@@ -9158,7 +13422,7 @@ def save_financial_analysis(
             (
                 str(chat_id),
                 project_id_value,
-                str(analysis_type),
+                analysis_type_value,
                 json.dumps(
                     input_data,
                     ensure_ascii=False,
@@ -9175,7 +13439,16 @@ def save_financial_analysis(
         )
 
         if result:
-            return int(result["id"])
+            try:
+                return int(
+                    result["id"]
+                )
+            except (
+                TypeError,
+                ValueError,
+                KeyError,
+            ):
+                return None
 
     except Exception as exc:
         logger.error(
@@ -9189,16 +13462,40 @@ def save_financial_analysis(
 def run_project_financial_analysis(
     chat_id: Any,
     project_id: int,
-    sale_price_per_m2: Optional[float] = None,
-    investor_share: Optional[float] = None,
+    sale_price_per_m2: Optional[
+        float
+    ] = None,
+    investor_share: Optional[
+        float
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Loads a project, performs financial analysis,
     and saves the result.
     """
+    try:
+        safe_project_id = int(
+            project_id
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return {
+            "success": False,
+            "error": "Invalid project ID.",
+        }
+
+    if safe_project_id <= 0:
+        return {
+            "success": False,
+            "error": "Invalid project ID.",
+        }
+
     project = get_project(
         chat_id,
-        project_id,
+        safe_project_id,
     )
 
     if not project:
@@ -9213,22 +13510,252 @@ def run_project_financial_analysis(
         investor_share=investor_share,
     )
 
-    if analysis.get("success"):
-        save_financial_analysis(
+    if analysis.get(
+        "success"
+    ):
+        analysis_id = save_financial_analysis(
             chat_id=chat_id,
-            project_id=project_id,
+            project_id=safe_project_id,
             analysis=analysis,
             analysis_type="project",
+        )
+
+        analysis["analysis_id"] = (
+            analysis_id
         )
 
     return analysis
 
 
-print("GENIOSA 4.0 — PART 9/12 LOADED")# ============================================================
+print(
+    "GENIOSA 4.0 — PART 9/12 LOADED"
+)
+# ============================================================
 # GENIOSA 4.0 — PART 10/12
 # File generation: Excel, PowerPoint and asset management
 # ============================================================
 
+
+# ------------------------------------------------------------
+# PART 10 — SAFE CONFIGURATION
+# ------------------------------------------------------------
+
+MAX_GENERATED_ASSETS = int(
+    globals().get(
+        "MAX_GENERATED_ASSETS",
+        100,
+    )
+)
+
+MAX_GENERATED_ASSETS = max(
+    1,
+    min(
+        MAX_GENERATED_ASSETS,
+        1000,
+    ),
+)
+
+
+# PART 1 defines GENERATED_DIR.
+# Keep GENERATION_DIR as a compatibility alias because
+# older parts may still reference this name.
+GENERATED_DIR = Path(
+    globals().get(
+        "GENERATED_DIR",
+        Path(
+            globals().get(
+                "BASE_DIR",
+                Path.cwd(),
+            )
+        ) / "generated",
+    )
+)
+
+GENERATED_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+GENERATION_DIR = GENERATED_DIR
+
+
+# ------------------------------------------------------------
+# OPTIONAL LIBRARY CHECKS
+# ------------------------------------------------------------
+
+WORKBOOK_CLASS = globals().get(
+    "Workbook"
+)
+
+PRESENTATION_CLASS = globals().get(
+    "Presentation"
+)
+
+
+# ------------------------------------------------------------
+# INTERNAL HELPERS
+# ------------------------------------------------------------
+
+def _safe_generated_project_name(
+    project_name: Any,
+) -> str:
+    """
+    Creates a filesystem-safe project name.
+    """
+
+    name = str(
+        project_name
+        or "project"
+    ).strip()
+
+    # Replace whitespace with underscores.
+    name = re.sub(
+        r"\s+",
+        "_",
+        name,
+    )
+
+    # Keep Unicode letters where possible,
+    # but remove filesystem-dangerous characters.
+    name = re.sub(
+        r'[\\/:*?"<>|]+',
+        "_",
+        name,
+    )
+
+    name = re.sub(
+        r"[^0-9A-Za-z_\-\u0080-\uFFFF]+",
+        "_",
+        name,
+    )
+
+    name = re.sub(
+        r"_+",
+        "_",
+        name,
+    ).strip(
+        "._-"
+    )
+
+    if not name:
+        name = "project"
+
+    return name[:120]
+
+
+def _generated_timestamp() -> str:
+    """
+    Returns a high-resolution timestamp string
+    suitable for generated filenames.
+    """
+
+    return str(
+        int(
+            time.time() * 1000
+        )
+    )
+
+
+def _ensure_generated_directory() -> Path:
+    """
+    Ensures the generated assets directory exists.
+    """
+
+    directory = Path(
+        globals().get(
+            "GENERATED_DIR",
+            Path.cwd() / "generated",
+        )
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return directory
+
+
+def _set_cell_bold(
+    cell: Any,
+    size: Optional[int] = None,
+) -> None:
+    """
+    Safely applies bold formatting to an openpyxl cell.
+
+    Avoids the deprecated Font.copy() method.
+    """
+
+    try:
+        from copy import copy
+
+        font = copy(
+            cell.font
+        )
+
+        font.bold = True
+
+        if size is not None:
+            font.sz = size
+
+        cell.font = font
+
+    except Exception:
+        # Formatting failure must never crash
+        # file generation.
+        pass
+
+
+def _excel_number_format(
+    cell: Any,
+) -> None:
+    """
+    Applies a standard numeric format.
+    """
+
+    try:
+        if isinstance(
+            cell.value,
+            (int, float),
+        ) and not isinstance(
+            cell.value,
+            bool,
+        ):
+            cell.number_format = "#,##0.00"
+
+    except Exception:
+        pass
+
+
+def _validate_generated_file(
+    filepath: Optional[str],
+) -> bool:
+    """
+    Confirms that a generated file exists
+    and has non-zero size.
+    """
+
+    if not filepath:
+        return False
+
+    try:
+        path = Path(
+            filepath
+        )
+
+        return (
+            path.exists()
+            and path.is_file()
+            and path.stat().st_size > 0
+        )
+
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------
+# NUMBER / MONEY FORMATTING
+# ------------------------------------------------------------
 
 def format_number(
     value: Any,
@@ -9237,20 +13764,41 @@ def format_number(
     """
     Formats a numeric value for human-readable output.
     """
-    number = safe_float(value)
+
+    number = safe_float(
+        value
+    )
 
     if number is None:
         return "0"
 
-    if decimals < 0:
-        decimals = 0
+    try:
+        decimals = int(
+            decimals
+        )
+    except Exception:
+        decimals = 2
+
+    decimals = max(
+        0,
+        min(
+            decimals,
+            8,
+        ),
+    )
 
     if decimals == 0:
         return f"{number:,.0f}"
 
-    formatted = f"{number:,.{decimals}f}"
+    formatted = (
+        f"{number:,.{decimals}f}"
+    )
 
-    formatted = formatted.rstrip("0").rstrip(".")
+    formatted = (
+        formatted
+        .rstrip("0")
+        .rstrip(".")
+    )
 
     return formatted
 
@@ -9263,16 +13811,25 @@ def format_money(
     """
     Formats money values.
     """
-    number = safe_float(value)
+
+    number = safe_float(
+        value
+    )
 
     if number is None:
-        return f"{currency}0"
+        return (
+            f"{currency}0"
+        )
 
     return (
         f"{currency}"
         f"{format_number(number, decimals)}"
     )
 
+
+# ------------------------------------------------------------
+# GENERATED ASSET DATABASE MANAGEMENT
+# ------------------------------------------------------------
 
 def generated_asset_save(
     chat_id: Any,
@@ -9284,15 +13841,29 @@ def generated_asset_save(
     """
     Saves generated file metadata into database.
     """
+
+    if chat_id is None:
+        return None
+
     safe_filename = Path(
-        str(filename or "generated_file")
+        str(
+            filename
+            or "generated_file"
+        )
     ).name
+
+    if not safe_filename:
+        safe_filename = (
+            "generated_file"
+        )
 
     project_id_value = None
 
     if project_id is not None:
         try:
-            project_id_value = int(project_id)
+            project_id_value = int(
+                project_id
+            )
         except Exception:
             project_id_value = None
 
@@ -9314,16 +13885,32 @@ def generated_asset_save(
             (
                 str(chat_id),
                 project_id_value,
-                str(asset_type or "file"),
-                safe_filename,
-                str(description or ""),
+                str(
+                    asset_type
+                    or "file"
+                )[:50],
+                safe_filename[:255],
+                str(
+                    description
+                    or ""
+                )[:2000],
             ),
             fetchone=True,
             commit=True,
         )
 
         if result:
-            return int(result["id"])
+            try:
+                return int(
+                    result["id"]
+                )
+            except Exception:
+                try:
+                    return int(
+                        result[0]
+                    )
+                except Exception:
+                    pass
 
     except Exception as exc:
         logger.error(
@@ -9341,6 +13928,10 @@ def get_generated_assets(
     """
     Returns generated files for a chat.
     """
+
+    if chat_id is None:
+        return []
+
     try:
         safe_limit = max(
             1,
@@ -9350,6 +13941,12 @@ def get_generated_assets(
             ),
         )
 
+    except Exception:
+        safe_limit = (
+            MAX_GENERATED_ASSETS
+        )
+
+    try:
         rows = db_execute(
             f"""
             SELECT
@@ -9365,7 +13962,9 @@ def get_generated_assets(
                 g.id DESC
             LIMIT {safe_limit}
             """,
-            (str(chat_id),),
+            (
+                str(chat_id),
+            ),
             fetchall=True,
         )
 
@@ -9376,6 +13975,7 @@ def get_generated_assets(
             "Failed to get generated assets: %s",
             exc,
         )
+
         return []
 
 
@@ -9385,6 +13985,7 @@ def generated_assets_summary(
     """
     Creates a readable list of generated files.
     """
+
     assets = get_generated_assets(
         chat_id,
         limit=MAX_GENERATED_ASSETS,
@@ -9402,15 +14003,20 @@ def generated_assets_summary(
     ]
 
     for asset in assets:
-        asset_id = asset.get("id")
+        asset_id = asset.get(
+            "id"
+        )
+
         filename = (
             asset.get("filename")
             or "უცნობი ფაილი"
         )
+
         asset_type = (
             asset.get("asset_type")
             or "file"
         )
+
         project_name = (
             asset.get("project_name")
             or "პროექტთან მიბმული არაა"
@@ -9419,16 +14025,25 @@ def generated_assets_summary(
         lines.append(
             f"#{asset_id} — {filename}"
         )
+
         lines.append(
             f"📁 ტიპი: {asset_type}"
         )
+
         lines.append(
             f"🏗️ პროექტი: {project_name}"
         )
+
         lines.append("")
 
-    return "\n".join(lines).strip()
+    return "\n".join(
+        lines
+    ).strip()
 
+
+# ------------------------------------------------------------
+# EXCEL GENERATION
+# ------------------------------------------------------------
 
 def generate_project_excel(
     project: Dict[str, Any],
@@ -9437,315 +14052,498 @@ def generate_project_excel(
     """
     Generates a professional project financial Excel file.
     """
+
     if not project:
         return None
 
-    project_id = project.get("id")
+    if WORKBOOK_CLASS is None:
+        logger.error(
+            "openpyxl Workbook is not available."
+        )
+        return None
+
+    project_id = project.get(
+        "id"
+    )
 
     project_name = (
         project.get("name")
         or "Geniosa Project"
     )
 
-    safe_project_name = re.sub(
-        r"[^A-Za-z0-9_-]+",
-        "_",
-        str(project_name),
-    ).strip("_")
-
-    if not safe_project_name:
-        safe_project_name = "project"
-
-    timestamp = int(
-        time.time()
+    safe_project_name = (
+        _safe_generated_project_name(
+            project_name
+        )
     )
 
     filename = (
-        f"Geniosa_Project_"
+        "Geniosa_Project_"
         f"{safe_project_name}_"
-        f"{timestamp}.xlsx"
+        f"{_generated_timestamp()}.xlsx"
     )
 
     filepath = (
-        GENERATION_DIR
+        _ensure_generated_directory()
         / filename
     )
 
     if analysis is None:
-        analysis = analyze_project_financials(
-            project
+        analysis = (
+            analyze_project_financials(
+                project
+            )
+            or {}
         )
 
-    workbook = Workbook()
-
-    summary_sheet = workbook.active
-    summary_sheet.title = "Summary"
-
-    summary_rows = [
-        ["GENIOSA 4.0 — PROJECT FINANCIAL MODEL"],
-        [],
-        ["Project", project_name],
-        ["Project ID", project_id],
-        ["Industry", project.get("industry") or ""],
-        ["Location", project.get("location") or ""],
-        [],
-        ["AREA & DEVELOPMENT"],
-        [
-            "Land Area (m²)",
-            project.get("land_area"),
-        ],
-        [
-            "Saleable Area (m²)",
-            project.get("saleable_area"),
-        ],
-        [
-            "Construction Area (m²)",
-            project.get("construction_area"),
-        ],
-        [
-            "Total Area (m²)",
-            project.get("total_area"),
-        ],
-        [],
-        ["COST STRUCTURE"],
-        [
-            "Land Cost",
-            project.get("land_cost"),
-        ],
-        [
-            "Construction Cost",
-            project.get("construction_cost"),
-        ],
-        [
-            "Operating Cost",
-            project.get("operating_cost"),
-        ],
-        [
-            "Financing Cost",
-            project.get("financing_cost"),
-        ],
-        [
-            "Other Cost",
-            project.get("other_cost"),
-        ],
-        [
-            "Total Cost",
-            analysis.get("total_cost"),
-        ],
-        [],
-        ["REVENUE & PROFIT"],
-        [
-            "Revenue",
-            analysis.get("revenue"),
-        ],
-        [
-            "Net Profit",
-            analysis.get("profit"),
-        ],
-        [
-            "Profit Margin (%)",
-            analysis.get("margin"),
-        ],
-        [
-            "Break-even Price / m²",
-            analysis.get("break_even_price"),
-        ],
-        [],
-        ["INVESTOR"],
-        [
-            "Investor Capital",
-            analysis.get("investor_capital"),
-        ],
-        [
-            "Investor Share (%)",
-            analysis.get("investor_share"),
-        ],
-        [
-            "Investor Profit",
-            analysis.get("investor_profit"),
-        ],
-        [
-            "Investor ROI (%)",
-            analysis.get("investor_roi"),
-        ],
-    ]
-
-    for row in summary_rows:
-        summary_sheet.append(row)
-
-    summary_sheet.column_dimensions[
-        "A"
-    ].width = 32
-
-    summary_sheet.column_dimensions[
-        "B"
-    ].width = 28
-
-    for cell in summary_sheet[1]:
-        cell.font = cell.font.copy(
-            bold=True,
-            size=14,
+    try:
+        workbook = (
+            WORKBOOK_CLASS()
         )
 
-    for row_number in range(
-        1,
-        summary_sheet.max_row + 1,
-    ):
-        first_cell = summary_sheet.cell(
-            row=row_number,
-            column=1,
+        summary_sheet = (
+            workbook.active
         )
 
-        if first_cell.value in {
+        summary_sheet.title = (
+            "Summary"
+        )
+
+        summary_rows = [
+            [
+                "GENIOSA 4.0 — PROJECT FINANCIAL MODEL"
+            ],
+            [],
+            [
+                "Project",
+                project_name,
+            ],
+            [
+                "Project ID",
+                project_id,
+            ],
+            [
+                "Industry",
+                project.get(
+                    "industry"
+                ) or "",
+            ],
+            [
+                "Location",
+                project.get(
+                    "location"
+                ) or "",
+            ],
+            [],
+            [
+                "AREA & DEVELOPMENT"
+            ],
+            [
+                "Land Area (m²)",
+                project.get(
+                    "land_area"
+                ),
+            ],
+            [
+                "Saleable Area (m²)",
+                project.get(
+                    "saleable_area"
+                ),
+            ],
+            [
+                "Construction Area (m²)",
+                project.get(
+                    "construction_area"
+                ),
+            ],
+            [
+                "Total Area (m²)",
+                project.get(
+                    "total_area"
+                ),
+            ],
+            [],
+            [
+                "COST STRUCTURE"
+            ],
+            [
+                "Land Cost",
+                project.get(
+                    "land_cost"
+                ),
+            ],
+            [
+                "Construction Cost",
+                project.get(
+                    "construction_cost"
+                ),
+            ],
+            [
+                "Operating Cost",
+                project.get(
+                    "operating_cost"
+                ),
+            ],
+            [
+                "Financing Cost",
+                project.get(
+                    "financing_cost"
+                ),
+            ],
+            [
+                "Other Cost",
+                project.get(
+                    "other_cost"
+                ),
+            ],
+            [
+                "Total Cost",
+                analysis.get(
+                    "total_cost"
+                ),
+            ],
+            [],
+            [
+                "REVENUE & PROFIT"
+            ],
+            [
+                "Revenue",
+                analysis.get(
+                    "revenue"
+                ),
+            ],
+            [
+                "Net Profit",
+                analysis.get(
+                    "profit"
+                ),
+            ],
+            [
+                "Profit Margin (%)",
+                analysis.get(
+                    "margin"
+                ),
+            ],
+            [
+                "Break-even Price / m²",
+                analysis.get(
+                    "break_even_price"
+                ),
+            ],
+            [],
+            [
+                "INVESTOR"
+            ],
+            [
+                "Investor Capital",
+                analysis.get(
+                    "investor_capital"
+                ),
+            ],
+            [
+                "Investor Share (%)",
+                analysis.get(
+                    "investor_share"
+                ),
+            ],
+            [
+                "Investor Profit",
+                analysis.get(
+                    "investor_profit"
+                ),
+            ],
+            [
+                "Investor ROI (%)",
+                analysis.get(
+                    "investor_roi"
+                ),
+            ],
+        ]
+
+        for row in summary_rows:
+            summary_sheet.append(
+                row
+            )
+
+        summary_sheet.column_dimensions[
+            "A"
+        ].width = 34
+
+        summary_sheet.column_dimensions[
+            "B"
+        ].width = 30
+
+        # Main title.
+        if summary_sheet.max_row >= 1:
+            for cell in (
+                summary_sheet[1]
+            ):
+                _set_cell_bold(
+                    cell,
+                    size=14,
+                )
+
+        section_titles = {
             "AREA & DEVELOPMENT",
             "COST STRUCTURE",
             "REVENUE & PROFIT",
             "INVESTOR",
-        }:
-            first_cell.font = first_cell.font.copy(
-                bold=True
+        }
+
+        for row_number in range(
+            1,
+            summary_sheet.max_row + 1,
+        ):
+            first_cell = (
+                summary_sheet.cell(
+                    row=row_number,
+                    column=1,
+                )
             )
 
-    for row_number in range(
-        1,
-        summary_sheet.max_row + 1,
-    ):
-        value_cell = summary_sheet.cell(
-            row=row_number,
-            column=2,
+            if first_cell.value in (
+                section_titles
+            ):
+                _set_cell_bold(
+                    first_cell
+                )
+
+        for row_number in range(
+            1,
+            summary_sheet.max_row + 1,
+        ):
+            value_cell = (
+                summary_sheet.cell(
+                    row=row_number,
+                    column=2,
+                )
+            )
+
+            _excel_number_format(
+                value_cell
+            )
+
+        # Freeze top row.
+        summary_sheet.freeze_panes = (
+            "A2"
         )
 
-        if isinstance(
-            value_cell.value,
-            (int, float),
-        ):
-            value_cell.number_format = (
-                '#,##0.00'
+        # ----------------------------------------------------
+        # SENSITIVITY SHEET
+        # ----------------------------------------------------
+
+        sensitivity_sheet = (
+            workbook.create_sheet(
+                "Sensitivity"
             )
+        )
 
-    sensitivity_sheet = workbook.create_sheet(
-        "Sensitivity"
-    )
-
-    sensitivity_sheet.append([
-        "Price Change (%)",
-        "Price / m²",
-        "Revenue",
-        "Profit",
-        "Margin (%)",
-    ])
-
-    sensitivity = analysis.get(
-        "sensitivity"
-    ) or []
-
-    for item in sensitivity:
         sensitivity_sheet.append([
-            item.get("price_change"),
-            item.get("price_per_m2"),
-            item.get("revenue"),
-            item.get("profit"),
-            item.get("margin"),
+            "Price Change (%)",
+            "Price / m²",
+            "Revenue",
+            "Profit",
+            "Margin (%)",
         ])
 
-    sensitivity_sheet.column_dimensions[
-        "A"
-    ].width = 20
+        sensitivity = (
+            analysis.get(
+                "sensitivity"
+            )
+            or []
+        )
 
-    sensitivity_sheet.column_dimensions[
-        "B"
-    ].width = 20
+        for item in sensitivity:
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
 
-    sensitivity_sheet.column_dimensions[
-        "C"
-    ].width = 20
+            sensitivity_sheet.append([
+                item.get(
+                    "price_change"
+                ),
+                item.get(
+                    "price_per_m2"
+                ),
+                item.get(
+                    "revenue"
+                ),
+                item.get(
+                    "profit"
+                ),
+                item.get(
+                    "margin"
+                ),
+            ])
 
-    sensitivity_sheet.column_dimensions[
-        "D"
-    ].width = 20
+        for column in (
+            "A",
+            "B",
+            "C",
+            "D",
+            "E",
+        ):
+            sensitivity_sheet.column_dimensions[
+                column
+            ].width = 20
 
-    sensitivity_sheet.column_dimensions[
-        "E"
-    ].width = 18
+        for cell in (
+            sensitivity_sheet[1]
+        ):
+            _set_cell_bold(
+                cell
+            )
 
-    assumptions_sheet = workbook.create_sheet(
-        "Assumptions"
-    )
+        for row in sensitivity_sheet.iter_rows(
+            min_row=2,
+        ):
+            for cell in row:
+                _excel_number_format(
+                    cell
+                )
 
-    assumptions = [
-        ["GENIOSA — ASSUMPTIONS"],
-        [],
-        [
-            "Field",
-            "Value",
-        ],
-        [
-            "Project Status",
-            project.get("status") or "",
-        ],
-        [
-            "Expected Revenue",
-            project.get(
-                "expected_revenue"
-            ),
-        ],
-        [
-            "Expected Profit",
-            project.get(
-                "expected_profit"
-            ),
-        ],
-        [
-            "Investor Capital",
-            project.get(
-                "investor_capital"
-            ),
-        ],
-        [
-            "Investor Profit",
-            project.get(
-                "investor_profit"
-            ),
-        ],
-        [
-            "Investor Share (%)",
-            project.get(
-                "investor_share"
-            ),
-        ],
-        [
-            "Notes",
-            project.get("notes") or "",
-        ],
-    ]
+        sensitivity_sheet.freeze_panes = (
+            "A2"
+        )
 
-    for row in assumptions:
-        assumptions_sheet.append(row)
+        # ----------------------------------------------------
+        # ASSUMPTIONS SHEET
+        # ----------------------------------------------------
 
-    assumptions_sheet.column_dimensions[
-        "A"
-    ].width = 30
+        assumptions_sheet = (
+            workbook.create_sheet(
+                "Assumptions"
+            )
+        )
 
-    assumptions_sheet.column_dimensions[
-        "B"
-    ].width = 70
+        assumptions = [
+            [
+                "GENIOSA — ASSUMPTIONS"
+            ],
+            [],
+            [
+                "Field",
+                "Value",
+            ],
+            [
+                "Project Status",
+                project.get(
+                    "status"
+                ) or "",
+            ],
+            [
+                "Expected Revenue",
+                project.get(
+                    "expected_revenue"
+                ),
+            ],
+            [
+                "Expected Profit",
+                project.get(
+                    "expected_profit"
+                ),
+            ],
+            [
+                "Investor Capital",
+                project.get(
+                    "investor_capital"
+                ),
+            ],
+            [
+                "Investor Profit",
+                project.get(
+                    "investor_profit"
+                ),
+            ],
+            [
+                "Investor Share (%)",
+                project.get(
+                    "investor_share"
+                ),
+            ],
+            [
+                "Notes",
+                project.get(
+                    "notes"
+                ) or "",
+            ],
+        ]
 
-    try:
+        for row in assumptions:
+            assumptions_sheet.append(
+                row
+            )
+
+        assumptions_sheet.column_dimensions[
+            "A"
+        ].width = 32
+
+        assumptions_sheet.column_dimensions[
+            "B"
+        ].width = 70
+
+        _set_cell_bold(
+            assumptions_sheet["A1"],
+            size=14,
+        )
+
+        _set_cell_bold(
+            assumptions_sheet["A3"]
+        )
+
+        for row_number in range(
+            4,
+            assumptions_sheet.max_row + 1,
+        ):
+            _excel_number_format(
+                assumptions_sheet.cell(
+                    row=row_number,
+                    column=2,
+                )
+            )
+
+        assumptions_sheet.freeze_panes = (
+            "A4"
+        )
+
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
+
         workbook.save(
             str(filepath)
         )
+
     except Exception as exc:
         logger.error(
-            "Failed to save Excel file: %s",
+            "Failed to generate Excel file: %s",
             exc,
+            exc_info=True,
         )
+
+        try:
+            if filepath.exists():
+                filepath.unlink()
+        except Exception:
+            pass
+
         return None
 
-    if not filepath.exists():
+    if not _validate_generated_file(
+        str(filepath)
+    ):
         return None
 
-    return str(filepath)
+    return str(
+        filepath
+    )
 
+
+# ------------------------------------------------------------
+# POWERPOINT GENERATION
+# ------------------------------------------------------------
 
 def generate_project_presentation(
     project: Dict[str, Any],
@@ -9754,186 +14552,288 @@ def generate_project_presentation(
     """
     Generates a PowerPoint investor presentation.
     """
+
     if not project:
         return None
 
-    project_id = project.get("id")
+    if PRESENTATION_CLASS is None:
+        logger.error(
+            "python-pptx Presentation is not available."
+        )
+        return None
+
+    project_id = project.get(
+        "id"
+    )
 
     project_name = (
         project.get("name")
         or "Geniosa Project"
     )
 
-    safe_project_name = re.sub(
-        r"[^A-Za-z0-9_-]+",
-        "_",
-        str(project_name),
-    ).strip("_")
-
-    if not safe_project_name:
-        safe_project_name = "project"
-
-    timestamp = int(
-        time.time()
+    safe_project_name = (
+        _safe_generated_project_name(
+            project_name
+        )
     )
 
     filename = (
-        f"Geniosa_Investor_"
+        "Geniosa_Investor_"
         f"{safe_project_name}_"
-        f"{timestamp}.pptx"
+        f"{_generated_timestamp()}.pptx"
     )
 
     filepath = (
-        GENERATION_DIR
+        _ensure_generated_directory()
         / filename
     )
 
     if analysis is None:
-        analysis = analyze_project_financials(
-            project
+        analysis = (
+            analyze_project_financials(
+                project
+            )
+            or {}
         )
 
-    presentation = Presentation()
-
-    title_slide = presentation.slides.add_slide(
-        presentation.slide_layouts[0]
-    )
-
-    title_slide.shapes.title.text = (
-        f"{project_name}"
-    )
-
-    subtitle = title_slide.placeholders[1]
-
-    subtitle.text = (
-        "GENIOSA 4.0\n"
-        "Investor Presentation"
-    )
-
-    slide = presentation.slides.add_slide(
-        presentation.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = (
-        "Project Overview"
-    )
-
-    overview_text = (
-        f"Industry: "
-        f"{project.get('industry') or 'N/A'}\n"
-        f"Location: "
-        f"{project.get('location') or 'N/A'}\n"
-        f"Land Area: "
-        f"{format_number(project.get('land_area'))} m²\n"
-        f"Saleable Area: "
-        f"{format_number(project.get('saleable_area'))} m²\n"
-        f"Construction Area: "
-        f"{format_number(project.get('construction_area'))} m²\n"
-        f"Total Area: "
-        f"{format_number(project.get('total_area'))} m²"
-    )
-
-    slide.placeholders[1].text = overview_text
-
-    slide = presentation.slides.add_slide(
-        presentation.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = (
-        "Financial Overview"
-    )
-
-    financial_text = (
-        f"Total Cost: "
-        f"{format_money(analysis.get('total_cost'))}\n"
-        f"Revenue: "
-        f"{format_money(analysis.get('revenue'))}\n"
-        f"Net Profit: "
-        f"{format_money(analysis.get('profit'))}\n"
-        f"Profit Margin: "
-        f"{format_number(analysis.get('margin'))}%\n"
-        f"Break-even Price: "
-        f"{format_money(analysis.get('break_even_price'))}/m²"
-    )
-
-    slide.placeholders[1].text = financial_text
-
-    slide = presentation.slides.add_slide(
-        presentation.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = (
-        "Investment Structure"
-    )
-
-    investment_text = (
-        f"Investor Capital: "
-        f"{format_money(analysis.get('investor_capital'))}\n"
-        f"Investor Share: "
-        f"{format_number(analysis.get('investor_share'))}%\n"
-        f"Investor Profit: "
-        f"{format_money(analysis.get('investor_profit'))}\n"
-        f"Investor ROI: "
-        f"{format_number(analysis.get('investor_roi'))}%"
-    )
-
-    slide.placeholders[1].text = (
-        investment_text
-    )
-
-    slide = presentation.slides.add_slide(
-        presentation.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = (
-        "Key Risks & Considerations"
-    )
-
-    risk_text = (
-        "• Construction cost escalation\n"
-        "• Sales price and absorption risk\n"
-        "• Financing cost and interest-rate risk\n"
-        "• Construction schedule risk\n"
-        "• Market and demand risk\n"
-        "• Regulatory and permitting risk\n"
-        "• Liquidity and exit risk"
-    )
-
-    slide.placeholders[1].text = (
-        risk_text
-    )
-
-    slide = presentation.slides.add_slide(
-        presentation.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = (
-        "Project Notes"
-    )
-
-    notes = str(
-        project.get("notes")
-        or "No additional notes."
-    )
-
-    slide.placeholders[1].text = notes
-
     try:
+        presentation = (
+            PRESENTATION_CLASS()
+        )
+
+        # ----------------------------------------------------
+        # TITLE SLIDE
+        # ----------------------------------------------------
+
+        title_slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[0]
+            )
+        )
+
+        title_slide.shapes.title.text = (
+            str(project_name)
+        )
+
+        if (
+            len(
+                title_slide.placeholders
+            ) > 1
+        ):
+            subtitle = (
+                title_slide.placeholders[1]
+            )
+
+            subtitle.text = (
+                "GENIOSA 4.0\n"
+                "Investor Presentation"
+            )
+
+        # ----------------------------------------------------
+        # PROJECT OVERVIEW
+        # ----------------------------------------------------
+
+        slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+        )
+
+        slide.shapes.title.text = (
+            "Project Overview"
+        )
+
+        overview_text = (
+            f"Industry: "
+            f"{project.get('industry') or 'N/A'}\n"
+            f"Location: "
+            f"{project.get('location') or 'N/A'}\n"
+            f"Land Area: "
+            f"{format_number(project.get('land_area'))} m²\n"
+            f"Saleable Area: "
+            f"{format_number(project.get('saleable_area'))} m²\n"
+            f"Construction Area: "
+            f"{format_number(project.get('construction_area'))} m²\n"
+            f"Total Area: "
+            f"{format_number(project.get('total_area'))} m²"
+        )
+
+        if (
+            len(
+                slide.placeholders
+            ) > 1
+        ):
+            slide.placeholders[1].text = (
+                overview_text
+            )
+
+        # ----------------------------------------------------
+        # FINANCIAL OVERVIEW
+        # ----------------------------------------------------
+
+        slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+        )
+
+        slide.shapes.title.text = (
+            "Financial Overview"
+        )
+
+        financial_text = (
+            f"Total Cost: "
+            f"{format_money(analysis.get('total_cost'))}\n"
+            f"Revenue: "
+            f"{format_money(analysis.get('revenue'))}\n"
+            f"Net Profit: "
+            f"{format_money(analysis.get('profit'))}\n"
+            f"Profit Margin: "
+            f"{format_number(analysis.get('margin'))}%\n"
+            f"Break-even Price: "
+            f"{format_money(analysis.get('break_even_price'))}/m²"
+        )
+
+        if (
+            len(
+                slide.placeholders
+            ) > 1
+        ):
+            slide.placeholders[1].text = (
+                financial_text
+            )
+
+        # ----------------------------------------------------
+        # INVESTMENT STRUCTURE
+        # ----------------------------------------------------
+
+        slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+        )
+
+        slide.shapes.title.text = (
+            "Investment Structure"
+        )
+
+        investment_text = (
+            f"Investor Capital: "
+            f"{format_money(analysis.get('investor_capital'))}\n"
+            f"Investor Share: "
+            f"{format_number(analysis.get('investor_share'))}%\n"
+            f"Investor Profit: "
+            f"{format_money(analysis.get('investor_profit'))}\n"
+            f"Investor ROI: "
+            f"{format_number(analysis.get('investor_roi'))}%"
+        )
+
+        if (
+            len(
+                slide.placeholders
+            ) > 1
+        ):
+            slide.placeholders[1].text = (
+                investment_text
+            )
+
+        # ----------------------------------------------------
+        # RISKS
+        # ----------------------------------------------------
+
+        slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+        )
+
+        slide.shapes.title.text = (
+            "Key Risks & Considerations"
+        )
+
+        risk_text = (
+            "• Construction cost escalation\n"
+            "• Sales price and absorption risk\n"
+            "• Financing cost and interest-rate risk\n"
+            "• Construction schedule risk\n"
+            "• Market and demand risk\n"
+            "• Regulatory and permitting risk\n"
+            "• Liquidity and exit risk"
+        )
+
+        if (
+            len(
+                slide.placeholders
+            ) > 1
+        ):
+            slide.placeholders[1].text = (
+                risk_text
+            )
+
+        # ----------------------------------------------------
+        # PROJECT NOTES
+        # ----------------------------------------------------
+
+        slide = (
+            presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+        )
+
+        slide.shapes.title.text = (
+            "Project Notes"
+        )
+
+        notes = str(
+            project.get("notes")
+            or "No additional notes."
+        )
+
+        if (
+            len(
+                slide.placeholders
+            ) > 1
+        ):
+            slide.placeholders[1].text = (
+                notes
+            )
+
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
+
         presentation.save(
             str(filepath)
         )
+
     except Exception as exc:
         logger.error(
-            "Failed to save PowerPoint file: %s",
+            "Failed to generate PowerPoint file: %s",
             exc,
+            exc_info=True,
         )
+
+        try:
+            if filepath.exists():
+                filepath.unlink()
+        except Exception:
+            pass
+
         return None
 
-    if not filepath.exists():
+    if not _validate_generated_file(
+        str(filepath)
+    ):
         return None
 
-    return str(filepath)
+    return str(
+        filepath
+    )
 
+
+# ------------------------------------------------------------
+# GENERATE ALL PROJECT FILES
+# ------------------------------------------------------------
 
 def generate_project_files(
     chat_id: Any,
@@ -9942,111 +14842,273 @@ def generate_project_files(
     """
     Generates both Excel and PowerPoint
     files for a project.
+
+    IMPORTANT:
+    The return value always contains:
+        success
+        project_id
+        files
+        analysis
+
+    PART 12 should iterate:
+        result.get("files", [])
     """
+
+    if chat_id is None:
+        return {
+            "success": False,
+            "project_id": project_id,
+            "files": [],
+            "analysis": {},
+            "error": "Chat ID is required.",
+        }
+
+    try:
+        project_id_value = int(
+            project_id
+        )
+    except Exception:
+        return {
+            "success": False,
+            "project_id": project_id,
+            "files": [],
+            "analysis": {},
+            "error": "Invalid project ID.",
+        }
+
+    # get_project() already scopes the lookup
+    # to the current chat.
     project = get_project(
         chat_id,
-        project_id,
+        project_id_value,
     )
 
     if not project:
         return {
             "success": False,
+            "project_id": project_id_value,
+            "files": [],
+            "analysis": {},
             "error": "Project not found.",
         }
 
-    analysis = analyze_project_financials(
-        project
-    )
-
-    excel_path = generate_project_excel(
-        project,
-        analysis,
-    )
-
-    presentation_path = (
-        generate_project_presentation(
-            project,
-            analysis,
+    try:
+        analysis = (
+            analyze_project_financials(
+                project
+            )
+            or {}
         )
-    )
+
+    except Exception as exc:
+        logger.error(
+            "Financial analysis failed before file generation: %s",
+            exc,
+            exc_info=True,
+        )
+
+        return {
+            "success": False,
+            "project_id": project_id_value,
+            "files": [],
+            "analysis": {},
+            "error": (
+                "Financial analysis failed."
+            ),
+        }
 
     generated = []
 
-    if excel_path:
-        asset_id = generated_asset_save(
-            chat_id=chat_id,
-            project_id=project_id,
-            filename=Path(
-                excel_path
-            ).name,
-            asset_type="xlsx",
-            description=(
-                "Project financial model"
-            ),
+    # --------------------------------------------------------
+    # EXCEL
+    # --------------------------------------------------------
+
+    try:
+        excel_path = (
+            generate_project_excel(
+                project,
+                analysis,
+            )
         )
 
-        generated.append({
-            "type": "xlsx",
-            "path": excel_path,
-            "asset_id": asset_id,
-        })
+        if excel_path:
+            asset_id = (
+                generated_asset_save(
+                    chat_id=chat_id,
+                    project_id=project_id_value,
+                    filename=Path(
+                        excel_path
+                    ).name,
+                    asset_type="xlsx",
+                    description=(
+                        "Project financial model"
+                    ),
+                )
+            )
 
-    if presentation_path:
-        asset_id = generated_asset_save(
-            chat_id=chat_id,
-            project_id=project_id,
-            filename=Path(
-                presentation_path
-            ).name,
-            asset_type="pptx",
-            description=(
-                "Investor presentation"
-            ),
+            generated.append({
+                "type": "xlsx",
+                "path": str(
+                    excel_path
+                ),
+                "filename": Path(
+                    excel_path
+                ).name,
+                "asset_id": asset_id,
+            })
+
+    except Exception as exc:
+        logger.error(
+            "Excel generation failed: %s",
+            exc,
+            exc_info=True,
         )
 
-        generated.append({
-            "type": "pptx",
-            "path": presentation_path,
-            "asset_id": asset_id,
-        })
+    # --------------------------------------------------------
+    # POWERPOINT
+    # --------------------------------------------------------
 
-    return {
-        "success": bool(generated),
-        "project_id": project_id,
+    try:
+        presentation_path = (
+            generate_project_presentation(
+                project,
+                analysis,
+            )
+        )
+
+        if presentation_path:
+            asset_id = (
+                generated_asset_save(
+                    chat_id=chat_id,
+                    project_id=project_id_value,
+                    filename=Path(
+                        presentation_path
+                    ).name,
+                    asset_type="pptx",
+                    description=(
+                        "Investor presentation"
+                    ),
+                )
+            )
+
+            generated.append({
+                "type": "pptx",
+                "path": str(
+                    presentation_path
+                ),
+                "filename": Path(
+                    presentation_path
+                ).name,
+                "asset_id": asset_id,
+            })
+
+    except Exception as exc:
+        logger.error(
+            "PowerPoint generation failed: %s",
+            exc,
+            exc_info=True,
+        )
+
+    # --------------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------------
+
+    result = {
+        "success": bool(
+            generated
+        ),
+        "project_id": project_id_value,
         "files": generated,
         "analysis": analysis,
     }
 
+    if not generated:
+        result["error"] = (
+            "No project files could be generated."
+        )
 
-print("GENIOSA 4.0 — PART 10/12 LOADED")# ============================================================
+    elif len(generated) == 1:
+        result["warning"] = (
+            "Only one project file was generated successfully."
+        )
+
+    return result
+
+
+print(
+    "GENIOSA 4.0 — PART 10/12 LOADED"
+)
+# ============================================================
 # GENIOSA 4.0 — PART 11/12
 # Commands, natural language processing and CRM actions
 # ============================================================
 
 
+# ------------------------------------------------------------
+# PART 11 — SAFE LIMITS / CONSTANTS
+# ------------------------------------------------------------
+
+MAX_COMMAND_TEXT_LENGTH = int(
+    globals().get(
+        "MAX_COMMAND_TEXT_LENGTH",
+        20000,
+    )
+)
+
+MAX_COMMAND_TEXT_LENGTH = max(
+    1000,
+    min(
+        MAX_COMMAND_TEXT_LENGTH,
+        100000,
+    ),
+)
+
+
+# ------------------------------------------------------------
+# TEXT PARSING
+# ------------------------------------------------------------
+
 def parse_key_value_text(
     text: str,
 ) -> Dict[str, str]:
     """
-    Parses simple key=value or key:value pairs.
+    Parses key=value or key:value pairs.
+
+    Supports English, Russian and Georgian.
+
+    Examples:
+        name: NIKKEA 12
+        სახელი: NIKKEA 12
+        location: Kutaisi
+        ლოკაცია: Kutaisi
     """
-    source = str(text or "").strip()
+
+    source = str(
+        text or ""
+    ).strip()
 
     if not source:
         return {}
 
-    result = {}
+    source = source[
+        :MAX_COMMAND_TEXT_LENGTH
+    ]
+
+    result: Dict[str, str] = {}
 
     pattern = re.compile(
         r"""
-        ([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_\- ]*)
-        \s*(?:=|:)\s*
-        (?:"([^"]+)"|'([^']+)'|([^,\n;]+))
+        ([^\d=:\n,;][^=:\n,;]*?)
+        \s*(?:=|:)
+        \s*
+        (?:"([^"]*)"|'([^']*)'|([^,\n;]+))
         """,
         re.VERBOSE,
     )
 
-    for match in pattern.finditer(source):
+    for match in pattern.finditer(
+        source
+    ):
         key = (
             match.group(1)
             or ""
@@ -10054,13 +15116,31 @@ def parse_key_value_text(
 
         value = (
             match.group(2)
-            or match.group(3)
-            or match.group(4)
-            or ""
+            if match.group(2) is not None
+            else (
+                match.group(3)
+                if match.group(3) is not None
+                else (
+                    match.group(4)
+                    or ""
+                )
+            )
+        )
+
+        value = str(
+            value or ""
         ).strip()
 
-        if key and value:
-            result[key] = value
+        if not key or not value:
+            continue
+
+        key = re.sub(
+            r"\s+",
+            " ",
+            key,
+        )
+
+        result[key] = value
 
     return result
 
@@ -10071,7 +15151,10 @@ def first_number(
     """
     Returns the first numeric value found in text.
     """
-    source = str(text or "")
+
+    source = str(
+        text or ""
+    )
 
     match = re.search(
         r"(?<!\d)"
@@ -10083,13 +15166,24 @@ def first_number(
     if not match:
         return None
 
-    value = match.group(0).replace(
-        ",",
-        ".",
+    value = (
+        match.group(0)
+        .replace(",", ".")
     )
 
     try:
-        return float(value)
+        result = float(
+            value
+        )
+
+        if not (
+            result == result
+            and abs(result) != float("inf")
+        ):
+            return None
+
+        return result
+
     except Exception:
         return None
 
@@ -10100,6 +15194,7 @@ def normalize_text_value(
     """
     Normalizes optional textual values.
     """
+
     if value is None:
         return None
 
@@ -10118,9 +15213,24 @@ def normalize_numeric_text(
 ) -> Optional[float]:
     """
     Converts numeric text containing common
-    currency/formatting symbols into float.
+    currency and formatting symbols into float.
+
+    Examples:
+        1,500
+        1.500
+        1,500.50
+        1.500,50
+        $1,500
+        1 500 ₾
     """
+
     if value is None:
+        return None
+
+    if isinstance(
+        value,
+        bool,
+    ):
         return None
 
     text_value = str(
@@ -10130,18 +15240,25 @@ def normalize_numeric_text(
     if not text_value:
         return None
 
-    text_value = text_value.replace(
+    for symbol in (
         "$",
-        "",
-    )
-    text_value = text_value.replace(
         "€",
-        "",
-    )
-    text_value = text_value.replace(
         "₾",
+    ):
+        text_value = text_value.replace(
+            symbol,
+            "",
+        )
+
+    text_value = re.sub(
+        r"\b(?:USD|EUR|GEL|ლარი|lari)\b",
         "",
+        text_value,
+        flags=re.IGNORECASE,
     )
+
+    text_value = text_value.strip()
+
     text_value = text_value.replace(
         " ",
         "",
@@ -10151,55 +15268,100 @@ def normalize_numeric_text(
         "," in text_value
         and "." in text_value
     ):
-        if text_value.rfind(",") > text_value.rfind("."):
-            text_value = text_value.replace(
-                ".",
-                "",
-            )
-            text_value = text_value.replace(
-                ",",
-                ".",
+        if (
+            text_value.rfind(",")
+            >
+            text_value.rfind(".")
+        ):
+            text_value = (
+                text_value
+                .replace(".", "")
+                .replace(",", ".")
             )
         else:
-            text_value = text_value.replace(
-                ",",
-                "",
+            text_value = (
+                text_value
+                .replace(",", "")
             )
+
     elif "," in text_value:
-        text_value = text_value.replace(
-            ",",
-            ".",
+        comma_match = re.search(
+            r",(\d{3})$",
+            text_value,
         )
 
+        if comma_match:
+            text_value = (
+                text_value
+                .replace(",", "")
+            )
+        else:
+            text_value = (
+                text_value
+                .replace(",", ".")
+            )
+
+    elif "." in text_value:
+        dot_match = re.search(
+            r"\.(\d{3})$",
+            text_value,
+        )
+
+        if dot_match:
+            text_value = (
+                text_value
+                .replace(".", "")
+            )
+
+    if not re.fullmatch(
+        r"-?\d+(?:\.\d+)?",
+        text_value,
+    ):
+        return None
+
     try:
-        return float(text_value)
+        number = float(
+            text_value
+        )
+
+        if not (
+            number == number
+            and abs(number) != float("inf")
+        ):
+            return None
+
+        return number
 
     except Exception:
         return None
 
+
+# ------------------------------------------------------------
+# PROJECT CREATION FROM TEXT
+# ------------------------------------------------------------
 
 def create_project_from_text(
     chat_id: Any,
     text: str,
 ) -> Optional[int]:
     """
-    Creates a project from a natural-language message.
-
-    Supported examples:
-        პროექტი: NIKKEA 12
-        სახელი: NIKKEA 12
-        ინდუსტრია: hotel
-        ლოკაცია: Kutaisi
-        მიწა: 3070
-        გასაყიდი ფართი: 10854
-        მშენებლობა: 2150000
+    Creates a project from explicit natural-language
+    key/value data.
     """
+
+    if chat_id is None:
+        return None
+
     source = str(
         text or ""
     ).strip()
 
     if not source:
         return None
+
+    source = source[
+        :MAX_COMMAND_TEXT_LENGTH
+    ]
 
     pairs = parse_key_value_text(
         source
@@ -10208,8 +15370,10 @@ def create_project_from_text(
     name = (
         pairs.get("name")
         or pairs.get("project")
+        or pairs.get("project name")
         or pairs.get("პროექტი")
         or pairs.get("სახელი")
+        or pairs.get("პროექტის სახელი")
     )
 
     if not name:
@@ -10219,18 +15383,31 @@ def create_project_from_text(
             if line.strip()
         ]
 
-        if lines:
-            first_line = lines[0]
-
+        for first_line in lines[:3]:
             cleaned = re.sub(
-                r"^(?:პროექტი|project)\s*[:\-]?\s*",
+                r"^(?:"
+                r"პროექტი"
+                r"|პროექტის\s+სახელი"
+                r"|project"
+                r"|project\s+name"
+                r")"
+                r"\s*[:\-]?\s*",
                 "",
                 first_line,
                 flags=re.IGNORECASE,
             ).strip()
 
-            if cleaned:
+            if (
+                cleaned
+                and "=" not in cleaned
+                and ":" not in cleaned
+            ):
                 name = cleaned
+                break
+
+    name = normalize_text_value(
+        name
+    )
 
     if not name:
         return None
@@ -10238,14 +15415,18 @@ def create_project_from_text(
     industry = (
         pairs.get("industry")
         or pairs.get("sector")
+        or pairs.get("type")
         or pairs.get("ინდუსტრია")
         or pairs.get("სექტორი")
+        or pairs.get("ტიპი")
     )
 
     location = (
         pairs.get("location")
+        or pairs.get("address")
         or pairs.get("ლოკაცია")
         or pairs.get("ადგილი")
+        or pairs.get("მისამართი")
     )
 
     description = (
@@ -10255,6 +15436,7 @@ def create_project_from_text(
 
     land_area = normalize_numeric_text(
         pairs.get("land_area")
+        or pairs.get("land area")
         or pairs.get("land")
         or pairs.get("მიწის ფართობი")
         or pairs.get("მიწა")
@@ -10262,6 +15444,7 @@ def create_project_from_text(
 
     saleable_area = normalize_numeric_text(
         pairs.get("saleable_area")
+        or pairs.get("saleable area")
         or pairs.get("saleable")
         or pairs.get("გასაყიდი ფართობი")
         or pairs.get("გასაყიდი")
@@ -10269,6 +15452,7 @@ def create_project_from_text(
 
     construction_area = normalize_numeric_text(
         pairs.get("construction_area")
+        or pairs.get("construction area")
         or pairs.get("construction")
         or pairs.get("სამშენებლო ფართობი")
         or pairs.get("მშენებლობა")
@@ -10276,6 +15460,7 @@ def create_project_from_text(
 
     total_area = normalize_numeric_text(
         pairs.get("total_area")
+        or pairs.get("total area")
         or pairs.get("total")
         or pairs.get("საერთო ფართობი")
         or pairs.get("სრული ფართობი")
@@ -10284,6 +15469,7 @@ def create_project_from_text(
     land_cost = normalize_numeric_text(
         pairs.get("land_cost")
         or pairs.get("land price")
+        or pairs.get("land value")
         or pairs.get("მიწის ღირებულება")
         or pairs.get("მიწის ფასი")
     )
@@ -10291,27 +15477,32 @@ def create_project_from_text(
     construction_cost = normalize_numeric_text(
         pairs.get("construction_cost")
         or pairs.get("construction price")
+        or pairs.get("construction value")
         or pairs.get("მშენებლობის ღირებულება")
         or pairs.get("მშენებლობის ფასი")
     )
 
     operating_cost = normalize_numeric_text(
         pairs.get("operating_cost")
+        or pairs.get("operating cost")
         or pairs.get("ოპერაციული ხარჯი")
     )
 
     financing_cost = normalize_numeric_text(
         pairs.get("financing_cost")
+        or pairs.get("financing cost")
         or pairs.get("ფინანსირების ხარჯი")
     )
 
     other_cost = normalize_numeric_text(
         pairs.get("other_cost")
+        or pairs.get("other cost")
         or pairs.get("სხვა ხარჯი")
     )
 
     expected_revenue = normalize_numeric_text(
         pairs.get("expected_revenue")
+        or pairs.get("expected revenue")
         or pairs.get("revenue")
         or pairs.get("შემოსავალი")
         or pairs.get("მოსალოდნელი შემოსავალი")
@@ -10319,6 +15510,7 @@ def create_project_from_text(
 
     expected_profit = normalize_numeric_text(
         pairs.get("expected_profit")
+        or pairs.get("expected profit")
         or pairs.get("profit")
         or pairs.get("მოგება")
         or pairs.get("მოსალოდნელი მოგება")
@@ -10326,6 +15518,7 @@ def create_project_from_text(
 
     investor_capital = normalize_numeric_text(
         pairs.get("investor_capital")
+        or pairs.get("investor capital")
         or pairs.get("investment")
         or pairs.get("ინვესტიცია")
         or pairs.get("ინვესტორის კაპიტალი")
@@ -10333,11 +15526,13 @@ def create_project_from_text(
 
     investor_profit = normalize_numeric_text(
         pairs.get("investor_profit")
+        or pairs.get("investor profit")
         or pairs.get("ინვესტორის მოგება")
     )
 
     investor_share = normalize_numeric_text(
         pairs.get("investor_share")
+        or pairs.get("investor share")
         or pairs.get("share")
         or pairs.get("წილი")
         or pairs.get("ინვესტორის წილი")
@@ -10345,6 +15540,7 @@ def create_project_from_text(
 
     notes = (
         pairs.get("notes")
+        or pairs.get("note")
         or pairs.get("შენიშვნა")
         or pairs.get("შენიშვნები")
     )
@@ -10380,19 +15576,32 @@ def create_project_from_text(
     )
 
 
+# ------------------------------------------------------------
+# INVESTOR CREATION FROM TEXT
+# ------------------------------------------------------------
+
 def create_investor_from_text(
     chat_id: Any,
     text: str,
 ) -> Optional[int]:
     """
-    Creates an investor from natural-language key/value text.
+    Creates an investor from explicit
+    natural-language key/value data.
     """
+
+    if chat_id is None:
+        return None
+
     source = str(
         text or ""
     ).strip()
 
     if not source:
         return None
+
+    source = source[
+        :MAX_COMMAND_TEXT_LENGTH
+    ]
 
     pairs = parse_key_value_text(
         source
@@ -10401,8 +15610,14 @@ def create_investor_from_text(
     name = (
         pairs.get("name")
         or pairs.get("investor")
+        or pairs.get("investor name")
         or pairs.get("ინვესტორი")
         or pairs.get("სახელი")
+        or pairs.get("ინვესტორის სახელი")
+    )
+
+    name = normalize_text_value(
+        name
     )
 
     if not name:
@@ -10427,12 +15642,14 @@ def create_investor_from_text(
 
     investment_capacity = normalize_numeric_text(
         pairs.get("investment_capacity")
+        or pairs.get("investment capacity")
         or pairs.get("capacity")
         or pairs.get("საინვესტიციო შესაძლებლობა")
     )
 
     preferred_sector = (
         pairs.get("preferred_sector")
+        or pairs.get("preferred sector")
         or pairs.get("sector")
         or pairs.get("სექტორი")
     )
@@ -10445,6 +15662,7 @@ def create_investor_from_text(
 
     notes = (
         pairs.get("notes")
+        or pairs.get("note")
         or pairs.get("შენიშვნა")
         or pairs.get("შენიშვნები")
     )
@@ -10462,13 +15680,17 @@ def create_investor_from_text(
     )
 
 
+# ------------------------------------------------------------
+# NATURAL-LANGUAGE INTENT DETECTION
+# ------------------------------------------------------------
+
 def looks_like_project_request(
     text: str,
 ) -> bool:
     """
-    Detects whether a message appears to describe
-    creation of a project.
+    Detects explicit project-creation requests.
     """
+
     source = str(
         text or ""
     ).strip().lower()
@@ -10478,13 +15700,17 @@ def looks_like_project_request(
 
     keywords = [
         "პროექტის დამატება",
+        "პროექტი დაამატე",
+        "პროექტის შექმნა",
         "პროექტი შექმენი",
         "შექმენი პროექტი",
         "ახალი პროექტი",
+        "დაამატე პროექტი",
         "create project",
         "new project",
         "add project",
         "project:",
+        "project=",
     ]
 
     return any(
@@ -10497,9 +15723,9 @@ def looks_like_investor_request(
     text: str,
 ) -> bool:
     """
-    Detects whether a message appears to describe
-    creation of an investor.
+    Detects explicit investor-creation requests.
     """
+
     source = str(
         text or ""
     ).strip().lower()
@@ -10510,12 +15736,16 @@ def looks_like_investor_request(
     keywords = [
         "ინვესტორის დამატება",
         "ინვესტორი დაამატე",
+        "ინვესტორის შექმნა",
+        "ინვესტორი შექმენი",
         "შექმენი ინვესტორი",
         "ახალი ინვესტორი",
+        "დაამატე ინვესტორი",
         "create investor",
         "new investor",
         "add investor",
         "investor:",
+        "investor=",
     ]
 
     return any(
@@ -10524,21 +15754,50 @@ def looks_like_investor_request(
     )
 
 
+# ------------------------------------------------------------
+# STATUS / CRM COMMANDS
+# ------------------------------------------------------------
+
 def status_text(
     chat_id: Any,
 ) -> str:
     """
     Returns a detailed Geniosa status.
     """
-    env = validate_environment()
-    database_ok = database_is_available()
+
+    try:
+        env = validate_environment()
+    except Exception:
+        env = {
+            "telegram": False,
+            "gemini": False,
+        }
+
+    try:
+        database_ok = database_is_available()
+    except Exception:
+        database_ok = False
+
+    telegram_ok = bool(
+        env.get(
+            "telegram",
+            False,
+        )
+    )
+
+    gemini_ok = bool(
+        env.get(
+            "gemini",
+            False,
+        )
+    )
 
     return (
         "🟢 GENIOSA 4.0 STATUS\n\n"
         f"Telegram: "
-        f"{'OK' if env['telegram'] else 'ERROR'}\n"
+        f"{'OK' if telegram_ok else 'ERROR'}\n"
         f"Gemini: "
-        f"{'OK' if env['gemini'] else 'ERROR'}\n"
+        f"{'OK' if gemini_ok else 'ERROR'}\n"
         f"Database: "
         f"{'OK' if database_ok else 'ERROR'}\n"
         f"Chat ID: {chat_id}"
@@ -10593,6 +15852,10 @@ def generated_files_command(
     )
 
 
+# ------------------------------------------------------------
+# PROJECT COMMAND
+# ------------------------------------------------------------
+
 def project_command(
     chat_id: Any,
     argument: str,
@@ -10600,6 +15863,7 @@ def project_command(
     """
     Shows a project by numeric ID or name.
     """
+
     value = str(
         argument or ""
     ).strip()
@@ -10636,6 +15900,10 @@ def project_command(
     )
 
 
+# ------------------------------------------------------------
+# INVESTOR COMMAND
+# ------------------------------------------------------------
+
 def investor_command(
     chat_id: Any,
     argument: str,
@@ -10643,6 +15911,7 @@ def investor_command(
     """
     Shows an investor by numeric ID or search text.
     """
+
     value = str(
         argument or ""
     ).strip()
@@ -10679,6 +15948,10 @@ def investor_command(
     )
 
 
+# ------------------------------------------------------------
+# DEAL COMMAND
+# ------------------------------------------------------------
+
 def deal_command(
     chat_id: Any,
     argument: str,
@@ -10686,6 +15959,7 @@ def deal_command(
     """
     Shows a deal by numeric ID.
     """
+
     value = str(
         argument or ""
     ).strip()
@@ -10716,6 +15990,10 @@ def deal_command(
     )
 
 
+# ------------------------------------------------------------
+# FINANCE COMMAND
+# ------------------------------------------------------------
+
 def finance_command(
     chat_id: Any,
     argument: str,
@@ -10723,6 +16001,7 @@ def finance_command(
     """
     Runs financial analysis for a project.
     """
+
     value = str(
         argument or ""
     ).strip()
@@ -10733,7 +16012,19 @@ def finance_command(
             "/finance 1"
         )
 
-    if not value.isdigit():
+    project = None
+
+    if value.isdigit():
+        project_id = int(
+            value
+        )
+
+        project = get_project(
+            chat_id,
+            project_id,
+        )
+
+    else:
         project = find_project_by_name(
             chat_id,
             value,
@@ -10744,20 +16035,45 @@ def finance_command(
                 "❌ პროექტი ვერ მოიძებნა."
             )
 
-        project_id = project.get("id")
+        project_id = project.get(
+            "id"
+        )
 
-    else:
-        project_id = int(value)
+    if not project:
+        return (
+            "❌ პროექტი ვერ მოიძებნა."
+        )
 
-    analysis = run_project_financial_analysis(
-        chat_id=chat_id,
-        project_id=project_id,
-    )
+    try:
+        analysis = run_project_financial_analysis(
+            chat_id=chat_id,
+            project_id=project_id,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Finance command failed: %s",
+            exc,
+            exc_info=True,
+        )
+
+        return (
+            "❌ ფინანსური ანალიზის შესრულება ვერ მოხერხდა."
+        )
+
+    if not analysis:
+        return (
+            "❌ ფინანსური ანალიზის მონაცემები ვერ მოიძებნა."
+        )
 
     return financial_analysis_text(
         analysis
     )
 
+
+# ------------------------------------------------------------
+# GENERATED ASSET COMMAND
+# ------------------------------------------------------------
 
 def generated_asset_command(
     chat_id: Any,
@@ -10766,6 +16082,7 @@ def generated_asset_command(
     """
     Shows metadata for one generated asset.
     """
+
     value = str(
         argument or ""
     ).strip()
@@ -10776,7 +16093,9 @@ def generated_asset_command(
             "/generated 1"
         )
 
-    asset_id = int(value)
+    asset_id = int(
+        value
+    )
 
     assets = get_generated_assets(
         chat_id,
@@ -10784,31 +16103,52 @@ def generated_asset_command(
     )
 
     for asset in assets:
-        if int(asset.get("id")) == asset_id:
-            filename = (
-                asset.get("filename")
-                or "unknown"
+        try:
+            current_id = int(
+                asset.get("id")
             )
-            asset_type = (
-                asset.get("asset_type")
-                or "file"
-            )
-            description = (
-                asset.get("description")
-                or ""
+        except Exception:
+            continue
+
+        if current_id != asset_id:
+            continue
+
+        filename = (
+            asset.get("filename")
+            or "unknown"
+        )
+
+        asset_type = (
+            asset.get("asset_type")
+            or "file"
+        )
+
+        description = (
+            asset.get("description")
+            or ""
+        )
+
+        response = (
+            f"📦 ფაილი #{asset_id}\n"
+            f"📎 {filename}\n"
+            f"📁 ტიპი: {asset_type}"
+        )
+
+        if description:
+            response += (
+                f"\n📝 {description}"
             )
 
-            return (
-                f"📦 ფაილი #{asset_id}\n"
-                f"📎 {filename}\n"
-                f"📁 ტიპი: {asset_type}\n"
-                f"📝 {description}"
-            )
+        return response
 
     return (
         "❌ გენერირებული ფაილი ვერ მოიძებნა."
     )
 
+
+# ------------------------------------------------------------
+# TELEGRAM COMMAND ROUTER
+# ------------------------------------------------------------
 
 def handle_command(
     chat_id: Any,
@@ -10817,6 +16157,7 @@ def handle_command(
     """
     Handles Telegram slash commands.
     """
+
     source = str(
         command_text or ""
     ).strip()
@@ -10824,11 +16165,22 @@ def handle_command(
     if not source:
         return ""
 
+    if len(source) > MAX_COMMAND_TEXT_LENGTH:
+        source = source[
+            :MAX_COMMAND_TEXT_LENGTH
+        ]
+
     parts = source.split(
         maxsplit=1
     )
 
-    command = parts[0].lower()
+    command = (
+        parts[0]
+        .strip()
+        .lower()
+        .split("@", 1)[0]
+    )
+
     argument = (
         parts[1].strip()
         if len(parts) > 1
@@ -10939,13 +16291,26 @@ def handle_command(
     )
 
 
+# ------------------------------------------------------------
+# MAIN TEXT MESSAGE HANDLER
+# ------------------------------------------------------------
+
 def handle_text_message(
     chat_id: Any,
     text: str,
 ) -> str:
     """
     Main natural-language message handler.
+
+    Explicit CRM creation requests are handled first.
+    All other messages go to Geniosa AI.
     """
+
+    if chat_id is None:
+        return (
+            "❌ Chat ID ვერ განისაზღვრა."
+        )
+
     message_text = str(
         text or ""
     ).strip()
@@ -10955,11 +16320,44 @@ def handle_text_message(
             "❌ ცარიელი შეტყობინება."
         )
 
+    message_text = message_text[
+        :MAX_COMMAND_TEXT_LENGTH
+    ]
+
+    # --------------------------------------------------------
+    # SLASH COMMANDS
+    # --------------------------------------------------------
+
     if message_text.startswith("/"):
-        return handle_command(
+        response = handle_command(
             chat_id,
             message_text,
         )
+
+        try:
+            save_message(
+                chat_id=chat_id,
+                role="user",
+                text=message_text,
+            )
+
+            save_message(
+                chat_id=chat_id,
+                role="assistant",
+                text=response,
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Could not save command conversation: %s",
+                exc,
+            )
+
+        return response
+
+    # --------------------------------------------------------
+    # SAVE USER MESSAGE
+    # --------------------------------------------------------
 
     try:
         save_message(
@@ -10967,18 +16365,25 @@ def handle_text_message(
             role="user",
             text=message_text,
         )
+
     except Exception as exc:
         logger.warning(
             "Could not save user message: %s",
             exc,
         )
 
+    # --------------------------------------------------------
+    # PROJECT CREATION
+    # --------------------------------------------------------
+
     if looks_like_project_request(
         message_text
     ):
-        project_id = create_project_from_text(
-            chat_id,
-            message_text,
+        project_id = (
+            create_project_from_text(
+                chat_id,
+                message_text,
+            )
         )
 
         if project_id:
@@ -10987,27 +16392,72 @@ def handle_text_message(
                 project_id,
             )
 
-            response = (
-                "✅ პროექტი დაემატა Geniosa-ს CRM-ში.\n\n"
-                + project_summary(
-                    project
+            if project:
+                response = (
+                    "✅ პროექტი დაემატა "
+                    "Geniosa-ს CRM-ში.\n\n"
+                    + project_summary(
+                        project
+                    )
                 )
-            )
+            else:
+                response = (
+                    "✅ პროექტი შეიქმნა "
+                    "Geniosa-ს CRM-ში."
+                )
 
+            try:
+                save_message(
+                    chat_id=chat_id,
+                    role="assistant",
+                    text=response,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not save project response: %s",
+                    exc,
+                )
+
+            return response
+
+        # Do not silently send a failed creation
+        # request to AI as if nothing happened.
+        response = (
+            "⚠️ პროექტის შექმნა ვერ შესრულდა.\n\n"
+            "მომწერე მაგალითად:\n"
+            "ახალი პროექტი\n"
+            "სახელი: NIKKEA 12\n"
+            "ინდუსტრია: hotel\n"
+            "ლოკაცია: Kutaisi\n"
+            "გასაყიდი ფართობი: 10854"
+        )
+
+        try:
             save_message(
                 chat_id=chat_id,
                 role="assistant",
                 text=response,
             )
+        except Exception as exc:
+            logger.warning(
+                "Could not save project error response: %s",
+                exc,
+            )
 
-            return response
+        return response
+
+    # --------------------------------------------------------
+    # INVESTOR CREATION
+    # --------------------------------------------------------
 
     if looks_like_investor_request(
         message_text
     ):
-        investor_id = create_investor_from_text(
-            chat_id,
-            message_text,
+        investor_id = (
+            create_investor_from_text(
+                chat_id,
+                message_text,
+            )
         )
 
         if investor_id:
@@ -11016,25 +16466,84 @@ def handle_text_message(
                 investor_id,
             )
 
-            response = (
-                "✅ ინვესტორი დაემატა Geniosa-ს CRM-ში.\n\n"
-                + format_investor(
-                    investor
+            if investor:
+                response = (
+                    "✅ ინვესტორი დაემატა "
+                    "Geniosa-ს CRM-ში.\n\n"
+                    + format_investor(
+                        investor
+                    )
                 )
-            )
+            else:
+                response = (
+                    "✅ ინვესტორი შეიქმნა "
+                    "Geniosa-ს CRM-ში."
+                )
 
+            try:
+                save_message(
+                    chat_id=chat_id,
+                    role="assistant",
+                    text=response,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not save investor response: %s",
+                    exc,
+                )
+
+            return response
+
+        response = (
+            "⚠️ ინვესტორის შექმნა ვერ შესრულდა.\n\n"
+            "მომწერე მაგალითად:\n"
+            "ახალი ინვესტორი\n"
+            "სახელი: John Smith\n"
+            "კომპანია: ABC Capital\n"
+            "ქვეყანა: UAE\n"
+            "საინვესტიციო შესაძლებლობა: 5000000"
+        )
+
+        try:
             save_message(
                 chat_id=chat_id,
                 role="assistant",
                 text=response,
             )
+        except Exception as exc:
+            logger.warning(
+                "Could not save investor error response: %s",
+                exc,
+            )
 
-            return response
+        return response
 
-    response = ask_geniosa(
-        chat_id=chat_id,
-        user_message=message_text,
-    )
+    # --------------------------------------------------------
+    # GENERAL AI REQUEST
+    # --------------------------------------------------------
+
+    try:
+        response = ask_geniosa(
+            chat_id=chat_id,
+            user_message=message_text,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "AI message handling failed: %s",
+            exc,
+            exc_info=True,
+        )
+
+        response = (
+            "❌ Geniosa-ს AI მოდულმა დროებით ვერ შეძლო "
+            "პასუხის დამუშავება."
+        )
+
+    if not response:
+        response = (
+            "❌ პასუხის გენერირება ვერ მოხერხდა."
+        )
 
     try:
         save_message(
@@ -11042,6 +16551,7 @@ def handle_text_message(
             role="assistant",
             text=response,
         )
+
     except Exception as exc:
         logger.warning(
             "Could not save assistant message: %s",
@@ -11051,7 +16561,9 @@ def handle_text_message(
     return response
 
 
-print("GENIOSA 4.0 — PART 11/12 LOADED")
+print(
+    "GENIOSA 4.0 — PART 11/12 LOADED"
+)
 # ============================================================
 # GENIOSA 4.0 — PART 12/12
 # Telegram polling, file sending, startup and shutdown
@@ -11061,7 +16573,7 @@ from pathlib import Path
 
 
 # ------------------------------------------------------------
-# Telegram URL compatibility helper
+# Telegram compatibility helpers
 # ------------------------------------------------------------
 
 def telegram_url(
@@ -11069,14 +16581,149 @@ def telegram_url(
 ) -> str:
     """
     Compatibility wrapper for Telegram API URL generation.
-
-    PART 1 defines telegram_api_url().
-    Older functions may still call telegram_url().
     """
 
     return telegram_api_url(
         method
     )
+
+
+def send_message(
+    chat_id: Any,
+    text: str,
+    **kwargs: Any,
+) -> bool:
+    """
+    Compatibility wrapper around send_telegram_message().
+    """
+
+    try:
+        return bool(
+            send_telegram_message(
+                chat_id=chat_id,
+                text=text,
+                **kwargs,
+            )
+        )
+    except TypeError:
+        try:
+            return bool(
+                send_telegram_message(
+                    chat_id,
+                    text,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not send Telegram message: %s",
+                exc,
+            )
+            return False
+    except Exception as exc:
+        logger.warning(
+            "Could not send Telegram message: %s",
+            exc,
+        )
+        return False
+
+
+def send_long_message(
+    chat_id: Any,
+    text: str,
+    chunk_size: int = 4000,
+) -> bool:
+    """
+    Sends long Telegram messages in safe chunks.
+    """
+
+    if text is None:
+        return False
+
+    message = str(
+        text
+    ).strip()
+
+    if not message:
+        return False
+
+    chunk_size = max(
+        500,
+        min(
+            int(chunk_size),
+            4000,
+        ),
+    )
+
+    chunks: List[str] = []
+
+    while message:
+        if len(message) <= chunk_size:
+            chunks.append(message)
+            break
+
+        split_at = message.rfind(
+            "\n",
+            0,
+            chunk_size,
+        )
+
+        if split_at < 200:
+            split_at = message.rfind(
+                " ",
+                0,
+                chunk_size,
+            )
+
+        if split_at < 200:
+            split_at = chunk_size
+
+        chunk = message[
+            :split_at
+        ].strip()
+
+        if chunk:
+            chunks.append(
+                chunk
+            )
+
+        message = message[
+            split_at:
+        ].strip()
+
+    success = True
+
+    for chunk in chunks:
+        if not send_message(
+            chat_id,
+            chunk,
+        ):
+            success = False
+            break
+
+    return success
+
+
+# ------------------------------------------------------------
+# Telegram timeout compatibility
+# ------------------------------------------------------------
+
+TELEGRAM_FILE_TIMEOUT = int(
+    globals().get(
+        "TELEGRAM_FILE_TIMEOUT",
+        globals().get(
+            "TELEGRAM_REQUEST_TIMEOUT",
+            60,
+        ),
+    )
+)
+
+TELEGRAM_FILE_TIMEOUT = max(
+    10,
+    min(
+        TELEGRAM_FILE_TIMEOUT,
+        600,
+    ),
+)
 
 
 # ------------------------------------------------------------
@@ -11107,13 +16754,31 @@ def send_document_to_chat(
     Sends a local file to a Telegram chat.
     """
 
+    if chat_id is None:
+        return False
+
+    if not filepath:
+        return False
+
     path = Path(
         filepath
     )
 
+    try:
+        path = path.resolve()
+    except Exception:
+        pass
+
     if not path.exists():
         logger.error(
             "File does not exist: %s",
+            filepath,
+        )
+        return False
+
+    if not path.is_file():
+        logger.error(
+            "Path is not a file: %s",
             filepath,
         )
         return False
@@ -11125,6 +16790,33 @@ def send_document_to_chat(
         return False
 
     try:
+        file_size = path.stat().st_size
+
+        max_size = int(
+            globals().get(
+                "MAX_DOCUMENT_FILE_SIZE_BYTES",
+                globals().get(
+                    "MAX_DOCUMENT_SIZE_BYTES",
+                    25 * 1024 * 1024,
+                ),
+            )
+        )
+
+        if file_size > max_size:
+            logger.error(
+                "File is too large for Telegram: %s",
+                path,
+            )
+            return False
+
+    except Exception as exc:
+        logger.warning(
+            "Could not validate file size: %s",
+            exc,
+        )
+
+    try:
+
         with path.open(
             "rb"
         ) as file_handle:
@@ -11165,7 +16857,15 @@ def send_document_to_chat(
             )
             return False
 
-        if not data.get("ok"):
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return False
+
+        if not data.get(
+            "ok"
+        ):
             logger.error(
                 "Telegram sendDocument returned error: %s",
                 data,
@@ -11192,36 +16892,94 @@ def send_generated_files_to_chat(
 ) -> List[str]:
     """
     Generates and sends the project's Excel and PPTX files.
+
+    generate_project_files() in PART 10 returns a dictionary
+    containing a 'files' list.
     """
 
-    result: List[str] = []
+    sent_files: List[str] = []
 
     try:
-        files = generate_project_files(
+
+        result = generate_project_files(
             chat_id=chat_id,
             project_id=project_id,
         )
+
     except Exception as exc:
+
         logger.exception(
             "Could not generate project files: %s",
             exc,
         )
-        return result
 
-    if not files:
+        return sent_files
+
+    if not result:
         logger.warning(
             "No project files were generated for project %s.",
             project_id,
         )
-        return result
+        return sent_files
 
-    for filepath in files:
+    if not isinstance(
+        result,
+        dict,
+    ):
+        logger.error(
+            "Unexpected generate_project_files() result type: %s",
+            type(result).__name__,
+        )
+        return sent_files
+
+    if not result.get(
+        "success",
+        False,
+    ):
+        logger.warning(
+            "Project file generation was not successful: %s",
+            result,
+        )
+
+    files = result.get(
+        "files",
+        [],
+    )
+
+    if not isinstance(
+        files,
+        list,
+    ):
+        logger.warning(
+            "Generated files field is not a list."
+        )
+        return sent_files
+
+    for file_info in files:
+
+        filepath = None
+
+        if isinstance(
+            file_info,
+            str,
+        ):
+            filepath = file_info
+
+        elif isinstance(
+            file_info,
+            dict,
+        ):
+            filepath = (
+                file_info.get("path")
+                or file_info.get("filepath")
+                or file_info.get("file")
+            )
 
         if not filepath:
             continue
 
         path = Path(
-            filepath
+            str(filepath)
         )
 
         if not path.exists():
@@ -11229,6 +16987,9 @@ def send_generated_files_to_chat(
                 "Generated file does not exist: %s",
                 filepath,
             )
+            continue
+
+        if not path.is_file():
             continue
 
         suffix = path.suffix.lower()
@@ -11256,11 +17017,11 @@ def send_generated_files_to_chat(
             str(path),
             caption,
         ):
-            result.append(
+            sent_files.append(
                 str(path)
             )
 
-    return result
+    return sent_files
 
 
 # ------------------------------------------------------------
@@ -11272,6 +17033,7 @@ def send_help_message(
 ) -> None:
 
     try:
+
         response = handle_command(
             chat_id,
             "/help",
@@ -11303,7 +17065,9 @@ def telegram_get_updates(
     """
 
     params: Dict[str, Any] = {
-        "timeout": TELEGRAM_POLL_TIMEOUT,
+        "timeout": int(
+            TELEGRAM_POLL_TIMEOUT
+        ),
         "allowed_updates": json.dumps(
             [
                 "message",
@@ -11316,10 +17080,21 @@ def telegram_get_updates(
             offset
         )
 
-    data = telegram_api_request(
-        "getUpdates",
-        params,
-    )
+    try:
+
+        data = telegram_api_request(
+            "getUpdates",
+            params,
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Telegram getUpdates failed: %s",
+            exc,
+        )
+
+        return []
 
     if not data:
         return []
@@ -11379,6 +17154,7 @@ def telegram_delete_webhook() -> bool:
 
     success = bool(
         data
+        and isinstance(data, dict)
         and data.get("ok")
     )
 
@@ -11405,7 +17181,7 @@ def acquire_polling_lock() -> bool:
     """
     Acquires the PostgreSQL advisory lock.
 
-    The function keeps retrying while another Geniosa
+    The function retries while another Geniosa
     process owns the lock.
     """
 
@@ -11457,7 +17233,10 @@ def acquire_polling_lock() -> bool:
 
             if acquired:
 
-                POLLING_LOCK_CONNECTION = connection
+                POLLING_LOCK_CONNECTION = (
+                    connection
+                )
+
                 POLLING_LOCK_ACQUIRED = True
 
                 logger.info(
@@ -11471,7 +17250,11 @@ def acquire_polling_lock() -> bool:
                 "the Telegram polling lock. Retrying..."
             )
 
-            connection.close()
+            try:
+                connection.close()
+            except Exception:
+                pass
+
             connection = None
 
             POLLING_STOP.wait(
@@ -11580,6 +17363,14 @@ def process_telegram_document(
     Downloads and analyzes a Telegram document.
     """
 
+    if not isinstance(
+        document,
+        dict,
+    ):
+        return (
+            "❌ დოკუმენტის მონაცემები არასწორია."
+        )
+
     file_id = document.get(
         "file_id"
     )
@@ -11595,9 +17386,24 @@ def process_telegram_document(
             "❌ დოკუმენტის ID ვერ მივიღე."
         )
 
-    filepath = telegram_download_file(
-        file_id
-    )
+    filepath = None
+
+    try:
+
+        filepath = telegram_download_file(
+            file_id
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram document download failed: %s",
+            exc,
+        )
+
+        return (
+            "❌ ფაილის ჩამოტვირთვა ვერ მოხერხდა."
+        )
 
     if not filepath:
 
@@ -11607,8 +17413,26 @@ def process_telegram_document(
 
     try:
 
-        extracted_text = extract_file_text(
+        path = Path(
             filepath
+        )
+
+        if not path.exists():
+            return (
+                "❌ ჩამოტვირთული ფაილი ვერ მოიძებნა."
+            )
+
+        file_type = detect_file_type(
+            filename
+        )
+
+        if not file_type:
+            file_type = detect_file_type(
+                str(path)
+            )
+
+        extracted_text = extract_file_text(
+            str(path)
         )
 
         if not extracted_text:
@@ -11630,9 +17454,7 @@ def process_telegram_document(
         record_id = save_document_record(
             chat_id=chat_id,
             filename=filename,
-            file_type=detect_file_type(
-                filename
-            ),
+            file_type=file_type,
             extracted_text=extracted_text,
         )
 
@@ -11642,11 +17464,20 @@ def process_telegram_document(
                 "Document record was not created."
             )
 
-        analysis = analyze_document_with_ai(
-            chat_id=chat_id,
-            filename=filename,
-            extracted_text=extracted_text,
-        )
+        # PART 7 canonical signature:
+        # analyze_document_with_ai(chat_id, document_id)
+        if record_id:
+
+            analysis = analyze_document_with_ai(
+                chat_id=chat_id,
+                document_id=record_id,
+            )
+
+        else:
+
+            analysis = (
+                "⚠️ დოკუმენტის ჩანაწერის შექმნა ვერ მოხერხდა."
+            )
 
         if not analysis:
 
@@ -11656,11 +17487,20 @@ def process_telegram_document(
 
         if record_id:
 
-            update_document_analysis(
-                chat_id=chat_id,
-                document_id=record_id,
-                analysis=analysis,
-            )
+            try:
+
+                update_document_analysis(
+                    chat_id=chat_id,
+                    document_id=record_id,
+                    analysis=analysis,
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Could not save document analysis: %s",
+                    exc,
+                )
 
         return (
             f"📄 ფაილი მიღებულია: {filename}\n\n"
@@ -11681,9 +17521,20 @@ def process_telegram_document(
 
     finally:
 
-        cleanup_temp_file(
-            filepath
-        )
+        if filepath:
+
+            try:
+
+                cleanup_temp_file(
+                    filepath
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Could not clean temporary document: %s",
+                    exc,
+                )
 
 
 # ------------------------------------------------------------
@@ -11707,6 +17558,14 @@ def process_telegram_photo(
 
     photo = photos[-1]
 
+    if not isinstance(
+        photo,
+        dict,
+    ):
+        return (
+            "❌ ფოტოს მონაცემები არასწორია."
+        )
+
     file_id = photo.get(
         "file_id"
     )
@@ -11717,9 +17576,24 @@ def process_telegram_photo(
             "❌ ფოტოს ID ვერ მივიღე."
         )
 
-    filepath = telegram_download_file(
-        file_id
-    )
+    filepath = None
+
+    try:
+
+        filepath = telegram_download_file(
+            file_id
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram photo download failed: %s",
+            exc,
+        )
+
+        return (
+            "❌ ფოტოს ჩამოტვირთვა ვერ მოხერხდა."
+        )
 
     if not filepath:
 
@@ -11729,9 +17603,19 @@ def process_telegram_photo(
 
     try:
 
+        path = Path(
+            filepath
+        )
+
+        if not path.exists():
+
+            return (
+                "❌ ჩამოტვირთული ფოტო ვერ მოიძებნა."
+            )
+
         result = analyze_image_with_ai(
             chat_id=chat_id,
-            filepath=filepath,
+            filepath=str(path),
             user_caption=caption,
         )
 
@@ -11759,9 +17643,20 @@ def process_telegram_photo(
 
     finally:
 
-        cleanup_temp_file(
-            filepath
-        )
+        if filepath:
+
+            try:
+
+                cleanup_temp_file(
+                    filepath
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Could not clean temporary photo: %s",
+                    exc,
+                )
 
 
 # ------------------------------------------------------------
@@ -11785,6 +17680,12 @@ def process_telegram_message(
         "chat"
     ) or {}
 
+    if not isinstance(
+        chat,
+        dict,
+    ):
+        return
+
     chat_id = chat.get(
         "id"
     )
@@ -11795,6 +17696,12 @@ def process_telegram_message(
     user = message.get(
         "from"
     ) or {}
+
+    if not isinstance(
+        user,
+        dict,
+    ):
+        user = {}
 
     username = (
         user.get("username")
@@ -11808,9 +17715,13 @@ def process_telegram_message(
         chat_id,
     )
 
+    # --------------------------------------------------------
+    # ACCESS CONTROL
+    # --------------------------------------------------------
+
     try:
 
-        if not user_allowed(
+        if not is_chat_allowed(
             chat_id
         ):
 
@@ -11824,7 +17735,7 @@ def process_telegram_message(
     except Exception as exc:
 
         logger.exception(
-            "User authorization check failed: %s",
+            "Chat authorization check failed: %s",
             exc,
         )
 
@@ -11855,7 +17766,16 @@ def process_telegram_message(
 
     try:
 
+        # ----------------------------------------------------
+        # DOCUMENT
+        # ----------------------------------------------------
+
         if document:
+
+            send_chat_action(
+                chat_id,
+                "typing",
+            )
 
             response = process_telegram_document(
                 chat_id,
@@ -11869,7 +17789,16 @@ def process_telegram_message(
 
             return
 
+        # ----------------------------------------------------
+        # PHOTO
+        # ----------------------------------------------------
+
         if photos:
+
+            send_chat_action(
+                chat_id,
+                "typing",
+            )
 
             response = process_telegram_photo(
                 chat_id,
@@ -11884,7 +17813,16 @@ def process_telegram_message(
 
             return
 
+        # ----------------------------------------------------
+        # TEXT
+        # ----------------------------------------------------
+
         if text:
+
+            send_chat_action(
+                chat_id,
+                "typing",
+            )
 
             response = handle_text_message(
                 chat_id,
@@ -11899,6 +17837,10 @@ def process_telegram_message(
                 )
 
             return
+
+        # ----------------------------------------------------
+        # UNSUPPORTED MESSAGE TYPE
+        # ----------------------------------------------------
 
         send_message(
             chat_id,
@@ -11954,7 +17896,10 @@ def process_telegram_update(
         "message"
     )
 
-    if not message:
+    if not isinstance(
+        message,
+        dict,
+    ):
         return
 
     process_telegram_message(
@@ -11970,9 +17915,8 @@ def telegram_polling_loop() -> None:
     """
     Main Telegram long-polling loop.
 
-    The process waits for the PostgreSQL advisory lock
-    instead of exiting when another deployment temporarily
-    owns it.
+    PostgreSQL advisory lock prevents multiple
+    Geniosa instances from polling Telegram simultaneously.
     """
 
     global TELEGRAM_OFFSET
@@ -12003,7 +17947,6 @@ def telegram_polling_loop() -> None:
                 )
 
                 if not updates:
-
                     continue
 
                 for update in updates:
@@ -12020,6 +17963,22 @@ def telegram_polling_loop() -> None:
                     update_id = update.get(
                         "update_id"
                     )
+
+                    # Process the update first.
+                    # Advance the offset only after the
+                    # update has been handed to the processor.
+                    try:
+
+                        process_telegram_update(
+                            update
+                        )
+
+                    except Exception as exc:
+
+                        logger.exception(
+                            "Telegram update processing failed: %s",
+                            exc,
+                        )
 
                     if update_id is not None:
 
@@ -12046,12 +18005,6 @@ def telegram_polling_loop() -> None:
                                 "Invalid Telegram update_id: %s",
                                 update_id,
                             )
-
-                            continue
-
-                    process_telegram_update(
-                        update
-                    )
 
             except requests.RequestException as exc:
 
@@ -12206,6 +18159,8 @@ def initialize_geniosa() -> None:
             ),
         }
 
+    database_ready = False
+
     if not environment.get(
         "database",
         False,
@@ -12220,6 +18175,8 @@ def initialize_geniosa() -> None:
         try:
 
             ensure_database_ready()
+
+            database_ready = True
 
             logger.info(
                 "PostgreSQL database initialized."
@@ -12253,6 +18210,16 @@ def initialize_geniosa() -> None:
     logger.info(
         "Geniosa initialization completed."
     )
+
+    if (
+        TELEGRAM_BOT_TOKEN
+        and not database_ready
+    ):
+
+        logger.warning(
+            "Telegram polling will not start because "
+            "the database is not ready."
+        )
 
 
 # ------------------------------------------------------------
@@ -12298,30 +18265,38 @@ async def geniosa_lifespan(
 
     initialize_geniosa()
 
-    if TELEGRAM_BOT_TOKEN:
+    should_start_polling = False
 
-        if DATABASE_URL:
+    if TELEGRAM_BOT_TOKEN and DATABASE_URL:
 
-            started = start_telegram_polling()
+        try:
 
-            if not started:
+            should_start_polling = database_is_available()
 
-                logger.error(
-                    "Telegram polling could not be started."
-                )
-
-        else:
+        except Exception as exc:
 
             logger.warning(
-                "Telegram polling was not started because "
-                "DATABASE_URL is missing."
+                "Could not verify database before polling: %s",
+                exc,
             )
 
-    else:
+            should_start_polling = False
+
+    if should_start_polling:
+
+        started = start_telegram_polling()
+
+        if not started:
+
+            logger.error(
+                "Telegram polling could not be started."
+            )
+
+    elif TELEGRAM_BOT_TOKEN:
 
         logger.warning(
             "Telegram polling was not started because "
-            "TELEGRAM_BOT_TOKEN is missing."
+            "the database is unavailable."
         )
 
     try:
