@@ -1,7 +1,7 @@
 # ============================================================
 # GENIOSA 4.0 — PART 1/12
-# Core configuration, environment, FastAPI,
-# Telegram, Gemini, PostgreSQL and health checks
+# Core configuration, imports, paths, environment,
+# Telegram, Gemini, PostgreSQL and FastAPI
 # ============================================================
 
 import os
@@ -28,21 +28,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 
-# ============================================================
-# 1.1 — LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger("geniosa")
-
-
-# ============================================================
-# 1.2 — APPLICATION SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Application identity
+# ------------------------------------------------------------
 
 APP_NAME = "Geniosa"
 APP_VERSION = "4.0"
@@ -50,148 +38,110 @@ APP_VERSION = "4.0"
 APP_ENV = os.getenv(
     "APP_ENV",
     "production",
-).strip() or "production"
+)
 
 TIMEZONE = os.getenv(
     "TIMEZONE",
     "Asia/Tbilisi",
-).strip() or "Asia/Tbilisi"
+)
 
 
-# ============================================================
-# 1.3 — SAFE ENVIRONMENT VALUE HELPERS
-# ============================================================
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 
-def get_env_int(
-    name: str,
-    default: int,
-    minimum: Optional[int] = None,
-) -> int:
-    """
-    უსაფრთხოდ კითხულობს integer environment variable-ს.
-    არასწორი მნიშვნელობის შემთხვევაში იყენებს default-ს.
-    """
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
 
-    raw_value = os.getenv(name, "").strip()
-
-    if not raw_value:
-        value = default
-
-    else:
-        try:
-            value = int(raw_value)
-
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid integer environment variable %s=%r. "
-                "Using default=%s.",
-                name,
-                raw_value,
-                default,
-            )
-            value = default
-
-    if minimum is not None and value < minimum:
-        logger.warning(
-            "Environment variable %s=%s is below minimum=%s. "
-            "Using minimum value.",
-            name,
-            value,
-            minimum,
-        )
-        value = minimum
-
-    return value
+logger = logging.getLogger(
+    APP_NAME
+)
 
 
-def get_env_float(
-    name: str,
-    default: float,
-    minimum: Optional[float] = None,
-) -> float:
-    """
-    უსაფრთხოდ კითხულობს float environment variable-ს.
-    """
-
-    raw_value = os.getenv(name, "").strip()
-
-    if not raw_value:
-        value = default
-
-    else:
-        try:
-            value = float(raw_value)
-
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid float environment variable %s=%r. "
-                "Using default=%s.",
-                name,
-                raw_value,
-                default,
-            )
-            value = default
-
-    if minimum is not None and value < minimum:
-        logger.warning(
-            "Environment variable %s=%s is below minimum=%s. "
-            "Using minimum value.",
-            name,
-            value,
-            minimum,
-        )
-        value = minimum
-
-    return value
-
-
-# ============================================================
-# 1.4 — TELEGRAM SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Telegram configuration
+# ------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
     "",
 ).strip()
 
-TELEGRAM_REQUEST_TIMEOUT = get_env_int(
-    "TELEGRAM_REQUEST_TIMEOUT",
-    30,
-    minimum=5,
+try:
+    TELEGRAM_REQUEST_TIMEOUT = int(
+        os.getenv(
+            "TELEGRAM_REQUEST_TIMEOUT",
+            "60",
+        )
+    )
+except Exception:
+    TELEGRAM_REQUEST_TIMEOUT = 60
+
+TELEGRAM_REQUEST_TIMEOUT = max(
+    10,
+    min(
+        TELEGRAM_REQUEST_TIMEOUT,
+        600,
+    ),
 )
 
-TELEGRAM_FILE_TIMEOUT = get_env_int(
-    "TELEGRAM_FILE_TIMEOUT",
-    60,
-    minimum=5,
+TELEGRAM_API_BASE = os.getenv(
+    "TELEGRAM_API_BASE",
+    "https://api.telegram.org",
+).strip().rstrip("/")
+
+TELEGRAM_FILE_BASE = os.getenv(
+    "TELEGRAM_FILE_BASE",
+    "https://api.telegram.org/file",
+).strip().rstrip("/")
+
+try:
+    TELEGRAM_POLL_INTERVAL = float(
+        os.getenv(
+            "TELEGRAM_POLL_INTERVAL",
+            "1",
+        )
+    )
+except Exception:
+    TELEGRAM_POLL_INTERVAL = 1.0
+
+TELEGRAM_POLL_INTERVAL = max(
+    0.1,
+    min(
+        TELEGRAM_POLL_INTERVAL,
+        30.0,
+    ),
 )
 
-TELEGRAM_POLL_INTERVAL = get_env_float(
-    "TELEGRAM_POLL_INTERVAL",
-    2.0,
-    minimum=0.1,
-)
+try:
+    TELEGRAM_POLL_TIMEOUT = int(
+        os.getenv(
+            "TELEGRAM_POLL_TIMEOUT",
+            "30",
+        )
+    )
+except Exception:
+    TELEGRAM_POLL_TIMEOUT = 30
 
-TELEGRAM_POLL_TIMEOUT = get_env_int(
-    "TELEGRAM_POLL_TIMEOUT",
-    25,
-    minimum=1,
-)
-
-TELEGRAM_API_BASE = (
-    "https://api.telegram.org/bot"
-    + TELEGRAM_BOT_TOKEN
-)
-
-TELEGRAM_FILE_BASE = (
-    "https://api.telegram.org/file/bot"
-    + TELEGRAM_BOT_TOKEN
+TELEGRAM_POLL_TIMEOUT = max(
+    1,
+    min(
+        TELEGRAM_POLL_TIMEOUT,
+        50,
+    ),
 )
 
 
-# ============================================================
-# 1.5 — GEMINI SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Gemini configuration
+# ------------------------------------------------------------
 
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
@@ -200,141 +150,276 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash-lite",
-).strip() or "gemini-2.5-flash-lite"
+    "gemini-3.5-flash-lite",
+).strip()
 
-GEMINI_API_BASE = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_API_BASE = os.getenv(
+    "GEMINI_API_BASE",
+    "https://generativelanguage.googleapis.com/v1beta",
+).strip().rstrip("/")
+
+try:
+    GEMINI_TIMEOUT = int(
+        os.getenv(
+            "GEMINI_TIMEOUT",
+            "120",
+        )
+    )
+except Exception:
+    GEMINI_TIMEOUT = 120
+
+GEMINI_TIMEOUT = max(
+    10,
+    min(
+        GEMINI_TIMEOUT,
+        600,
+    ),
 )
 
-GEMINI_TIMEOUT = get_env_int(
-    "GEMINI_TIMEOUT",
-    120,
-    minimum=10,
-)
 
-
-# ============================================================
-# 1.6 — DATABASE SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# PostgreSQL configuration
+# ------------------------------------------------------------
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "",
 ).strip()
 
-DATABASE_CONNECT_TIMEOUT = get_env_int(
-    "DATABASE_CONNECT_TIMEOUT",
-    10,
-    minimum=2,
+try:
+    DATABASE_CONNECT_TIMEOUT = int(
+        os.getenv(
+            "DATABASE_CONNECT_TIMEOUT",
+            "10",
+        )
+    )
+except Exception:
+    DATABASE_CONNECT_TIMEOUT = 10
+
+DATABASE_CONNECT_TIMEOUT = max(
+    3,
+    min(
+        DATABASE_CONNECT_TIMEOUT,
+        60,
+    ),
 )
 
 
-# ============================================================
-# 1.7 — OWNER SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Owner / access configuration
+# ------------------------------------------------------------
 
 OWNER_ID_RAW = os.getenv(
     "OWNER_ID",
     "",
 ).strip()
 
-OWNER_ID: Optional[int] = None
+try:
+    OWNER_ID = (
+        int(OWNER_ID_RAW)
+        if OWNER_ID_RAW
+        else None
+    )
+except Exception:
+    OWNER_ID = None
 
-if OWNER_ID_RAW:
+
+ALLOWED_CHAT_IDS_RAW = os.getenv(
+    "ALLOWED_CHAT_IDS",
+    "",
+).strip()
+
+
+def _parse_chat_ids(
+    raw_value: str,
+) -> set:
+    """
+    Parses comma-separated Telegram chat IDs.
+    """
+
+    result = set()
+
+    if not raw_value:
+        return result
+
+    for item in raw_value.split(","):
+
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            result.add(
+                int(item)
+            )
+        except Exception:
+            logger.warning(
+                "Invalid chat ID in ALLOWED_CHAT_IDS: %s",
+                item,
+            )
+
+    return result
+
+
+ALLOWED_CHAT_IDS = _parse_chat_ids(
+    ALLOWED_CHAT_IDS_RAW
+)
+
+
+# ------------------------------------------------------------
+# Access control
+# ------------------------------------------------------------
+
+def is_chat_allowed(
+    chat_id: Any,
+) -> bool:
+    """
+    Determines whether a Telegram chat is allowed
+    to use Geniosa.
+
+    Priority:
+    1. OWNER_ID
+    2. ALLOWED_CHAT_IDS
+    3. If no restrictions are configured, allow access.
+    """
 
     try:
-        OWNER_ID = int(
-            OWNER_ID_RAW
+        normalized_chat_id = int(
+            chat_id
         )
+    except Exception:
+        return False
 
-    except (TypeError, ValueError):
+    if (
+        OWNER_ID is not None
+        and normalized_chat_id == OWNER_ID
+    ):
+        return True
 
-        logger.warning(
-            "Invalid OWNER_ID value: %r",
-            OWNER_ID_RAW,
-        )
+    if (
+        ALLOWED_CHAT_IDS
+        and normalized_chat_id in ALLOWED_CHAT_IDS
+    ):
+        return True
 
-        OWNER_ID = None
+    if (
+        OWNER_ID is None
+        and not ALLOWED_CHAT_IDS
+    ):
+        return True
 
-
-# ============================================================
-# 1.8 — STORAGE DIRECTORIES
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-STORAGE_DIR = os.path.join(
-    BASE_DIR,
-    "storage",
-)
-
-UPLOADS_DIR = os.path.join(
-    STORAGE_DIR,
-    "uploads",
-)
-
-GENERATED_DIR = os.path.join(
-    STORAGE_DIR,
-    "generated",
-)
-
-TEMP_DIR = os.path.join(
-    STORAGE_DIR,
-    "temp",
-)
-
-# Compatibility alias used by later Geniosa parts.
-GENERATION_DIR = GENERATED_DIR
-
-# Compatibility alias used by Telegram file processing.
-DOWNLOAD_DIR = UPLOADS_DIR
+    return False
 
 
-def ensure_storage_directories() -> None:
-    """
-    ქმნის Geniosa-ს სამუშაო დირექტორიებს.
-    """
+# ------------------------------------------------------------
+# Storage paths
+# IMPORTANT:
+# All filesystem paths are pathlib.Path objects.
+# ------------------------------------------------------------
 
-    directories = (
-        STORAGE_DIR,
-        UPLOADS_DIR,
-        GENERATED_DIR,
-        TEMP_DIR,
+BASE_DIR = Path(
+    os.path.dirname(
+        os.path.abspath(__file__)
     )
+)
 
-    for directory in directories:
+STORAGE_DIR = (
+    BASE_DIR / "storage"
+)
 
-        os.makedirs(
-            directory,
+UPLOADS_DIR = (
+    STORAGE_DIR / "uploads"
+)
+
+GENERATED_DIR = (
+    STORAGE_DIR / "generated"
+)
+
+TEMP_DIR = (
+    STORAGE_DIR / "temp"
+)
+
+DOWNLOADS_DIR = (
+    TEMP_DIR / "downloads"
+)
+
+
+# ------------------------------------------------------------
+# Create required directories
+# ------------------------------------------------------------
+
+for directory in (
+    STORAGE_DIR,
+    UPLOADS_DIR,
+    GENERATED_DIR,
+    TEMP_DIR,
+    DOWNLOADS_DIR,
+):
+
+    try:
+
+        directory.mkdir(
+            parents=True,
             exist_ok=True,
         )
 
+    except Exception as exc:
 
-ensure_storage_directories()
+        logger.error(
+            "Could not create directory %s: %s",
+            directory,
+            exc,
+        )
 
 
-# ============================================================
-# 1.9 — FASTAPI APPLICATION
-# ============================================================
+# ------------------------------------------------------------
+# Document configuration
+# ------------------------------------------------------------
 
-app = FastAPI(
-    title=APP_NAME,
-    version=APP_VERSION,
+try:
+    MAX_DOCUMENT_SIZE_MB = float(
+        os.getenv(
+            "MAX_DOCUMENT_SIZE_MB",
+            "25",
+        )
+    )
+except Exception:
+    MAX_DOCUMENT_SIZE_MB = 25.0
+
+MAX_DOCUMENT_SIZE_MB = max(
+    1.0,
+    min(
+        MAX_DOCUMENT_SIZE_MB,
+        50.0,
+    ),
+)
+
+MAX_DOCUMENT_SIZE_BYTES = int(
+    MAX_DOCUMENT_SIZE_MB
+    * 1024
+    * 1024
 )
 
 
-# ============================================================
-# 1.10 — GLOBAL TELEGRAM POLLING STATE
-# ============================================================
+# ------------------------------------------------------------
+# PostgreSQL polling lock
+# ------------------------------------------------------------
+
+POLLING_LOCK_ID = int(
+    os.getenv(
+        "POLLING_LOCK_ID",
+        "406391204",
+    )
+)
 
 POLLING_STOP = threading.Event()
 
-POLLING_THREAD: Optional[threading.Thread] = None
+POLLING_THREAD = None
 
-POLLING_THREAD_LOCK = threading.Lock()
+POLLING_THREAD_LOCK = (
+    threading.Lock()
+)
 
 POLLING_LOCK_CONNECTION = None
 
@@ -342,166 +427,31 @@ POLLING_LOCK_ACQUIRED = False
 
 LAST_UPDATE_ID = 0
 
-# Compatibility variable used by later polling code.
-TELEGRAM_OFFSET = 0
 
+# ------------------------------------------------------------
+# FastAPI application
+# ------------------------------------------------------------
 
-# ============================================================
-# 1.11 — DATABASE ADVISORY LOCK
-# ============================================================
-
-POLLING_LOCK_ID = get_env_int(
-    "POLLING_LOCK_ID",
-    406391202,
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
 )
 
 
-# ============================================================
-# 1.12 — DOCUMENT SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Environment status
+# ------------------------------------------------------------
 
-MAX_DOCUMENT_SIZE_MB = get_env_int(
-    "MAX_DOCUMENT_SIZE_MB",
-    20,
-    minimum=1,
-)
-
-MAX_DOCUMENT_SIZE_BYTES = (
-    MAX_DOCUMENT_SIZE_MB
-    * 1024
-    * 1024
-)
-
-MAX_DOCUMENT_AI_TEXT = get_env_int(
-    "MAX_DOCUMENT_AI_TEXT",
-    30000,
-    minimum=1000,
-)
-
-MAX_DOCUMENT_RECORDS = get_env_int(
-    "MAX_DOCUMENT_RECORDS",
-    50,
-    minimum=1,
-)
-
-MAX_EXCEL_ROWS_PER_SHEET = get_env_int(
-    "MAX_EXCEL_ROWS_PER_SHEET",
-    5000,
-    minimum=100,
-)
-
-SUPPORTED_DOCUMENT_TYPES = {
-    "pdf",
-    "docx",
-    "xlsx",
-    "xlsm",
-    "pptx",
-    "txt",
-    "csv",
-}
-
-
-# ============================================================
-# 1.13 — CRM / DATABASE LIMITS
-# ============================================================
-
-MAX_PROJECT_RECORDS = get_env_int(
-    "MAX_PROJECT_RECORDS",
-    50,
-    minimum=1,
-)
-
-MAX_INVESTOR_RECORDS = get_env_int(
-    "MAX_INVESTOR_RECORDS",
-    100,
-    minimum=1,
-)
-
-MAX_DEAL_RECORDS = get_env_int(
-    "MAX_DEAL_RECORDS",
-    100,
-    minimum=1,
-)
-
-MAX_GENERATED_ASSETS = get_env_int(
-    "MAX_GENERATED_ASSETS",
-    100,
-    minimum=1,
-)
-
-
-# ============================================================
-# 1.14 — SECURITY / ACCESS CONTROL
-# ============================================================
-
-ALLOWED_CHAT_IDS_RAW = os.getenv(
-    "ALLOWED_CHAT_IDS",
-    "",
-).strip()
-
-ALLOWED_CHAT_IDS = set()
-
-if ALLOWED_CHAT_IDS_RAW:
-
-    for raw_value in ALLOWED_CHAT_IDS_RAW.split(","):
-
-        value = raw_value.strip()
-
-        if not value:
-            continue
-
-        try:
-
-            ALLOWED_CHAT_IDS.add(
-                int(value)
-            )
-
-        except (TypeError, ValueError):
-
-            logger.warning(
-                "Invalid ALLOWED_CHAT_IDS value: %r",
-                value,
-            )
-
-
-def is_chat_allowed(
-    chat_id: Optional[int],
-) -> bool:
+def get_environment_status() -> Dict[str, Any]:
     """
-    ამოწმებს Telegram chat_id-ს.
-
-    თუ ALLOWED_CHAT_IDS ცარიელია,
-    ბოტი მუშაობს ყველა chat_id-ზე.
-
-    თუ სია შევსებულია,
-    მხოლოდ მითითებული chat_id-ები დაიშვება.
-    """
-
-    if not ALLOWED_CHAT_IDS:
-        return True
-
-    if chat_id is None:
-        return False
-
-    try:
-
-        return int(chat_id) in ALLOWED_CHAT_IDS
-
-    except (TypeError, ValueError):
-
-        return False
-
-
-# ============================================================
-# 1.15 — ENVIRONMENT STATUS
-# ============================================================
-
-def get_environment_status() -> Dict[str, bool]:
-    """
-    აბრუნებს ძირითადი სერვისების კონფიგურაციის სტატუსს.
+    Returns current environment configuration status.
     """
 
     return {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "environment": APP_ENV,
+        "timezone": TIMEZONE,
         "telegram": bool(
             TELEGRAM_BOT_TOKEN
         ),
@@ -511,30 +461,36 @@ def get_environment_status() -> Dict[str, bool]:
         "database": bool(
             DATABASE_URL
         ),
+        "owner_configured": (
+            OWNER_ID is not None
+        ),
+        "allowed_chat_ids_configured": bool(
+            ALLOWED_CHAT_IDS
+        ),
     }
 
 
-def validate_environment() -> Dict[str, bool]:
+def validate_environment() -> Dict[str, Any]:
     """
-    ამოწმებს აუცილებელ environment variables-ს.
+    Validates required environment variables.
+
+    Returns booleans rather than raising during startup,
+    allowing Render logs to clearly show what is missing.
     """
 
     status = get_environment_status()
 
     if not status["telegram"]:
-
         logger.warning(
             "TELEGRAM_BOT_TOKEN is not configured."
         )
 
     if not status["gemini"]:
-
         logger.warning(
             "GEMINI_API_KEY is not configured."
         )
 
     if not status["database"]:
-
         logger.warning(
             "DATABASE_URL is not configured."
         )
@@ -542,38 +498,32 @@ def validate_environment() -> Dict[str, bool]:
     return status
 
 
-# ============================================================
-# 1.16 — DATABASE CONNECTION
-# ============================================================
+# ------------------------------------------------------------
+# PostgreSQL connection
+# ------------------------------------------------------------
 
 def get_db_connection():
     """
-    ქმნის PostgreSQL კავშირს.
+    Creates a PostgreSQL connection.
     """
 
     if not DATABASE_URL:
-
         raise RuntimeError(
             "DATABASE_URL is not configured."
         )
 
-    return psycopg2.connect(
+    connection = psycopg2.connect(
         DATABASE_URL,
         connect_timeout=DATABASE_CONNECT_TIMEOUT,
     )
 
+    return connection
 
-# ============================================================
-# 1.17 — DATABASE AVAILABILITY
-# ============================================================
 
 def database_available() -> bool:
     """
-    ამოწმებს PostgreSQL-ის ხელმისაწვდომობას.
+    Checks whether PostgreSQL is reachable.
     """
-
-    if not DATABASE_URL:
-        return False
 
     connection = None
 
@@ -593,7 +543,7 @@ def database_available() -> bool:
 
     except Exception as exc:
 
-        logger.error(
+        logger.warning(
             "Database availability check failed: %s",
             exc,
         )
@@ -602,290 +552,324 @@ def database_available() -> bool:
 
     finally:
 
-        if connection is not None:
+        if connection:
 
             try:
                 connection.close()
-
             except Exception:
                 pass
 
 
-# ============================================================
-# 1.18 — TELEGRAM API URL
-# ============================================================
+# ------------------------------------------------------------
+# Telegram API
+# ------------------------------------------------------------
 
 def telegram_api_url(
     method: str,
 ) -> str:
+    """
+    Builds a Telegram Bot API URL.
+    """
 
     method = str(
         method or ""
     ).strip().lstrip("/")
 
+    if not method:
+        raise ValueError(
+            "Telegram API method is required."
+        )
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not configured."
+        )
+
     return (
-        TELEGRAM_API_BASE
-        + "/"
-        + method
+        f"{TELEGRAM_API_BASE}"
+        f"/bot{TELEGRAM_BOT_TOKEN}"
+        f"/{method}"
     )
 
-
-# ============================================================
-# 1.19 — TELEGRAM API REQUEST
-# ============================================================
 
 def telegram_request(
     method: str,
     payload: Optional[Dict[str, Any]] = None,
     timeout: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    Telegram Bot API-ს უნივერსალური POST wrapper.
-
-    აბრუნებს Telegram-ის სრულ response dictionary-ს
-    წარმატების შემთხვევაში.
+    Sends a request to the Telegram Bot API.
     """
 
-    if not TELEGRAM_BOT_TOKEN:
-
-        logger.error(
-            "Telegram bot token is not configured."
-        )
-
-        return None
-
-    if payload is None:
-        payload = {}
-
-    request_timeout = (
-        timeout
-        if timeout is not None
-        else TELEGRAM_REQUEST_TIMEOUT
+    url = telegram_api_url(
+        method
     )
 
+    if timeout is None:
+        timeout = TELEGRAM_REQUEST_TIMEOUT
+
+    timeout = max(
+        5,
+        min(
+            int(timeout),
+            600,
+        ),
+    )
+
+    response = requests.post(
+        url,
+        json=payload or {},
+        timeout=timeout,
+    )
+
+    response.raise_for_status()
+
     try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "Telegram returned invalid JSON."
+        ) from exc
 
-        response = requests.post(
-            telegram_api_url(method),
-            json=payload,
-            timeout=request_timeout,
+    if not isinstance(
+        data,
+        dict,
+    ):
+        raise RuntimeError(
+            "Telegram returned an invalid response."
         )
 
-        if response.status_code != 200:
-
-            logger.error(
-                "Telegram API HTTP %s: %s",
-                response.status_code,
-                response.text[:1000],
-            )
-
-            return None
-
-        try:
-
-            data = response.json()
-
-        except ValueError:
-
-            logger.error(
-                "Telegram API returned invalid JSON."
-            )
-
-            return None
-
-        if not data.get("ok"):
-
-            logger.error(
-                "Telegram API error: %s",
-                data,
-            )
-
-            return None
-
-        return data
-
-    except requests.Timeout as exc:
-
-        logger.error(
-            "Telegram request timeout: %s",
-            exc,
+    if not data.get(
+        "ok",
+        False,
+    ):
+        description = data.get(
+            "description",
+            "Unknown Telegram API error.",
         )
 
-        return None
-
-    except requests.RequestException as exc:
-
-        logger.error(
-            "Telegram request failed: %s",
-            exc,
+        raise RuntimeError(
+            f"Telegram API error: {description}"
         )
 
-        return None
+    return data
 
-    except Exception as exc:
-
-        logger.exception(
-            "Telegram request unexpected error: %s",
-            exc,
-        )
-
-        return None
-
-
-# ============================================================
-# 1.20 — TELEGRAM SEND MESSAGE
-# ============================================================
 
 def send_telegram_message(
-    chat_id: int,
+    chat_id: Any,
     text: str,
     parse_mode: Optional[str] = None,
     disable_web_page_preview: bool = True,
+    **kwargs: Any,
 ) -> bool:
     """
-    აგზავნის ტექსტურ შეტყობინებას Telegram-ში.
+    Sends a text message through Telegram.
     """
 
     if chat_id is None:
         return False
 
-    if not text:
+    message = str(
+        text or ""
+    ).strip()
+
+    if not message:
         return False
 
     payload: Dict[str, Any] = {
-        "chat_id": int(chat_id),
-        "text": str(text),
+        "chat_id": chat_id,
+        "text": message[:4096],
         "disable_web_page_preview": (
             disable_web_page_preview
         ),
     }
 
     if parse_mode:
-
         payload["parse_mode"] = parse_mode
 
-    result = telegram_request(
-        "sendMessage",
-        payload,
-    )
+    for key, value in kwargs.items():
 
-    return bool(
-        result
-        and result.get("ok")
-    )
+        if value is not None:
+            payload[key] = value
 
+    try:
 
-# ============================================================
-# 1.21 — TELEGRAM CHAT ACTION
-# ============================================================
+        telegram_request(
+            "sendMessage",
+            payload,
+        )
+
+        return True
+
+    except Exception as exc:
+
+        logger.warning(
+            "Could not send Telegram message: %s",
+            exc,
+        )
+
+        return False
+
 
 def send_chat_action(
-    chat_id: int,
+    chat_id: Any,
     action: str = "typing",
 ) -> bool:
     """
-    აგზავნის Telegram chat action-ს.
+    Sends a Telegram chat action.
     """
 
     if chat_id is None:
         return False
 
-    action = (
-        str(action or "typing").strip()
-        or "typing"
-    )
+    try:
 
-    result = telegram_request(
-        "sendChatAction",
-        {
-            "chat_id": int(chat_id),
-            "action": action,
-        },
-    )
+        telegram_request(
+            "sendChatAction",
+            {
+                "chat_id": chat_id,
+                "action": action,
+            },
+        )
 
-    return bool(
-        result
-        and result.get("ok")
-    )
+        return True
 
+    except Exception as exc:
 
-# ============================================================
-# 1.22 — TELEGRAM BOT INFORMATION
-# ============================================================
+        logger.debug(
+            "Could not send Telegram chat action: %s",
+            exc,
+        )
+
+        return False
+
 
 def telegram_get_me() -> Optional[Dict[str, Any]]:
     """
-    აბრუნებს Telegram bot-ის ინფორმაციას.
+    Returns Telegram bot information.
     """
 
-    result = telegram_request(
-        "getMe",
-        {},
-    )
+    try:
 
-    if not result:
-        return None
+        data = telegram_request(
+            "getMe"
+        )
 
-    return result.get(
-        "result"
-    )
+        result = data.get(
+            "result"
+        )
+
+        if isinstance(
+            result,
+            dict,
+        ):
+            return result
+
+    except Exception as exc:
+
+        logger.warning(
+            "Telegram getMe failed: %s",
+            exc,
+        )
+
+    return None
 
 
-# ============================================================
-# 1.23 — GEMINI API URL
-# ============================================================
+# ------------------------------------------------------------
+# Gemini API
+# ------------------------------------------------------------
 
 def gemini_api_url(
     model: Optional[str] = None,
 ) -> str:
     """
-    ქმნის Gemini generateContent endpoint URL-ს.
+    Builds Gemini generateContent endpoint URL.
     """
 
     selected_model = (
-        model
-        or GEMINI_MODEL
-    ).strip()
+        str(
+            model or GEMINI_MODEL
+        ).strip()
+    )
+
+    if not selected_model:
+        selected_model = GEMINI_MODEL
 
     return (
-        GEMINI_API_BASE
-        + "/"
-        + selected_model
-        + ":generateContent"
+        f"{GEMINI_API_BASE}"
+        f"/models/{selected_model}"
+        f":generateContent"
     )
 
 
-# ============================================================
-# 1.24 — BASIC TEXT UTILITIES
-# ============================================================
+# ------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------
 
 def safe_text(
     value: Any,
+    default: str = "",
 ) -> str:
     """
-    უსაფრთხოდ გარდაქმნის მნიშვნელობას ტექსტად.
+    Converts a value into safe text.
     """
 
     if value is None:
-        return ""
+        return default
 
-    return str(value).strip()
+    try:
+        result = str(
+            value
+        )
+    except Exception:
+        return default
+
+    result = (
+        result
+        .replace("\x00", "")
+        .strip()
+    )
+
+    return (
+        result
+        if result
+        else default
+    )
 
 
 def normalize_text(
     value: Any,
 ) -> str:
     """
-    ამცირებს ზედმეტ whitespace-ს.
+    Normalizes whitespace and line endings.
     """
 
     text = safe_text(
         value
     )
 
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
     text = re.sub(
-        r"\s+",
+        r"[ \t]+",
         " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
         text,
     )
 
@@ -894,7 +878,7 @@ def normalize_text(
 
 def utc_now() -> datetime:
     """
-    აბრუნებს მიმდინარე UTC datetime-ს.
+    Returns timezone-aware UTC datetime.
     """
 
     return datetime.now(
@@ -904,7 +888,7 @@ def utc_now() -> datetime:
 
 def generate_uuid() -> str:
     """
-    ქმნის UUID-ს.
+    Generates a UUID string.
     """
 
     return str(
@@ -912,229 +896,122 @@ def generate_uuid() -> str:
     )
 
 
-# ============================================================
-# 1.25 — FASTAPI ROOT
-# ============================================================
+# ------------------------------------------------------------
+# FastAPI routes
+# ------------------------------------------------------------
 
 @app.get("/")
 def root():
-
-    env = get_environment_status()
-
     return {
-        "service": APP_NAME,
+        "name": APP_NAME,
         "version": APP_VERSION,
         "status": "online",
-        "telegram_configured": env["telegram"],
-        "gemini_configured": env["gemini"],
-        "database_configured": env["database"],
     }
 
-
-# ============================================================
-# 1.26 — HEAD HEALTH CHECK
-# ============================================================
 
 @app.head("/")
 def root_head():
-
     return JSONResponse(
-        status_code=200,
         content=None,
+        status_code=200,
     )
 
-
-# ============================================================
-# 1.27 — STATUS ENDPOINT
-# ============================================================
 
 @app.get("/status")
 def status():
+    return get_environment_status()
 
-    env = get_environment_status()
 
-    polling_alive = bool(
-        POLLING_THREAD
-        and POLLING_THREAD.is_alive()
-    )
+@app.get("/health/database")
+def health_database():
+    available = database_available()
 
     return {
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "status": "online",
-        "environment": APP_ENV,
-        "telegram_configured": env["telegram"],
-        "gemini_configured": env["gemini"],
-        "database_configured": env["database"],
-        "gemini_model": GEMINI_MODEL,
-        "polling_thread_alive": polling_alive,
-        "allowed_chat_count": len(
-            ALLOWED_CHAT_IDS
+        "database": (
+            "ok"
+            if available
+            else "error"
         ),
     }
 
 
-# ============================================================
-# 1.28 — DATABASE HEALTH CHECK
-# ============================================================
-
-@app.get("/health/database")
-def database_health():
-
-    available = database_available()
-
-    return JSONResponse(
-        status_code=(
-            200
-            if available
-            else 503
-        ),
-        content={
-            "database": (
-                "ok"
-                if available
-                else "unavailable"
-            ),
-        },
-    )
-
-
-# ============================================================
-# 1.29 — GENERAL HEALTH CHECK
-# ============================================================
-
 @app.get("/health")
 def health():
+    database_ok = database_available()
 
-    env = get_environment_status()
-
-    db_ok = database_available()
-
-    overall_ok = (
-        env["telegram"]
-        and env["gemini"]
-        and env["database"]
-        and db_ok
-    )
-
-    return JSONResponse(
-        status_code=(
-            200
-            if overall_ok
-            else 503
+    return {
+        "status": "ok",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "database": database_ok,
+        "telegram_configured": bool(
+            TELEGRAM_BOT_TOKEN
         ),
-        content={
-            "service": APP_NAME,
-            "version": APP_VERSION,
-            "status": (
-                "healthy"
-                if overall_ok
-                else "degraded"
-            ),
-            "telegram": env["telegram"],
-            "gemini": env["gemini"],
-            "database": env["database"],
-            "database_connection": db_ok,
-            "gemini_model": GEMINI_MODEL,
-        },
-    )
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        ),
+    }
 
 
-# ============================================================
-# 1.30 — STARTUP CONFIGURATION LOG
-# ============================================================
+# ------------------------------------------------------------
+# Startup configuration logging
+# ------------------------------------------------------------
 
-def log_startup_configuration():
+try:
 
-    logger.info(
-        "============================================================"
+    environment_status = (
+        validate_environment()
     )
 
     logger.info(
-        "GENIOSA 4.0 configuration"
+        "%s %s configuration loaded.",
+        APP_NAME,
+        APP_VERSION,
     )
 
     logger.info(
-        "APP_ENV=%s",
+        "Environment: %s",
         APP_ENV,
     )
 
     logger.info(
-        "Telegram configured=%s",
-        bool(
-            TELEGRAM_BOT_TOKEN
-        ),
+        "Storage directory: %s",
+        STORAGE_DIR,
     )
 
     logger.info(
-        "Gemini configured=%s",
-        bool(
-            GEMINI_API_KEY
-        ),
+        "Uploads directory: %s",
+        UPLOADS_DIR,
     )
 
     logger.info(
-        "Gemini model=%s",
-        GEMINI_MODEL,
+        "Generated directory: %s",
+        GENERATED_DIR,
     )
 
     logger.info(
-        "Database configured=%s",
-        bool(
-            DATABASE_URL
-        ),
+        "Temp directory: %s",
+        TEMP_DIR,
     )
 
     logger.info(
-        "Telegram request timeout=%s",
-        TELEGRAM_REQUEST_TIMEOUT,
+        "Downloads directory: %s",
+        DOWNLOADS_DIR,
     )
 
-    logger.info(
-        "Telegram file timeout=%s",
-        TELEGRAM_FILE_TIMEOUT,
+except Exception as exc:
+
+    logger.exception(
+        "Startup configuration logging failed: %s",
+        exc,
     )
-
-    logger.info(
-        "Telegram poll interval=%s",
-        TELEGRAM_POLL_INTERVAL,
-    )
-
-    logger.info(
-        "Telegram poll timeout=%s",
-        TELEGRAM_POLL_TIMEOUT,
-    )
-
-    logger.info(
-        "Maximum document size=%s MB",
-        MAX_DOCUMENT_SIZE_MB,
-    )
-
-    logger.info(
-        "Allowed chat IDs configured=%s",
-        len(ALLOWED_CHAT_IDS),
-    )
-
-    logger.info(
-        "============================================================"
-    )
-
-
 # ============================================================
-# 1.31 — INITIAL ENVIRONMENT CHECK
-# ============================================================
-
-validate_environment()
-
-log_startup_configuration()
-
-
-# ============================================================
-# 1.32 — PART 1 COMPLETE
+# GENIOSA 4.0 — PART 1/12 LOADED
 # ============================================================
 
 print(
     "GENIOSA 4.0 — PART 1/12 LOADED"
+)
 )
 
 
