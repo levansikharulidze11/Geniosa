@@ -17,6 +17,7 @@ import traceback
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
 
 import requests
 import psycopg2
@@ -151,7 +152,10 @@ OWNER_ID_RAW = os.getenv(
 ).strip()
 
 try:
-    OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW else None
+    OWNER_ID = int(
+        OWNER_ID_RAW
+    ) if OWNER_ID_RAW else None
+
 except ValueError:
     OWNER_ID = None
 
@@ -273,14 +277,19 @@ ALLOWED_CHAT_IDS_RAW = os.getenv(
 ALLOWED_CHAT_IDS = set()
 
 if ALLOWED_CHAT_IDS_RAW:
+
     for value in ALLOWED_CHAT_IDS_RAW.split(","):
+
         value = value.strip()
 
         if not value:
             continue
 
         try:
-            ALLOWED_CHAT_IDS.add(int(value))
+            ALLOWED_CHAT_IDS.add(
+                int(value)
+            )
+
         except ValueError:
             logger.warning(
                 "Invalid ALLOWED_CHAT_IDS value: %s",
@@ -304,7 +313,11 @@ def is_chat_allowed(
     if chat_id is None:
         return False
 
-    return int(chat_id) in ALLOWED_CHAT_IDS
+    try:
+        return int(chat_id) in ALLOWED_CHAT_IDS
+
+    except (TypeError, ValueError):
+        return False
 
 
 # ============================================================
@@ -312,6 +325,7 @@ def is_chat_allowed(
 # ============================================================
 
 def get_environment_status() -> Dict[str, bool]:
+
     return {
         "telegram": bool(
             TELEGRAM_BOT_TOKEN
@@ -329,22 +343,25 @@ def validate_environment() -> Dict[str, bool]:
     """
     Проверяет основные переменные окружения.
     Не останавливает приложение при отсутствии
-    необязательных переменных.
+    переменных.
     """
 
     status = get_environment_status()
 
     if not status["telegram"]:
+
         logger.warning(
             "TELEGRAM_BOT_TOKEN is not configured"
         )
 
     if not status["gemini"]:
+
         logger.warning(
             "GEMINI_API_KEY is not configured"
         )
 
     if not status["database"]:
+
         logger.warning(
             "DATABASE_URL is not configured"
         )
@@ -362,6 +379,7 @@ def get_db_connection():
     """
 
     if not DATABASE_URL:
+
         raise RuntimeError(
             "DATABASE_URL is not configured"
         )
@@ -389,15 +407,21 @@ def database_available() -> bool:
     connection = None
 
     try:
+
         connection = get_db_connection()
 
         with connection.cursor() as cursor:
-            cursor.execute("SELECT 1")
+
+            cursor.execute(
+                "SELECT 1"
+            )
+
             cursor.fetchone()
 
         return True
 
     except Exception as exc:
+
         logger.error(
             "Database availability check failed: %s",
             exc,
@@ -406,9 +430,12 @@ def database_available() -> bool:
         return False
 
     finally:
+
         if connection:
+
             try:
                 connection.close()
+
             except Exception:
                 pass
 
@@ -420,6 +447,7 @@ def database_available() -> bool:
 def telegram_api_url(
     method: str,
 ) -> str:
+
     return (
         TELEGRAM_API_BASE
         + "/"
@@ -437,6 +465,7 @@ def telegram_request(
     """
 
     if not TELEGRAM_BOT_TOKEN:
+
         logger.error(
             "Telegram bot token is not configured"
         )
@@ -453,6 +482,7 @@ def telegram_request(
     )
 
     try:
+
         response = requests.post(
             telegram_api_url(method),
             json=payload,
@@ -460,6 +490,7 @@ def telegram_request(
         )
 
         if response.status_code != 200:
+
             logger.error(
                 "Telegram API HTTP %s: %s",
                 response.status_code,
@@ -471,6 +502,7 @@ def telegram_request(
         data = response.json()
 
         if not data.get("ok"):
+
             logger.error(
                 "Telegram API error: %s",
                 data,
@@ -481,6 +513,7 @@ def telegram_request(
         return data
 
     except requests.RequestException as exc:
+
         logger.error(
             "Telegram request failed: %s",
             exc,
@@ -489,6 +522,7 @@ def telegram_request(
         return None
 
     except Exception as exc:
+
         logger.error(
             "Telegram request unexpected error: %s",
             exc,
@@ -544,6 +578,7 @@ def send_chat_action(
     chat_id: int,
     action: str = "typing",
 ) -> bool:
+
     result = telegram_request(
         "sendChatAction",
         {
@@ -563,6 +598,7 @@ def send_chat_action(
 # ============================================================
 
 def telegram_get_me() -> Optional[Dict[str, Any]]:
+
     result = telegram_request(
         "getMe",
         {},
@@ -571,7 +607,9 @@ def telegram_get_me() -> Optional[Dict[str, Any]]:
     if not result:
         return None
 
-    return result.get("result")
+    return result.get(
+        "result"
+    )
 
 
 # ============================================================
@@ -581,6 +619,7 @@ def telegram_get_me() -> Optional[Dict[str, Any]]:
 def gemini_api_url(
     model: Optional[str] = None,
 ) -> str:
+
     selected_model = (
         model
         or GEMINI_MODEL
@@ -601,6 +640,7 @@ def gemini_api_url(
 def safe_text(
     value: Any,
 ) -> str:
+
     if value is None:
         return ""
 
@@ -610,7 +650,10 @@ def safe_text(
 def normalize_text(
     value: Any,
 ) -> str:
-    text = safe_text(value)
+
+    text = safe_text(
+        value
+    )
 
     text = re.sub(
         r"\s+",
@@ -622,13 +665,17 @@ def normalize_text(
 
 
 def utc_now() -> datetime:
+
     return datetime.now(
         timezone.utc
     )
 
 
 def generate_uuid() -> str:
-    return str(uuid.uuid4())
+
+    return str(
+        uuid.uuid4()
+    )
 
 
 # ============================================================
@@ -637,6 +684,7 @@ def generate_uuid() -> str:
 
 @app.get("/")
 def root():
+
     env = get_environment_status()
 
     return {
@@ -655,6 +703,7 @@ def root():
 
 @app.head("/")
 def root_head():
+
     return None
 
 
@@ -664,6 +713,7 @@ def root_head():
 
 @app.get("/status")
 def status():
+
     env = get_environment_status()
 
     return {
@@ -689,10 +739,15 @@ def status():
 
 @app.get("/health/database")
 def database_health():
+
     available = database_available()
 
     return JSONResponse(
-        status_code=200 if available else 503,
+        status_code=(
+            200
+            if available
+            else 503
+        ),
         content={
             "database": (
                 "ok"
@@ -709,6 +764,7 @@ def database_health():
 
 @app.get("/health")
 def health():
+
     env = get_environment_status()
 
     db_ok = database_available()
@@ -721,7 +777,11 @@ def health():
     )
 
     return JSONResponse(
-        status_code=200 if overall_ok else 503,
+        status_code=(
+            200
+            if overall_ok
+            else 503
+        ),
         content={
             "service": APP_NAME,
             "version": APP_VERSION,
@@ -760,12 +820,16 @@ def log_startup_configuration():
 
     logger.info(
         "Telegram configured=%s",
-        bool(TELEGRAM_BOT_TOKEN),
+        bool(
+            TELEGRAM_BOT_TOKEN
+        ),
     )
 
     logger.info(
         "Gemini configured=%s",
-        bool(GEMINI_API_KEY),
+        bool(
+            GEMINI_API_KEY
+        ),
     )
 
     logger.info(
@@ -775,7 +839,9 @@ def log_startup_configuration():
 
     logger.info(
         "Database configured=%s",
-        bool(DATABASE_URL),
+        bool(
+            DATABASE_URL
+        ),
     )
 
     logger.info(
@@ -801,7 +867,9 @@ log_startup_configuration()
 # PART 1 COMPLETE
 # ============================================================
 
-print("GENIOSA 4.0 — PART 1/12 LOADED")
+print(
+    "GENIOSA 4.0 — PART 1/12 LOADED"
+)
 
 
 # ============================================================
