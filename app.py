@@ -1,935 +1,4 @@
 # ============================================================
-
-# GENIOSA 4.0 — PART 1/12
-
-# Core configuration, imports, logging, storage and FastAPI
-
-# ============================================================
-
-import os
-
-import re
-
-import json
-
-import time
-
-import base64
-
-import logging
-
-import threading
-
-from pathlib import Path
-
-from contextlib import asynccontextmanager
-
-from datetime import datetime
-
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests
-
-import psycopg2
-
-from psycopg2.extras import RealDictCursor
-
-from fastapi import FastAPI
-
-from openpyxl import Workbook, load_workbook
-
-from pptx import Presentation
-
-from pypdf import PdfReader
-
-from docx import Document
-
-# ============================================================
-
-# 1.1 — LOGGING
-
-# ============================================================
-
-logging.basicConfig(
-
-    level=logging.INFO,
-
-    format="%(asctime)s %(levelname)s %(name)s %(message)s"
-
-)
-
-logger = logging.getLogger("geniosa")
-
-# ============================================================
-
-# 1.2 — ENVIRONMENT VARIABLES
-
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-
-    "TELEGRAM_BOT_TOKEN",
-
-    ""
-
-).strip()
-
-GEMINI_API_KEY = os.getenv(
-
-    "GEMINI_API_KEY",
-
-    ""
-
-).strip()
-
-DATABASE_URL = os.getenv(
-
-    "DATABASE_URL",
-
-    ""
-
-).strip()
-
-OWNER_ID = os.getenv(
-
-    "GENIOSA_OWNER_ID",
-
-    ""
-
-).strip()
-
-GEMINI_MODEL = os.getenv(
-
-    "GEMINI_MODEL",
-
-    "gemini-3.5-flash-lite"
-
-).strip()
-
-# ============================================================
-
-# 1.3 — APPLICATION SETTINGS
-
-# ============================================================
-
-APP_NAME = "Geniosa"
-
-APP_VERSION = "4.0"
-
-MAX_TELEGRAM_MESSAGE = 3900
-
-TELEGRAM_LONG_POLL_TIMEOUT = 25
-
-TELEGRAM_REQUEST_TIMEOUT = 35
-
-TELEGRAM_FILE_TIMEOUT = 120
-
-DATABASE_CONNECT_TIMEOUT = 15
-
-MAX_MEMORY_RECORDS = 50
-
-MAX_PROJECT_RECORDS = 100
-
-MAX_INVESTOR_RECORDS = 100
-
-MAX_DEAL_RECORDS = 100
-
-MAX_DOCUMENT_RECORDS = 50
-
-MAX_GENERATED_ASSETS = 100
-
-# ============================================================
-
-# 1.4 — STORAGE DIRECTORIES
-
-# ============================================================
-
-STORAGE_DIR = Path(
-
-    os.getenv(
-
-        "GENIOSA_STORAGE_DIR",
-
-        "/tmp/geniosa"
-
-    )
-
-)
-
-DOWNLOAD_DIR = STORAGE_DIR / "downloads"
-
-GENERATION_DIR = STORAGE_DIR / "generated"
-
-UPLOAD_DIR = STORAGE_DIR / "uploads"
-
-for directory in (
-
-    STORAGE_DIR,
-
-    DOWNLOAD_DIR,
-
-    GENERATION_DIR,
-
-    UPLOAD_DIR,
-
-):
-
-    directory.mkdir(
-
-        parents=True,
-
-        exist_ok=True
-
-    )
-
-# ============================================================
-
-# 1.5 — TELEGRAM API
-
-# ============================================================
-
-TELEGRAM_API = (
-
-    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-)
-
-def telegram_url(method: str) -> str:
-
-    """
-
-    Build a Telegram Bot API endpoint URL.
-
-    """
-
-    return f"{TELEGRAM_API}/{method}"
-
-# ============================================================
-
-# 1.6 — GEMINI API
-
-# ============================================================
-
-def gemini_url(model: Optional[str] = None) -> str:
-
-    """
-
-    Build the Gemini generateContent endpoint.
-
-    """
-
-    selected_model = (
-
-        model or GEMINI_MODEL
-
-    ).strip()
-
-    return (
-
-        "https://generativelanguage.googleapis.com/"
-
-        f"v1beta/models/{selected_model}:generateContent"
-
-    )
-
-# ============================================================
-
-# 1.7 — FASTAPI APPLICATION
-
-# ============================================================
-
-app = FastAPI(
-
-    title=APP_NAME,
-
-    version=APP_VERSION
-
-)
-
-# ============================================================
-
-# 1.8 — GLOBAL TELEGRAM POLLING STATE
-
-# ============================================================
-
-POLLING_THREAD = None
-
-POLLING_STOP = threading.Event()
-
-POLLING_THREAD_LOCK = threading.Lock()
-
-TELEGRAM_OFFSET = None
-
-# ============================================================
-
-# 1.9 — POSTGRESQL ADVISORY LOCK STATE
-
-# ============================================================
-
-POLLING_LOCK_CONN = None
-
-POLLING_LOCK_ACQUIRED = False
-
-POLLING_LOCK_ID = 987654321
-
-# ============================================================
-
-# 1.10 — DOCUMENT SETTINGS
-
-# ============================================================
-
-SUPPORTED_DOCUMENT_TYPES = {
-
-    "pdf",
-
-    "docx",
-
-    "xlsx",
-
-    "xlsm",
-
-    "pptx",
-
-    "txt",
-
-    "csv",
-
-}
-
-MAX_DOCUMENT_AI_TEXT = 50000
-
-MAX_EXCEL_ROWS_PER_SHEET = 5000
-
-# ============================================================
-
-# 1.11 — BASIC SECURITY
-
-# ============================================================
-
-def user_allowed(chat_id: Any) -> bool:
-
-    """
-
-    Restrict bot access to the configured owner.
-
-    If GENIOSA_OWNER_ID is empty, access is allowed.
-
-    """
-
-    if not OWNER_ID:
-
-        return True
-
-    return str(chat_id) == str(OWNER_ID)
-
-# ============================================================
-
-# 1.12 — ENVIRONMENT VALIDATION
-
-# ============================================================
-
-def validate_environment() -> Dict[str, bool]:
-
-    """
-
-    Check required environment variables.
-
-    This function does not crash the application during import.
-
-    It allows the health/status endpoints to report the problem
-
-    clearly instead.
-
-    """
-
-    return {
-
-        "telegram": bool(TELEGRAM_BOT_TOKEN),
-
-        "gemini": bool(GEMINI_API_KEY),
-
-        "database": bool(DATABASE_URL),
-
-    }
-
-def environment_is_ready() -> bool:
-
-    """
-
-    Return True when all required environment variables exist.
-
-    """
-
-    state = validate_environment()
-
-    return all(state.values())
-
-# ============================================================
-
-# 1.13 — DATABASE CONNECTION
-
-# ============================================================
-
-def db():
-
-    """
-
-    Create a PostgreSQL connection.
-
-    A new connection is intentionally created for each operation.
-
-    This keeps the architecture simple and reliable for the
-
-    current Geniosa deployment.
-
-    """
-
-    if not DATABASE_URL:
-
-        raise RuntimeError(
-
-            "DATABASE_URL is not configured."
-
-        )
-
-    return psycopg2.connect(
-
-        DATABASE_URL,
-
-        cursor_factory=RealDictCursor,
-
-        connect_timeout=DATABASE_CONNECT_TIMEOUT,
-
-    )
-
-# ============================================================
-
-# 1.14 — DATABASE AVAILABILITY CHECK
-
-# ============================================================
-
-def database_is_available() -> bool:
-
-    """
-
-    Test PostgreSQL connectivity.
-
-    """
-
-    connection = None
-
-    cursor = None
-
-    try:
-
-        connection = db()
-
-        cursor = connection.cursor()
-
-        cursor.execute(
-
-            "SELECT 1 AS ok"
-
-        )
-
-        result = cursor.fetchone()
-
-        return bool(
-
-            result and result.get("ok") == 1
-
-        )
-
-    except Exception as exc:
-
-        logger.error(
-
-            "Database availability check failed: %s",
-
-            exc
-
-        )
-
-        return False
-
-    finally:
-
-        if cursor is not None:
-
-            try:
-
-                cursor.close()
-
-            except Exception:
-
-                pass
-
-        if connection is not None:
-
-            try:
-
-                connection.close()
-
-            except Exception:
-
-                pass
-
-# ============================================================
-
-# 1.15 — TELEGRAM AVAILABILITY CHECK
-
-# ============================================================
-
-def telegram_is_available() -> bool:
-
-    """
-
-    Check whether the Telegram bot token is configured.
-
-    A lightweight API call is intentionally avoided here so that
-
-    health checks do not create unnecessary Telegram traffic.
-
-    """
-
-    return bool(TELEGRAM_BOT_TOKEN)
-
-# ============================================================
-
-# 1.16 — GEMINI AVAILABILITY CHECK
-
-# ============================================================
-
-def gemini_is_available() -> bool:
-
-    """
-
-    Check whether the Gemini API key is configured.
-
-    """
-
-    return bool(GEMINI_API_KEY)
-
-# ============================================================
-
-# 1.17 — TELEGRAM SEND MESSAGE
-
-# ============================================================
-
-def send_message(
-
-    chat_id: Any,
-
-    text: str
-
-) -> bool:
-
-    """
-
-    Send a text message through Telegram.
-
-    """
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        logger.error(
-
-            "Cannot send Telegram message: "
-
-            "TELEGRAM_BOT_TOKEN is missing."
-
-        )
-
-        return False
-
-    if text is None:
-
-        text = ""
-
-    text = str(text)
-
-    if not text:
-
-        text = "Geniosa: empty response."
-
-    payload = {
-
-        "chat_id": chat_id,
-
-        "text": text,
-
-    }
-
-    try:
-
-        response = requests.post(
-
-            telegram_url("sendMessage"),
-
-            json=payload,
-
-            timeout=TELEGRAM_REQUEST_TIMEOUT,
-
-        )
-
-        if response.status_code != 200:
-
-            logger.error(
-
-                "Telegram sendMessage HTTP %s: %s",
-
-                response.status_code,
-
-                response.text[:1000],
-
-            )
-
-            return False
-
-        data = response.json()
-
-        if not data.get("ok"):
-
-            logger.error(
-
-                "Telegram sendMessage API error: %s",
-
-                data
-
-            )
-
-            return False
-
-        return True
-
-    except Exception as exc:
-
-        logger.error(
-
-            "Telegram sendMessage failed: %s",
-
-            exc
-
-        )
-
-        return False
-
-# ============================================================
-
-# 1.18 — LONG TELEGRAM MESSAGE SENDER
-
-# ============================================================
-
-def send_long_message(
-
-    chat_id: Any,
-
-    text: str
-
-) -> bool:
-
-    """
-
-    Split long responses into Telegram-safe chunks.
-
-    """
-
-    if text is None:
-
-        text = ""
-
-    text = str(text).strip()
-
-    if not text:
-
-        return send_message(
-
-            chat_id,
-
-            "Geniosa: empty response."
-
-        )
-
-    chunks = []
-
-    remaining = text
-
-    while len(remaining) > MAX_TELEGRAM_MESSAGE:
-
-        cut = remaining.rfind(
-
-            "\n",
-
-            0,
-
-            MAX_TELEGRAM_MESSAGE
-
-        )
-
-        if cut < 500:
-
-            cut = remaining.rfind(
-
-                " ",
-
-                0,
-
-                MAX_TELEGRAM_MESSAGE
-
-            )
-
-        if cut < 500:
-
-            cut = MAX_TELEGRAM_MESSAGE
-
-        chunk = remaining[:cut].strip()
-
-        if chunk:
-
-            chunks.append(chunk)
-
-        remaining = remaining[cut:].strip()
-
-    if remaining:
-
-        chunks.append(remaining)
-
-    success = True
-
-    for chunk in chunks:
-
-        if not send_message(
-
-            chat_id,
-
-            chunk
-
-        ):
-
-            success = False
-
-        time.sleep(0.15)
-
-    return success
-
-# ============================================================
-
-# 1.19 — FASTAPI ROOT
-
-# ============================================================
-
-@app.get("/")
-
-def root():
-
-    """
-
-    Basic service information.
-
-    """
-
-    env = validate_environment()
-
-    return {
-
-        "service": APP_NAME,
-
-        "version": APP_VERSION,
-
-        "status": "online",
-
-        "telegram_configured": env["telegram"],
-
-        "gemini_configured": env["gemini"],
-
-        "database_configured": env["database"],
-
-    }
-@app.head("/")
-
-def root_head():
-
-    return None
-# ============================================================
-
-# 1.20 — FASTAPI STATUS
-
-# ============================================================
-
-@app.get("/status")
-
-def status():
-
-    """
-
-    Detailed service status.
-
-    """
-
-    database_ok = database_is_available()
-
-    telegram_ok = telegram_is_available()
-
-    gemini_ok = gemini_is_available()
-
-    overall_ok = (
-
-        database_ok
-
-        and telegram_ok
-
-        and gemini_ok
-
-    )
-
-    return {
-
-        "service": APP_NAME,
-
-        "version": APP_VERSION,
-
-        "status": (
-
-            "online"
-
-            if overall_ok
-
-            else "degraded"
-
-        ),
-
-        "database": database_ok,
-
-        "telegram": telegram_ok,
-
-        "gemini": gemini_ok,
-
-    }
-
-# ============================================================
-
-# 1.21 — FASTAPI HEALTH CHECK
-
-# ============================================================
-
-@app.get("/health")
-
-def health():
-
-    """
-
-    Render-compatible health endpoint.
-
-    """
-
-    database_ok = database_is_available()
-
-    telegram_ok = telegram_is_available()
-
-    gemini_ok = gemini_is_available()
-
-    healthy = (
-
-        database_ok
-
-        and telegram_ok
-
-        and gemini_ok
-
-    )
-
-    return {
-
-        "status": (
-
-            "healthy"
-
-            if healthy
-
-            else "degraded"
-
-        ),
-
-        "database": database_ok,
-
-        "telegram": telegram_ok,
-
-        "gemini": gemini_ok,
-
-    }
-
-# ============================================================
-
-# 1.22 — PART 1 COMPLETION MARKER
-
-# ============================================================
-
-print(
-
-    "GENIOSA 4.0 — PART 1/12 LOADED"
-
-)# ============================================================
-
-# GENIOSA 4.0 — PART 2/12
-
-# PostgreSQL database, schema initialization and migrations
-
-# ============================================================
-
-# ============================================================
-
-# 2.1 — GENERIC DATABASE EXECUTOR
-
-# ============================================================
-
-def db_execute(
-
-    query: str,
-
-    params: Optional[Tuple] = None,
-
-    fetchone: bool = False,
-
-    fetchall: bool = False,
-
-    commit: bool = False,
-
-):
-
-    """
-
-    Execute a PostgreSQL query safely.
-
-    Each operation uses its own connection so that one failed
-
-    operation does not leave another operation in a broken
-
-    transaction state.
-
-    """
-
-    connection = None
-
-    cursor = None
-
-    try:
-
-        connection = db()
-
-        cursor = connection.cursor()
-
-        cursor.execute(
-
-            query,
-
-            params
-
-        )
-
-        result = None
-
-
-print(# ============================================================
 # GENIOSA 4.0 — PART 2/12
 # PostgreSQL database layer, initialization and migrations
 # ============================================================
@@ -951,7 +20,6 @@ def db_execute(
     cursor = None
 
     try:
-
         connection = db()
 
         cursor = connection.cursor(
@@ -966,15 +34,12 @@ def db_execute(
         result = None
 
         if fetchone:
-
             result = cursor.fetchone()
 
         elif fetchall:
-
             result = cursor.fetchall()
 
         if commit:
-
             connection.commit()
 
         return result
@@ -982,7 +47,6 @@ def db_execute(
     except Exception as exc:
 
         if connection is not None:
-
             try:
                 connection.rollback()
             except Exception:
@@ -999,14 +63,12 @@ def db_execute(
     finally:
 
         if cursor is not None:
-
             try:
                 cursor.close()
             except Exception:
                 pass
 
         if connection is not None:
-
             try:
                 connection.close()
             except Exception:
@@ -1062,13 +124,6 @@ def init_db() -> bool:
 
         # ====================================================
         # 2.2.0 — MESSAGES MIGRATION
-        #
-        # IMPORTANT:
-        # Older Geniosa versions may already have a messages
-        # table without the `text` column.
-        #
-        # We DO NOT delete or recreate the table.
-        # We add the missing column safely and preserve data.
         # ====================================================
 
         cursor.execute(
@@ -1107,7 +162,7 @@ def init_db() -> bool:
             )
 
         # ----------------------------------------------------
-        # Try to preserve text from common legacy columns
+        # Preserve legacy message data
         # ----------------------------------------------------
 
         legacy_text_columns = [
@@ -1138,16 +193,13 @@ def init_db() -> bool:
             )
 
             logger.info(
-                "Messages migration: copied legacy `%s` "
-                "values into `text`.",
+                "Messages migration: copied legacy `%s` values "
+                "into `text`.",
                 legacy_column,
             )
 
         # ----------------------------------------------------
-        # Any remaining NULL text values become empty strings.
-        #
-        # This allows the column to remain compatible with the
-        # current save_message() implementation.
+        # Replace remaining NULL values
         # ----------------------------------------------------
 
         cursor.execute(
@@ -1159,8 +211,7 @@ def init_db() -> bool:
         )
 
         # ----------------------------------------------------
-        # Make text NOT NULL only after all existing rows have
-        # been safely populated.
+        # Make text NOT NULL
         # ----------------------------------------------------
 
         cursor.execute(
@@ -1787,9 +838,6 @@ def init_db() -> bool:
 # ============================================================
 
 def ensure_database_ready() -> bool:
-    """
-    Initialize the database and verify that it is reachable.
-    """
 
     if not DATABASE_URL:
 
@@ -1843,21 +891,13 @@ def save_message(
     text: Optional[str] = None,
     content: Optional[str] = None,
 ) -> Optional[int]:
-    """
-    Save a conversation message.
-
-    Both `text` and `content` are accepted for compatibility,
-    but the database always stores the final value in `text`.
-    """
 
     message_text = text
 
     if message_text is None:
-
         message_text = content
 
     if message_text is None:
-
         message_text = ""
 
     message_text = str(
@@ -1923,9 +963,6 @@ def get_recent_messages(
     chat_id: Any,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
-    """
-    Return recent conversation messages in chronological order.
-    """
 
     try:
 
@@ -1980,9 +1017,6 @@ def format_conversation_history(
     chat_id: Any,
     limit: int = 20,
 ) -> str:
-    """
-    Convert recent messages into a compact AI-readable history.
-    """
 
     messages = get_recent_messages(
         chat_id,
@@ -2016,7 +1050,6 @@ def format_conversation_history(
         ).strip()
 
         if not text_value:
-
             continue
 
         lines.append(
@@ -2038,12 +1071,6 @@ def save_memory(
     category: str = "general",
     importance: int = 5,
 ) -> Optional[int]:
-    """
-    Save persistent business memory.
-
-    Memory is scoped by chat_id so one user's business data
-    cannot leak into another user's context.
-    """
 
     memory = str(
         memory or ""
@@ -2072,7 +1099,6 @@ def save_memory(
     )
 
     if not memory:
-
         return None
 
     try:
@@ -2124,9 +1150,6 @@ def get_memories(
     chat_id: Any,
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
-    """
-    Get the most relevant persistent business memories.
-    """
 
     try:
 
@@ -2182,9 +1205,6 @@ def build_memory_context(
     chat_id: Any,
     limit: int = 30,
 ) -> str:
-    """
-    Build persistent memory for Gemini.
-    """
 
     memories = get_memories(
         chat_id,
@@ -2223,7 +1243,6 @@ def build_memory_context(
         )
 
         if not memory:
-
             continue
 
         lines.append(
@@ -2251,9 +1270,6 @@ def delete_memory(
     chat_id: Any,
     memory_id: int,
 ) -> bool:
-    """
-    Delete one memory belonging to the current chat.
-    """
 
     try:
 
@@ -2288,16 +1304,13 @@ def delete_memory(
 
 
 # ============================================================
-# 3.8 — MEMORY SUMMARY FOR USER
+# 3.8 — MEMORY SUMMARY
 # ============================================================
 
 def memories_summary(
     chat_id: Any,
     limit: int = 50,
 ) -> str:
-    """
-    Create a human-readable memory list.
-    """
 
     memories = get_memories(
         chat_id,
@@ -2395,9 +1408,6 @@ INDUSTRY_NAMES = {
 def industry_name(
     industry: Optional[str]
 ) -> str:
-    """
-    Convert internal industry code into a user-friendly name.
-    """
 
     if not industry:
 
@@ -2416,17 +1426,12 @@ def industry_name(
 
 
 # ============================================================
-# 3.10 — PROJECT AI CONTEXT HELPER
+# 3.10 — PROJECT TO AI CONTEXT
 # ============================================================
 
 def project_to_ai_context(
     project: Optional[Dict[str, Any]]
 ) -> str:
-    """
-    Convert a project database record into AI-readable text.
-
-    Database identifiers and timestamps are intentionally excluded.
-    """
 
     if not project:
 
@@ -2446,11 +1451,9 @@ def project_to_ai_context(
     for key, value in project.items():
 
         if key in excluded:
-
             continue
 
         if value is None:
-
             continue
 
         if isinstance(
@@ -2461,7 +1464,6 @@ def project_to_ai_context(
             value = value.strip()
 
             if not value:
-
                 continue
 
         lines.append(
@@ -2487,11 +1489,6 @@ def build_projects_context(
     chat_id: Any,
     limit: int = 20,
 ) -> str:
-    """
-    Build compact project context.
-
-    The full project CRM functions are implemented in PART 4.
-    """
 
     try:
 
@@ -2602,11 +1599,6 @@ def build_projects_context(
 def build_business_context(
     chat_id: Any
 ) -> str:
-    """
-    Combine persistent memory, conversation history and projects.
-
-    This is the core business context used by the AI layer.
-    """
 
     sections = [
 
@@ -2644,9 +1636,6 @@ def clean_context_text(
     value: Any,
     max_length: int = 12000,
 ) -> str:
-    """
-    Normalize arbitrary context text before sending it to AI.
-    """
 
     if value is None:
 
@@ -2668,18 +1657,12 @@ def clean_context_text(
 
 
 # ============================================================
-# 3.14 — FULL BUSINESS CONTEXT BUILDER
+# 3.14 — FULL AI CONTEXT
 # ============================================================
 
 def build_full_ai_context(
     chat_id: Any
 ) -> str:
-    """
-    Final context builder used by the AI request layer.
-
-    CRM information from Investors and Deals will be appended
-    by the later CRM layer when those functions are available.
-    """
 
     context = build_business_context(
         chat_id
@@ -2696,7 +1679,6 @@ def build_full_ai_context(
 # ============================================================
 
 print(
-    
     "GENIOSA 4.0 — PART 3/12 LOADED"
 )# ============================================================
 
