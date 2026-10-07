@@ -837,7 +837,7 @@ except Exception as exc:
 
 print("GENIOSA 4.0 — PART 1/12 LOADED")
 
-)
+
 
 # ============================================================
 # GENIOSA 4.0 — PART 2/12
