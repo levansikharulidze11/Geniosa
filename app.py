@@ -1,11 +1,812 @@
 # ============================================================
+# GENIOSA 4.0 — PART 1/12
+# Core configuration, environment, FastAPI,
+# Telegram, Gemini, PostgreSQL and health checks
+# ============================================================
+
+import os
+import re
+import json
+import time
+import uuid
+import base64
+import logging
+import mimetypes
+import threading
+import traceback
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import psycopg2
+import psycopg2.extras
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("geniosa")
+
+
+# ============================================================
+# APPLICATION SETTINGS
+# ============================================================
+
+APP_NAME = "Geniosa"
+
+APP_VERSION = "4.0"
+
+APP_ENV = os.getenv(
+    "APP_ENV",
+    "production",
+).strip()
+
+TIMEZONE = os.getenv(
+    "TIMEZONE",
+    "Asia/Tbilisi",
+).strip()
+
+
+# ============================================================
+# TELEGRAM SETTINGS
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
+
+TELEGRAM_REQUEST_TIMEOUT = int(
+    os.getenv(
+        "TELEGRAM_REQUEST_TIMEOUT",
+        "30",
+    )
+)
+
+TELEGRAM_API_BASE = (
+    "https://api.telegram.org/bot"
+    + TELEGRAM_BOT_TOKEN
+)
+
+TELEGRAM_FILE_BASE = (
+    "https://api.telegram.org/file/bot"
+    + TELEGRAM_BOT_TOKEN
+)
+
+TELEGRAM_POLL_INTERVAL = float(
+    os.getenv(
+        "TELEGRAM_POLL_INTERVAL",
+        "2",
+    )
+)
+
+TELEGRAM_POLL_TIMEOUT = int(
+    os.getenv(
+        "TELEGRAM_POLL_TIMEOUT",
+        "25",
+    )
+)
+
+
+# ============================================================
+# GEMINI SETTINGS
+# ============================================================
+
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    "",
+).strip()
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite",
+).strip()
+
+GEMINI_API_BASE = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+)
+
+GEMINI_TIMEOUT = int(
+    os.getenv(
+        "GEMINI_TIMEOUT",
+        "120",
+    )
+)
+
+
+# ============================================================
+# DATABASE SETTINGS
+# ============================================================
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "",
+).strip()
+
+DATABASE_CONNECT_TIMEOUT = int(
+    os.getenv(
+        "DATABASE_CONNECT_TIMEOUT",
+        "10",
+    )
+)
+
+
+# ============================================================
+# OWNER SETTINGS
+# ============================================================
+
+OWNER_ID_RAW = os.getenv(
+    "OWNER_ID",
+    "",
+).strip()
+
+try:
+    OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW else None
+except ValueError:
+    OWNER_ID = None
+
+
+# ============================================================
+# STORAGE
+# ============================================================
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+STORAGE_DIR = os.path.join(
+    BASE_DIR,
+    "storage",
+)
+
+UPLOADS_DIR = os.path.join(
+    STORAGE_DIR,
+    "uploads",
+)
+
+GENERATED_DIR = os.path.join(
+    STORAGE_DIR,
+    "generated",
+)
+
+TEMP_DIR = os.path.join(
+    STORAGE_DIR,
+    "temp",
+)
+
+
+os.makedirs(
+    STORAGE_DIR,
+    exist_ok=True,
+)
+
+os.makedirs(
+    UPLOADS_DIR,
+    exist_ok=True,
+)
+
+os.makedirs(
+    GENERATED_DIR,
+    exist_ok=True,
+)
+
+os.makedirs(
+    TEMP_DIR,
+    exist_ok=True,
+)
+
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+)
+
+
+# ============================================================
+# GLOBAL POLLING STATE
+# ============================================================
+
+POLLING_STOP = threading.Event()
+
+POLLING_THREAD = None
+
+POLLING_LOCK_CONNECTION = None
+
+POLLING_LOCK_ACQUIRED = False
+
+LAST_UPDATE_ID = 0
+
+
+# ============================================================
+# DATABASE LOCK ID
+# ============================================================
+
+POLLING_LOCK_ID = int(
+    os.getenv(
+        "POLLING_LOCK_ID",
+        "406391202",
+    )
+)
+
+
+# ============================================================
+# DOCUMENT SETTINGS
+# ============================================================
+
+MAX_DOCUMENT_SIZE_MB = int(
+    os.getenv(
+        "MAX_DOCUMENT_SIZE_MB",
+        "20",
+    )
+)
+
+MAX_DOCUMENT_SIZE_BYTES = (
+    MAX_DOCUMENT_SIZE_MB
+    * 1024
+    * 1024
+)
+
+
+# ============================================================
+# SECURITY / ACCESS
+# ============================================================
+
+ALLOWED_CHAT_IDS_RAW = os.getenv(
+    "ALLOWED_CHAT_IDS",
+    "",
+).strip()
+
+ALLOWED_CHAT_IDS = set()
+
+if ALLOWED_CHAT_IDS_RAW:
+    for value in ALLOWED_CHAT_IDS_RAW.split(","):
+        value = value.strip()
+
+        if not value:
+            continue
+
+        try:
+            ALLOWED_CHAT_IDS.add(int(value))
+        except ValueError:
+            logger.warning(
+                "Invalid ALLOWED_CHAT_IDS value: %s",
+                value,
+            )
+
+
+def is_chat_allowed(
+    chat_id: Optional[int],
+) -> bool:
+    """
+    Проверяет, разрешён ли Telegram chat_id.
+
+    Если список ALLOWED_CHAT_IDS пустой,
+    доступ разрешён.
+    """
+
+    if not ALLOWED_CHAT_IDS:
+        return True
+
+    if chat_id is None:
+        return False
+
+    return int(chat_id) in ALLOWED_CHAT_IDS
+
+
+# ============================================================
+# ENVIRONMENT VALIDATION
+# ============================================================
+
+def get_environment_status() -> Dict[str, bool]:
+    return {
+        "telegram": bool(
+            TELEGRAM_BOT_TOKEN
+        ),
+        "gemini": bool(
+            GEMINI_API_KEY
+        ),
+        "database": bool(
+            DATABASE_URL
+        ),
+    }
+
+
+def validate_environment() -> Dict[str, bool]:
+    """
+    Проверяет основные переменные окружения.
+    Не останавливает приложение при отсутствии
+    необязательных переменных.
+    """
+
+    status = get_environment_status()
+
+    if not status["telegram"]:
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN is not configured"
+        )
+
+    if not status["gemini"]:
+        logger.warning(
+            "GEMINI_API_KEY is not configured"
+        )
+
+    if not status["database"]:
+        logger.warning(
+            "DATABASE_URL is not configured"
+        )
+
+    return status
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_db_connection():
+    """
+    Создаёт новое PostgreSQL-соединение.
+    """
+
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured"
+        )
+
+    connection = psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=DATABASE_CONNECT_TIMEOUT,
+    )
+
+    return connection
+
+
+# ============================================================
+# DATABASE AVAILABILITY
+# ============================================================
+
+def database_available() -> bool:
+    """
+    Проверяет доступность PostgreSQL.
+    """
+
+    if not DATABASE_URL:
+        return False
+
+    connection = None
+
+    try:
+        connection = get_db_connection()
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+
+        return True
+
+    except Exception as exc:
+        logger.error(
+            "Database availability check failed: %s",
+            exc,
+        )
+
+        return False
+
+    finally:
+        if connection:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
+
+def telegram_api_url(
+    method: str,
+) -> str:
+    return (
+        TELEGRAM_API_BASE
+        + "/"
+        + method
+    )
+
+
+def telegram_request(
+    method: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Универсальный Telegram Bot API request.
+    """
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error(
+            "Telegram bot token is not configured"
+        )
+
+        return None
+
+    if payload is None:
+        payload = {}
+
+    request_timeout = (
+        timeout
+        if timeout is not None
+        else TELEGRAM_REQUEST_TIMEOUT
+    )
+
+    try:
+        response = requests.post(
+            telegram_api_url(method),
+            json=payload,
+            timeout=request_timeout,
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                "Telegram API HTTP %s: %s",
+                response.status_code,
+                response.text[:1000],
+            )
+
+            return None
+
+        data = response.json()
+
+        if not data.get("ok"):
+            logger.error(
+                "Telegram API error: %s",
+                data,
+            )
+
+            return None
+
+        return data
+
+    except requests.RequestException as exc:
+        logger.error(
+            "Telegram request failed: %s",
+            exc,
+        )
+
+        return None
+
+    except Exception as exc:
+        logger.error(
+            "Telegram request unexpected error: %s",
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
+# TELEGRAM SEND MESSAGE
+# ============================================================
+
+def send_telegram_message(
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = True,
+) -> bool:
+    """
+    Отправляет текстовое сообщение в Telegram.
+    """
+
+    if not text:
+        return False
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": (
+            disable_web_page_preview
+        ),
+    }
+
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    result = telegram_request(
+        "sendMessage",
+        payload,
+    )
+
+    return bool(
+        result
+        and result.get("ok")
+    )
+
+
+# ============================================================
+# TELEGRAM CHAT ACTION
+# ============================================================
+
+def send_chat_action(
+    chat_id: int,
+    action: str = "typing",
+) -> bool:
+    result = telegram_request(
+        "sendChatAction",
+        {
+            "chat_id": chat_id,
+            "action": action,
+        },
+    )
+
+    return bool(
+        result
+        and result.get("ok")
+    )
+
+
+# ============================================================
+# TELEGRAM BOT INFORMATION
+# ============================================================
+
+def telegram_get_me() -> Optional[Dict[str, Any]]:
+    result = telegram_request(
+        "getMe",
+        {},
+    )
+
+    if not result:
+        return None
+
+    return result.get("result")
+
+
+# ============================================================
+# GEMINI API
+# ============================================================
+
+def gemini_api_url(
+    model: Optional[str] = None,
+) -> str:
+    selected_model = (
+        model
+        or GEMINI_MODEL
+    ).strip()
+
+    return (
+        GEMINI_API_BASE
+        + "/"
+        + selected_model
+        + ":generateContent"
+    )
+
+
+# ============================================================
+# BASIC TEXT UTILITIES
+# ============================================================
+
+def safe_text(
+    value: Any,
+) -> str:
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def normalize_text(
+    value: Any,
+) -> str:
+    text = safe_text(value)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def utc_now() -> datetime:
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def generate_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+# ============================================================
+# FASTAPI ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+    env = get_environment_status()
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+        "telegram_configured": env["telegram"],
+        "gemini_configured": env["gemini"],
+        "database_configured": env["database"],
+    }
+
+
+# ============================================================
+# HEAD HEALTH CHECK
+# ============================================================
+
+@app.head("/")
+def root_head():
+    return None
+
+
+# ============================================================
+# STATUS ENDPOINT
+# ============================================================
+
+@app.get("/status")
+def status():
+    env = get_environment_status()
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+        "environment": APP_ENV,
+        "telegram_configured": env["telegram"],
+        "gemini_configured": env["gemini"],
+        "database_configured": env["database"],
+        "gemini_model": GEMINI_MODEL,
+        "polling_thread_alive": (
+            POLLING_THREAD.is_alive()
+            if POLLING_THREAD
+            else False
+        ),
+    }
+
+
+# ============================================================
+# DATABASE HEALTH CHECK
+# ============================================================
+
+@app.get("/health/database")
+def database_health():
+    available = database_available()
+
+    return JSONResponse(
+        status_code=200 if available else 503,
+        content={
+            "database": (
+                "ok"
+                if available
+                else "unavailable"
+            )
+        },
+    )
+
+
+# ============================================================
+# GENERAL HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+    env = get_environment_status()
+
+    db_ok = database_available()
+
+    overall_ok = (
+        env["telegram"]
+        and env["gemini"]
+        and env["database"]
+        and db_ok
+    )
+
+    return JSONResponse(
+        status_code=200 if overall_ok else 503,
+        content={
+            "service": APP_NAME,
+            "version": APP_VERSION,
+            "status": (
+                "healthy"
+                if overall_ok
+                else "degraded"
+            ),
+            "telegram": env["telegram"],
+            "gemini": env["gemini"],
+            "database": env["database"],
+            "database_connection": db_ok,
+            "gemini_model": GEMINI_MODEL,
+        },
+    )
+
+
+# ============================================================
+# STARTUP CONFIGURATION LOG
+# ============================================================
+
+def log_startup_configuration():
+
+    logger.info(
+        "============================================================"
+    )
+
+    logger.info(
+        "GENIOSA 4.0 configuration"
+    )
+
+    logger.info(
+        "APP_ENV=%s",
+        APP_ENV,
+    )
+
+    logger.info(
+        "Telegram configured=%s",
+        bool(TELEGRAM_BOT_TOKEN),
+    )
+
+    logger.info(
+        "Gemini configured=%s",
+        bool(GEMINI_API_KEY),
+    )
+
+    logger.info(
+        "Gemini model=%s",
+        GEMINI_MODEL,
+    )
+
+    logger.info(
+        "Database configured=%s",
+        bool(DATABASE_URL),
+    )
+
+    logger.info(
+        "Telegram request timeout=%s",
+        TELEGRAM_REQUEST_TIMEOUT,
+    )
+
+    logger.info(
+        "============================================================"
+    )
+
+
+# ============================================================
+# INITIAL ENVIRONMENT CHECK
+# ============================================================
+
+validate_environment()
+
+log_startup_configuration()
+
+
+# ============================================================
+# PART 1 COMPLETE
+# ============================================================
+
+print("GENIOSA 4.0 — PART 1/12 LOADED")
+
+
+# ============================================================
 # GENIOSA 4.0 — PART 2/12
 # PostgreSQL database layer, initialization and migrations
-# ============================================================
-
-
-# ============================================================
-# 2.1 — DATABASE EXECUTION HELPER
 # ============================================================
 
 def db_execute(
