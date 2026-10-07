@@ -11054,359 +11054,300 @@ def handle_text_message(
 print("GENIOSA 4.0 — PART 11/12 LOADED")
 
 # ============================================================
-
 # GENIOSA 4.0 — PART 12/12
-
 # Telegram polling, file sending, startup and shutdown
-
 # ============================================================
 
-def send_document_to_chat(
+from pathlib import Path
 
-    chat_id: Any,
 
-    filepath: str,
+# ------------------------------------------------------------
+# Telegram URL compatibility helper
+# ------------------------------------------------------------
 
-    caption: str = "",
+def telegram_url(
+    method: str,
+) -> str:
+    """
+    Compatibility wrapper for Telegram API URL generation.
 
-) -> bool:
-
+    PART 1 defines telegram_api_url().
+    Older functions may still call telegram_url().
     """
 
-    Sends a local file to a Telegram chat.
+    return telegram_api_url(
+        method
+    )
 
+
+# ------------------------------------------------------------
+# Telegram polling offset
+# ------------------------------------------------------------
+
+TELEGRAM_OFFSET = int(
+    globals().get(
+        "TELEGRAM_OFFSET",
+        globals().get(
+            "LAST_UPDATE_ID",
+            0,
+        ),
+    )
+)
+
+
+# ------------------------------------------------------------
+# Telegram document sending
+# ------------------------------------------------------------
+
+def send_document_to_chat(
+    chat_id: Any,
+    filepath: str,
+    caption: str = "",
+) -> bool:
+    """
+    Sends a local file to a Telegram chat.
     """
 
     path = Path(
-
         filepath
-
     )
 
     if not path.exists():
-
         logger.error(
-
             "File does not exist: %s",
-
             filepath,
-
         )
-
         return False
 
     if not TELEGRAM_BOT_TOKEN:
-
         logger.error(
-
             "TELEGRAM_BOT_TOKEN is not configured."
-
         )
-
         return False
 
     try:
-
         with path.open(
-
             "rb"
-
         ) as file_handle:
 
             response = requests.post(
-
                 telegram_url(
-
                     "sendDocument"
-
                 ),
-
                 data={
-
                     "chat_id": str(
-
                         chat_id
-
                     ),
-
                     "caption": str(
-
                         caption or ""
-
                     )[:1000],
-
                 },
-
                 files={
-
                     "document": (
-
                         path.name,
-
                         file_handle,
-
                     )
-
                 },
-
                 timeout=TELEGRAM_FILE_TIMEOUT,
-
             )
 
         if not response.ok:
-
             logger.error(
-
                 "Telegram sendDocument failed: %s",
-
                 response.text[:1000],
-
             )
-
             return False
 
         data = response.json()
 
         if not data.get("ok"):
-
             logger.error(
-
                 "Telegram sendDocument returned error: %s",
-
                 data,
-
             )
-
             return False
 
         return True
 
     except Exception as exc:
-
         logger.exception(
-
             "Could not send document to Telegram: %s",
-
             exc,
-
         )
-
         return False
 
+
+# ------------------------------------------------------------
+# Generated files
+# ------------------------------------------------------------
+
 def send_generated_files_to_chat(
-
     chat_id: Any,
-
     project_id: int,
-
 ) -> List[str]:
-
     """
-
     Generates and sends the project's Excel and PPTX files.
-
     """
 
-    result = []
+    result: List[str] = []
 
     files = generate_project_files(
-
         chat_id=chat_id,
-
         project_id=project_id,
-
     )
 
     if not files:
-
         return result
 
     for filepath in files:
 
         path = Path(
-
             filepath
-
         )
 
         if not path.exists():
-
             continue
 
         if path.suffix.lower() == ".xlsx":
 
             caption = (
-
                 "📊 Geniosa — Financial Model / Excel"
-
             )
 
         elif path.suffix.lower() == ".pptx":
 
             caption = (
-
                 "📑 Geniosa — Investor Presentation / PPTX"
-
             )
 
         else:
 
             caption = (
-
                 "📎 Geniosa — Generated File"
-
             )
 
         if send_document_to_chat(
-
             chat_id,
-
             str(path),
-
             caption,
-
         ):
-
             result.append(
-
                 str(path)
-
             )
 
     return result
 
+
+# ------------------------------------------------------------
+# Help message
+# ------------------------------------------------------------
+
 def send_help_message(
-
     chat_id: Any,
-
 ) -> None:
 
     send_long_message(
-
         chat_id,
-
         handle_command(
-
             chat_id,
-
             "/help",
-
         ),
-
     )
 
+
+# ------------------------------------------------------------
+# Telegram getUpdates
+# ------------------------------------------------------------
+
 def telegram_get_updates(
-
     offset: Optional[int] = None,
-
 ) -> List[Dict[str, Any]]:
-
     """
-
     Gets Telegram updates using long polling.
-
     """
 
     params = {
-
         "timeout": TELEGRAM_LONG_POLL_TIMEOUT,
-
         "allowed_updates": json.dumps(
-
             [
-
                 "message",
-
             ]
-
         ),
-
     }
 
     if offset is not None:
-
         params["offset"] = offset
 
     data = telegram_api_request(
-
         "getUpdates",
-
         params,
-
     )
 
     if not data:
-
         return []
 
     return data.get(
-
         "result",
-
         [],
-
     )
 
+
+# ------------------------------------------------------------
+# Telegram webhook
+# ------------------------------------------------------------
+
 def telegram_delete_webhook() -> bool:
-
     """
-
     Removes an existing Telegram webhook so polling can work.
-
     """
 
     data = telegram_api_request(
-
         "deleteWebhook",
-
         {
-
             "drop_pending_updates": False,
-
         },
-
     )
 
-    return bool(
-
+    success = bool(
         data
-
         and data.get("ok")
-
     )
+
+    if success:
+        logger.info(
+            "Telegram webhook removed successfully."
+        )
+    else:
+        logger.warning(
+            "Telegram webhook removal was not confirmed."
+        )
+
+    return success
+
+
+# ------------------------------------------------------------
+# PostgreSQL polling advisory lock
+# ------------------------------------------------------------
 
 def acquire_polling_lock() -> bool:
-
     """
-
     Acquires the PostgreSQL advisory lock.
 
     The function keeps retrying while another Geniosa
-
-    process owns the lock. This prevents a temporary
-
-    deployment overlap from stopping Telegram polling.
-
+    process owns the lock.
     """
 
-    global POLLING_LOCK_CONN
-
+    global POLLING_LOCK_CONNECTION
     global POLLING_LOCK_ACQUIRED
 
     if not DATABASE_URL:
-
         logger.warning(
-
             "DATABASE_URL is missing. "
-
             "Telegram polling lock cannot be created."
-
         )
-
         return False
 
     if POLLING_LOCK_ACQUIRED:
-
         return True
 
     while not POLLING_STOP.is_set():
@@ -11416,11 +11357,8 @@ def acquire_polling_lock() -> bool:
         try:
 
             connection = psycopg2.connect(
-
                 DATABASE_URL,
-
                 connect_timeout=DATABASE_CONNECT_TIMEOUT,
-
             )
 
             connection.autocommit = True
@@ -11428,15 +11366,10 @@ def acquire_polling_lock() -> bool:
             cursor = connection.cursor()
 
             cursor.execute(
-
                 "SELECT pg_try_advisory_lock(%s)",
-
                 (
-
                     POLLING_LOCK_ID,
-
                 ),
-
             )
 
             result = cursor.fetchone()
@@ -11444,97 +11377,73 @@ def acquire_polling_lock() -> bool:
             cursor.close()
 
             acquired = bool(
-
                 result
-
                 and result[0]
-
             )
 
             if acquired:
 
-                POLLING_LOCK_CONN = connection
-
+                POLLING_LOCK_CONNECTION = connection
                 POLLING_LOCK_ACQUIRED = True
 
                 logger.info(
-
                     "Telegram polling advisory lock acquired."
-
                 )
 
                 return True
 
             connection.close()
-
             connection = None
 
             logger.warning(
-
                 "Another Geniosa instance already owns "
-
-                "the Telegram polling lock. "
-
-                "Retrying..."
-
+                "the Telegram polling lock. Retrying..."
             )
 
             POLLING_STOP.wait(
-
                 5
-
             )
 
         except Exception as exc:
 
             logger.warning(
-
                 "Could not acquire polling lock: %s. "
-
                 "Retrying...",
-
                 exc,
-
             )
 
             if connection:
 
                 try:
-
                     connection.close()
-
                 except Exception:
-
                     pass
 
             POLLING_STOP.wait(
-
                 5
-
             )
 
     return False
 
+
+# ------------------------------------------------------------
+# Release PostgreSQL polling lock
+# ------------------------------------------------------------
+
 def release_polling_lock() -> None:
-
     """
-
     Releases PostgreSQL advisory lock.
-
     """
 
-    global POLLING_LOCK_CONN
-
+    global POLLING_LOCK_CONNECTION
     global POLLING_LOCK_ACQUIRED
 
-    connection = POLLING_LOCK_CONN
+    connection = POLLING_LOCK_CONNECTION
 
-    POLLING_LOCK_CONN = None
-
+    POLLING_LOCK_CONNECTION = None
     POLLING_LOCK_ACQUIRED = False
 
     if not connection:
-
         return
 
     try:
@@ -11542,15 +11451,10 @@ def release_polling_lock() -> None:
         cursor = connection.cursor()
 
         cursor.execute(
-
             "SELECT pg_advisory_unlock(%s)",
-
             (
-
                 POLLING_LOCK_ID,
-
             ),
-
         )
 
         cursor.close()
@@ -11558,233 +11462,160 @@ def release_polling_lock() -> None:
     except Exception as exc:
 
         logger.warning(
-
             "Could not release polling lock cleanly: %s",
-
             exc,
-
         )
 
     finally:
 
         try:
-
             connection.close()
-
         except Exception:
-
             pass
 
+
+# ------------------------------------------------------------
+# Telegram document processing
+# ------------------------------------------------------------
+
 def process_telegram_document(
-
     chat_id: Any,
-
     document: Dict[str, Any],
-
 ) -> str:
-
     """
-
     Downloads and analyzes a Telegram document.
-
     """
 
     file_id = document.get(
-
         "file_id"
-
     )
 
     filename = (
-
         document.get("file_name")
-
         or f"telegram_file_{file_id}"
-
     )
 
     if not file_id:
-
         return (
-
             "❌ დოკუმენტის ID ვერ მივიღე."
-
         )
 
     filepath = telegram_download_file(
-
         file_id
-
     )
 
     if not filepath:
-
         return (
-
             "❌ ფაილის ჩამოტვირთვა ვერ მოხერხდა."
-
         )
 
     try:
 
         extracted_text = extract_file_text(
-
             filepath
-
         )
 
         if not extracted_text.strip():
-
             return (
-
                 "⚠️ ფაილიდან ტექსტის ამოღება ვერ მოხერხდა."
-
             )
 
         record_id = save_document_record(
-
             chat_id=chat_id,
-
             filename=filename,
-
             file_type=detect_file_type(
-
                 filename
-
             ),
-
             extracted_text=extracted_text,
-
         )
 
         if not record_id:
-
             logger.warning(
-
                 "Document record was not created."
-
             )
 
         analysis = analyze_document_with_ai(
-
             chat_id=chat_id,
-
             filename=filename,
-
             extracted_text=extracted_text,
-
         )
 
         if record_id:
 
             update_document_analysis(
-
                 chat_id=chat_id,
-
                 document_id=record_id,
-
                 analysis=analysis,
-
             )
 
         return (
-
             f"📄 ფაილი მიღებულია: {filename}\n\n"
-
             f"{analysis}"
-
         )
 
     except Exception as exc:
 
         logger.exception(
-
             "Document processing failed: %s",
-
             exc,
-
         )
 
         return (
-
             "❌ დოკუმენტის დამუშავებისას "
-
             "შეცდომა მოხდა."
-
         )
 
     finally:
 
         cleanup_temp_file(
-
             filepath
-
         )
 
+
+# ------------------------------------------------------------
+# Telegram photo processing
+# ------------------------------------------------------------
+
 def process_telegram_photo(
-
     chat_id: Any,
-
     photos: List[Dict[str, Any]],
-
     caption: str = "",
-
 ) -> str:
-
     """
-
     Downloads the largest Telegram photo and analyzes it.
-
     """
 
     if not photos:
-
         return (
-
             "❌ ფოტო ვერ მივიღე."
-
         )
 
     photo = photos[-1]
 
     file_id = photo.get(
-
         "file_id"
-
     )
 
     if not file_id:
-
         return (
-
             "❌ ფოტოს ID ვერ მივიღე."
-
         )
 
     filepath = telegram_download_file(
-
         file_id
-
     )
 
     if not filepath:
-
         return (
-
             "❌ ფოტოს ჩამოტვირთვა ვერ მოხერხდა."
-
         )
 
     try:
 
         result = analyze_image_with_ai(
-
             chat_id=chat_id,
-
             filepath=filepath,
-
             user_caption=caption,
-
         )
 
         return result
@@ -11792,125 +11623,87 @@ def process_telegram_photo(
     except Exception as exc:
 
         logger.exception(
-
             "Photo processing failed: %s",
-
             exc,
-
         )
 
         return (
-
             "❌ ფოტოს ანალიზისას "
-
             "შეცდომა მოხდა."
-
         )
 
     finally:
 
         cleanup_temp_file(
-
             filepath
-
         )
 
+
+# ------------------------------------------------------------
+# Telegram message processing
+# ------------------------------------------------------------
+
 def process_telegram_message(
-
     message: Dict[str, Any],
-
 ) -> None:
-
     """
-
     Processes one Telegram message.
-
     """
 
     chat = message.get(
-
         "chat"
-
     ) or {}
 
     chat_id = chat.get(
-
         "id"
-
     )
 
     if chat_id is None:
-
         return
 
     user = message.get(
-
         "from"
-
     ) or {}
 
     username = (
-
         user.get("username")
-
         or user.get("first_name")
-
         or "user"
-
     )
 
     logger.info(
-
         "Telegram message from %s in chat %s",
-
         username,
-
         chat_id,
-
     )
 
     if not user_allowed(
-
         chat_id
-
     ):
 
         send_message(
-
             chat_id,
-
             "⛔ წვდომა შეზღუდულია.",
-
         )
 
         return
 
     text = (
-
         message.get("text")
-
         or ""
-
     ).strip()
 
     caption = (
-
         message.get("caption")
-
         or ""
-
     ).strip()
 
     document = message.get(
-
         "document"
-
     )
 
     photos = message.get(
-
         "photo"
-
     )
 
     try:
@@ -11918,19 +11711,13 @@ def process_telegram_message(
         if document:
 
             response = process_telegram_document(
-
                 chat_id,
-
                 document,
-
             )
 
             send_long_message(
-
                 chat_id,
-
                 response,
-
             )
 
             return
@@ -11938,21 +11725,14 @@ def process_telegram_message(
         if photos:
 
             response = process_telegram_photo(
-
                 chat_id,
-
                 photos,
-
                 caption,
-
             )
 
             send_long_message(
-
                 chat_id,
-
                 response,
-
             )
 
             return
@@ -11960,119 +11740,89 @@ def process_telegram_message(
         if text:
 
             response = handle_text_message(
-
                 chat_id,
-
                 text,
-
             )
 
             send_long_message(
-
                 chat_id,
-
                 response,
-
             )
 
             return
 
         send_message(
-
             chat_id,
-
             (
-
                 "📎 ფაილი ან შეტყობინება მივიღე, "
-
                 "მაგრამ ამ ტიპის მონაცემის დამუშავება "
-
                 "ჯერ არ არის მხარდაჭერილი."
-
             ),
-
         )
 
     except Exception as exc:
 
         logger.exception(
-
             "Telegram message processing failed: %s",
-
             exc,
-
         )
 
         send_message(
-
             chat_id,
-
             (
-
                 "❌ დამუშავებისას მოხდა ტექნიკური "
-
                 "შეცდომა. სცადე ხელახლა."
-
             ),
-
         )
 
+
+# ------------------------------------------------------------
+# Telegram update processing
+# ------------------------------------------------------------
+
 def process_telegram_update(
-
     update: Dict[str, Any],
-
 ) -> None:
-
     """
-
     Processes a single Telegram update.
-
     """
 
     message = update.get(
-
         "message"
-
     )
 
     if not message:
-
         return
 
     process_telegram_message(
-
         message
-
     )
 
+
+# ------------------------------------------------------------
+# Main Telegram polling loop
+# ------------------------------------------------------------
+
 def telegram_polling_loop() -> None:
-
     """
-
     Main Telegram long-polling loop.
 
     The process waits for the PostgreSQL advisory lock
-
     instead of exiting when another deployment temporarily
-
     owns it.
-
     """
 
     global TELEGRAM_OFFSET
+    global LAST_UPDATE_ID
 
     logger.info(
-
         "Geniosa Telegram polling loop started."
-
     )
 
     if not acquire_polling_lock():
 
         logger.warning(
-
             "Telegram polling stopped before lock acquisition."
-
         )
 
         return
@@ -12086,67 +11836,52 @@ def telegram_polling_loop() -> None:
             try:
 
                 updates = telegram_get_updates(
-
                     TELEGRAM_OFFSET
-
                 )
 
                 for update in updates:
 
                     if POLLING_STOP.is_set():
-
                         break
 
                     update_id = update.get(
-
                         "update_id"
-
                     )
 
                     if update_id is not None:
 
                         TELEGRAM_OFFSET = (
-
                             int(update_id) + 1
+                        )
 
+                        LAST_UPDATE_ID = (
+                            TELEGRAM_OFFSET
                         )
 
                     process_telegram_update(
-
                         update
-
                     )
 
             except requests.RequestException as exc:
 
                 logger.warning(
-
                     "Telegram network error: %s",
-
                     exc,
-
                 )
 
                 POLLING_STOP.wait(
-
                     5
-
                 )
 
             except Exception as exc:
 
                 logger.exception(
-
                     "Telegram polling error: %s",
-
                     exc,
-
                 )
 
                 POLLING_STOP.wait(
-
                     5
-
                 )
 
     finally:
@@ -12154,17 +11889,17 @@ def telegram_polling_loop() -> None:
         release_polling_lock()
 
         logger.info(
-
             "Geniosa Telegram polling loop stopped."
-
         )
 
+
+# ------------------------------------------------------------
+# Start Telegram polling
+# ------------------------------------------------------------
+
 def start_telegram_polling() -> bool:
-
     """
-
     Starts Telegram polling in a background thread.
-
     """
 
     global POLLING_THREAD
@@ -12172,11 +11907,8 @@ def start_telegram_polling() -> bool:
     if not TELEGRAM_BOT_TOKEN:
 
         logger.error(
-
             "Cannot start Telegram polling: "
-
             "TELEGRAM_BOT_TOKEN is missing."
-
         )
 
         return False
@@ -12186,9 +11918,7 @@ def start_telegram_polling() -> bool:
         if POLLING_THREAD.is_alive():
 
             logger.info(
-
                 "Telegram polling is already running."
-
             )
 
             return True
@@ -12198,37 +11928,32 @@ def start_telegram_polling() -> bool:
         if POLLING_THREAD is not None:
 
             if POLLING_THREAD.is_alive():
-
                 return True
 
         POLLING_STOP.clear()
 
         POLLING_THREAD = threading.Thread(
-
             target=telegram_polling_loop,
-
             name="geniosa-telegram-polling",
-
             daemon=True,
-
         )
 
         POLLING_THREAD.start()
 
     logger.info(
-
         "Telegram polling thread started."
-
     )
 
     return True
 
+
+# ------------------------------------------------------------
+# Stop Telegram polling
+# ------------------------------------------------------------
+
 def stop_telegram_polling() -> None:
-
     """
-
     Stops Telegram polling.
-
     """
 
     global POLLING_THREAD
@@ -12242,9 +11967,7 @@ def stop_telegram_polling() -> None:
         if thread.is_alive():
 
             thread.join(
-
                 timeout=10
-
             )
 
     POLLING_THREAD = None
@@ -12252,27 +11975,23 @@ def stop_telegram_polling() -> None:
     release_polling_lock()
 
     logger.info(
-
         "Telegram polling shutdown completed."
-
     )
 
+
+# ------------------------------------------------------------
+# Geniosa initialization
+# ------------------------------------------------------------
+
 def initialize_geniosa() -> None:
-
     """
-
     Initializes database and application dependencies.
-
     """
 
     logger.info(
-
         "Initializing %s %s...",
-
         APP_NAME,
-
         APP_VERSION,
-
     )
 
     environment = validate_environment()
@@ -12280,9 +11999,7 @@ def initialize_geniosa() -> None:
     if not environment["database"]:
 
         logger.warning(
-
             "DATABASE_URL is not configured."
-
         )
 
     else:
@@ -12292,77 +12009,63 @@ def initialize_geniosa() -> None:
             ensure_database_ready()
 
             logger.info(
-
                 "PostgreSQL database initialized."
-
             )
 
         except Exception as exc:
 
             logger.exception(
-
                 "Database initialization failed: %s",
-
                 exc,
-
             )
 
     if not environment["telegram"]:
 
         logger.warning(
-
             "TELEGRAM_BOT_TOKEN is not configured."
-
         )
 
     if not environment["gemini"]:
 
         logger.warning(
-
             "GEMINI_API_KEY is not configured."
-
         )
 
     logger.info(
-
         "Geniosa initialization completed."
-
     )
 
+
+# ------------------------------------------------------------
+# Geniosa shutdown
+# ------------------------------------------------------------
+
 def shutdown_geniosa() -> None:
-
     """
-
     Gracefully shuts down Geniosa.
-
     """
 
     logger.info(
-
         "Shutting down Geniosa..."
-
     )
 
     stop_telegram_polling()
 
     logger.info(
-
         "Geniosa shutdown completed."
-
     )
 
+
+# ------------------------------------------------------------
+# FastAPI lifespan
+# ------------------------------------------------------------
+
 @asynccontextmanager
-
 async def geniosa_lifespan(
-
     application: FastAPI,
-
 ):
-
     """
-
     FastAPI lifespan handler.
-
     """
 
     initialize_geniosa()
@@ -12376,43 +12079,51 @@ async def geniosa_lifespan(
         else:
 
             logger.warning(
-
                 "Telegram polling was not started because "
-
                 "DATABASE_URL is missing."
-
             )
 
     else:
 
         logger.warning(
-
             "Telegram polling was not started because "
-
             "TELEGRAM_BOT_TOKEN is missing."
-
         )
 
     yield
 
     shutdown_geniosa()
 
+
+# ------------------------------------------------------------
+# Register FastAPI lifespan
+# ------------------------------------------------------------
+
 app.router.lifespan_context = geniosa_lifespan
 
-@app.get("/geniosa")
 
+# ------------------------------------------------------------
+# Geniosa information endpoint
+# ------------------------------------------------------------
+
+@app.get("/geniosa")
 def geniosa_info():
 
     return {
-
         "name": APP_NAME,
-
         "version": APP_VERSION,
-
         "status": "running",
-
     }
 
-print("GENIOSA 4.0 — PART 12/12 LOADED")
 
-print("GENIOSA 4.0 — FULL APP LOADED")
+# ============================================================
+# GENIOSA 4.0 — PART 12/12 LOADED
+# ============================================================
+
+print(
+    "GENIOSA 4.0 — PART 12/12 LOADED"
+)
+
+print(
+    "GENIOSA 4.0 — FULL APP LOADED"
+)
