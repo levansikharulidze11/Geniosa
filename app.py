@@ -11052,7 +11052,6 @@ def handle_text_message(
 
 
 print("GENIOSA 4.0 — PART 11/12 LOADED")
-
 # ============================================================
 # GENIOSA 4.0 — PART 12/12
 # Telegram polling, file sending, startup and shutdown
@@ -11158,7 +11157,13 @@ def send_document_to_chat(
             )
             return False
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error(
+                "Telegram sendDocument returned invalid JSON."
+            )
+            return False
 
         if not data.get("ok"):
             logger.error(
@@ -11191,30 +11196,50 @@ def send_generated_files_to_chat(
 
     result: List[str] = []
 
-    files = generate_project_files(
-        chat_id=chat_id,
-        project_id=project_id,
-    )
+    try:
+        files = generate_project_files(
+            chat_id=chat_id,
+            project_id=project_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Could not generate project files: %s",
+            exc,
+        )
+        return result
 
     if not files:
+        logger.warning(
+            "No project files were generated for project %s.",
+            project_id,
+        )
         return result
 
     for filepath in files:
+
+        if not filepath:
+            continue
 
         path = Path(
             filepath
         )
 
         if not path.exists():
+            logger.warning(
+                "Generated file does not exist: %s",
+                filepath,
+            )
             continue
 
-        if path.suffix.lower() == ".xlsx":
+        suffix = path.suffix.lower()
+
+        if suffix == ".xlsx":
 
             caption = (
                 "📊 Geniosa — Financial Model / Excel"
             )
 
-        elif path.suffix.lower() == ".pptx":
+        elif suffix == ".pptx":
 
             caption = (
                 "📑 Geniosa — Investor Presentation / PPTX"
@@ -11246,13 +11271,24 @@ def send_help_message(
     chat_id: Any,
 ) -> None:
 
-    send_long_message(
-        chat_id,
-        handle_command(
+    try:
+        response = handle_command(
             chat_id,
             "/help",
-        ),
-    )
+        )
+
+        if response:
+            send_long_message(
+                chat_id,
+                response,
+            )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not send help message: %s",
+            exc,
+        )
 
 
 # ------------------------------------------------------------
@@ -11266,7 +11302,7 @@ def telegram_get_updates(
     Gets Telegram updates using long polling.
     """
 
-    params = {
+    params: Dict[str, Any] = {
         "timeout": TELEGRAM_POLL_TIMEOUT,
         "allowed_updates": json.dumps(
             [
@@ -11276,7 +11312,9 @@ def telegram_get_updates(
     }
 
     if offset is not None:
-        params["offset"] = offset
+        params["offset"] = int(
+            offset
+        )
 
     data = telegram_api_request(
         "getUpdates",
@@ -11286,10 +11324,30 @@ def telegram_get_updates(
     if not data:
         return []
 
-    return data.get(
+    if not isinstance(
+        data,
+        dict,
+    ):
+        logger.warning(
+            "Unexpected Telegram getUpdates response type."
+        )
+        return []
+
+    result = data.get(
         "result",
         [],
     )
+
+    if not isinstance(
+        result,
+        list,
+    ):
+        logger.warning(
+            "Unexpected Telegram getUpdates result type."
+        )
+        return []
+
+    return result
 
 
 # ------------------------------------------------------------
@@ -11301,12 +11359,23 @@ def telegram_delete_webhook() -> bool:
     Removes an existing Telegram webhook so polling can work.
     """
 
-    data = telegram_api_request(
-        "deleteWebhook",
-        {
-            "drop_pending_updates": False,
-        },
-    )
+    try:
+
+        data = telegram_api_request(
+            "deleteWebhook",
+            {
+                "drop_pending_updates": False,
+            },
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Telegram webhook removal failed: %s",
+            exc,
+        )
+
+        return False
 
     success = bool(
         data
@@ -11314,10 +11383,13 @@ def telegram_delete_webhook() -> bool:
     )
 
     if success:
+
         logger.info(
             "Telegram webhook removed successfully."
         )
+
     else:
+
         logger.warning(
             "Telegram webhook removal was not confirmed."
         )
@@ -11341,18 +11413,22 @@ def acquire_polling_lock() -> bool:
     global POLLING_LOCK_ACQUIRED
 
     if not DATABASE_URL:
+
         logger.warning(
             "DATABASE_URL is missing. "
             "Telegram polling lock cannot be created."
         )
+
         return False
 
     if POLLING_LOCK_ACQUIRED:
+
         return True
 
     while not POLLING_STOP.is_set():
 
         connection = None
+        cursor = None
 
         try:
 
@@ -11374,8 +11450,6 @@ def acquire_polling_lock() -> bool:
 
             result = cursor.fetchone()
 
-            cursor.close()
-
             acquired = bool(
                 result
                 and result[0]
@@ -11392,13 +11466,13 @@ def acquire_polling_lock() -> bool:
 
                 return True
 
-            connection.close()
-            connection = None
-
             logger.warning(
                 "Another Geniosa instance already owns "
                 "the Telegram polling lock. Retrying..."
             )
+
+            connection.close()
+            connection = None
 
             POLLING_STOP.wait(
                 5
@@ -11423,6 +11497,15 @@ def acquire_polling_lock() -> bool:
                 5
             )
 
+        finally:
+
+            if cursor:
+
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
     return False
 
 
@@ -11446,6 +11529,8 @@ def release_polling_lock() -> None:
     if not connection:
         return
 
+    cursor = None
+
     try:
 
         cursor = connection.cursor()
@@ -11457,7 +11542,9 @@ def release_polling_lock() -> None:
             ),
         )
 
-        cursor.close()
+        logger.info(
+            "Telegram polling advisory lock released."
+        )
 
     except Exception as exc:
 
@@ -11467,6 +11554,13 @@ def release_polling_lock() -> None:
         )
 
     finally:
+
+        if cursor:
+
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
         try:
             connection.close()
@@ -11496,6 +11590,7 @@ def process_telegram_document(
     )
 
     if not file_id:
+
         return (
             "❌ დოკუმენტის ID ვერ მივიღე."
         )
@@ -11505,6 +11600,7 @@ def process_telegram_document(
     )
 
     if not filepath:
+
         return (
             "❌ ფაილის ჩამოტვირთვა ვერ მოხერხდა."
         )
@@ -11515,7 +11611,18 @@ def process_telegram_document(
             filepath
         )
 
-        if not extracted_text.strip():
+        if not extracted_text:
+
+            return (
+                "⚠️ ფაილიდან ტექსტის ამოღება ვერ მოხერხდა."
+            )
+
+        extracted_text = str(
+            extracted_text
+        ).strip()
+
+        if not extracted_text:
+
             return (
                 "⚠️ ფაილიდან ტექსტის ამოღება ვერ მოხერხდა."
             )
@@ -11530,6 +11637,7 @@ def process_telegram_document(
         )
 
         if not record_id:
+
             logger.warning(
                 "Document record was not created."
             )
@@ -11539,6 +11647,12 @@ def process_telegram_document(
             filename=filename,
             extracted_text=extracted_text,
         )
+
+        if not analysis:
+
+            analysis = (
+                "⚠️ დოკუმენტის ანალიზის შედეგი ვერ მივიღე."
+            )
 
         if record_id:
 
@@ -11586,6 +11700,7 @@ def process_telegram_photo(
     """
 
     if not photos:
+
         return (
             "❌ ფოტო ვერ მივიღე."
         )
@@ -11597,6 +11712,7 @@ def process_telegram_photo(
     )
 
     if not file_id:
+
         return (
             "❌ ფოტოს ID ვერ მივიღე."
         )
@@ -11606,6 +11722,7 @@ def process_telegram_photo(
     )
 
     if not filepath:
+
         return (
             "❌ ფოტოს ჩამოტვირთვა ვერ მოხერხდა."
         )
@@ -11618,7 +11735,15 @@ def process_telegram_photo(
             user_caption=caption,
         )
 
-        return result
+        if not result:
+
+            return (
+                "⚠️ ფოტოს ანალიზის შედეგი ვერ მივიღე."
+            )
+
+        return str(
+            result
+        )
 
     except Exception as exc:
 
@@ -11650,6 +11775,12 @@ def process_telegram_message(
     Processes one Telegram message.
     """
 
+    if not isinstance(
+        message,
+        dict,
+    ):
+        return
+
     chat = message.get(
         "chat"
     ) or {}
@@ -11677,13 +11808,29 @@ def process_telegram_message(
         chat_id,
     )
 
-    if not user_allowed(
-        chat_id
-    ):
+    try:
+
+        if not user_allowed(
+            chat_id
+        ):
+
+            send_message(
+                chat_id,
+                "⛔ წვდომა შეზღუდულია.",
+            )
+
+            return
+
+    except Exception as exc:
+
+        logger.exception(
+            "User authorization check failed: %s",
+            exc,
+        )
 
         send_message(
             chat_id,
-            "⛔ წვდომა შეზღუდულია.",
+            "❌ მომხმარებლის ავტორიზაციის შემოწმება ვერ მოხერხდა.",
         )
 
         return
@@ -11744,10 +11891,12 @@ def process_telegram_message(
                 text,
             )
 
-            send_long_message(
-                chat_id,
-                response,
-            )
+            if response:
+
+                send_long_message(
+                    chat_id,
+                    response,
+                )
 
             return
 
@@ -11767,13 +11916,21 @@ def process_telegram_message(
             exc,
         )
 
-        send_message(
-            chat_id,
-            (
-                "❌ დამუშავებისას მოხდა ტექნიკური "
-                "შეცდომა. სცადე ხელახლა."
-            ),
-        )
+        try:
+
+            send_message(
+                chat_id,
+                (
+                    "❌ დამუშავებისას მოხდა ტექნიკური "
+                    "შეცდომა. სცადე ხელახლა."
+                ),
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not send Telegram error message."
+            )
 
 
 # ------------------------------------------------------------
@@ -11786,6 +11943,12 @@ def process_telegram_update(
     """
     Processes a single Telegram update.
     """
+
+    if not isinstance(
+        update,
+        dict,
+    ):
+        return
 
     message = update.get(
         "message"
@@ -11839,10 +12002,20 @@ def telegram_polling_loop() -> None:
                     TELEGRAM_OFFSET
                 )
 
+                if not updates:
+
+                    continue
+
                 for update in updates:
 
                     if POLLING_STOP.is_set():
                         break
+
+                    if not isinstance(
+                        update,
+                        dict,
+                    ):
+                        continue
 
                     update_id = update.get(
                         "update_id"
@@ -11850,13 +12023,31 @@ def telegram_polling_loop() -> None:
 
                     if update_id is not None:
 
-                        TELEGRAM_OFFSET = (
-                            int(update_id) + 1
-                        )
+                        try:
 
-                        LAST_UPDATE_ID = (
-                            TELEGRAM_OFFSET
-                        )
+                            next_offset = (
+                                int(update_id) + 1
+                            )
+
+                            TELEGRAM_OFFSET = (
+                                next_offset
+                            )
+
+                            LAST_UPDATE_ID = (
+                                next_offset
+                            )
+
+                        except (
+                            TypeError,
+                            ValueError,
+                        ):
+
+                            logger.warning(
+                                "Invalid Telegram update_id: %s",
+                                update_id,
+                            )
+
+                            continue
 
                     process_telegram_update(
                         update
@@ -11913,21 +12104,16 @@ def start_telegram_polling() -> bool:
 
         return False
 
-    if POLLING_THREAD is not None:
-
-        if POLLING_THREAD.is_alive():
-
-            logger.info(
-                "Telegram polling is already running."
-            )
-
-            return True
-
     with POLLING_THREAD_LOCK:
 
         if POLLING_THREAD is not None:
 
             if POLLING_THREAD.is_alive():
+
+                logger.info(
+                    "Telegram polling is already running."
+                )
+
                 return True
 
         POLLING_STOP.clear()
@@ -11953,7 +12139,7 @@ def start_telegram_polling() -> bool:
 
 def stop_telegram_polling() -> None:
     """
-    Stops Telegram polling.
+    Stops Telegram polling gracefully.
     """
 
     global POLLING_THREAD
@@ -11964,7 +12150,10 @@ def stop_telegram_polling() -> None:
 
     if thread is not None:
 
-        if thread.is_alive():
+        if (
+            thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
 
             thread.join(
                 timeout=10
@@ -11994,9 +12183,33 @@ def initialize_geniosa() -> None:
         APP_VERSION,
     )
 
-    environment = validate_environment()
+    try:
 
-    if not environment["database"]:
+        environment = validate_environment()
+
+    except Exception as exc:
+
+        logger.exception(
+            "Environment validation failed: %s",
+            exc,
+        )
+
+        environment = {
+            "database": bool(
+                DATABASE_URL
+            ),
+            "telegram": bool(
+                TELEGRAM_BOT_TOKEN
+            ),
+            "gemini": bool(
+                GEMINI_API_KEY
+            ),
+        }
+
+    if not environment.get(
+        "database",
+        False,
+    ):
 
         logger.warning(
             "DATABASE_URL is not configured."
@@ -12019,13 +12232,19 @@ def initialize_geniosa() -> None:
                 exc,
             )
 
-    if not environment["telegram"]:
+    if not environment.get(
+        "telegram",
+        False,
+    ):
 
         logger.warning(
             "TELEGRAM_BOT_TOKEN is not configured."
         )
 
-    if not environment["gemini"]:
+    if not environment.get(
+        "gemini",
+        False,
+    ):
 
         logger.warning(
             "GEMINI_API_KEY is not configured."
@@ -12049,7 +12268,16 @@ def shutdown_geniosa() -> None:
         "Shutting down Geniosa..."
     )
 
-    stop_telegram_polling()
+    try:
+
+        stop_telegram_polling()
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram polling shutdown failed: %s",
+            exc,
+        )
 
     logger.info(
         "Geniosa shutdown completed."
@@ -12074,7 +12302,13 @@ async def geniosa_lifespan(
 
         if DATABASE_URL:
 
-            start_telegram_polling()
+            started = start_telegram_polling()
+
+            if not started:
+
+                logger.error(
+                    "Telegram polling could not be started."
+                )
 
         else:
 
@@ -12090,9 +12324,13 @@ async def geniosa_lifespan(
             "TELEGRAM_BOT_TOKEN is missing."
         )
 
-    yield
+    try:
 
-    shutdown_geniosa()
+        yield
+
+    finally:
+
+        shutdown_geniosa()
 
 
 # ------------------------------------------------------------
