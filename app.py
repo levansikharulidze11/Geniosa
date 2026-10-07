@@ -1,7 +1,7 @@
 # ============================================================
-# GENIOSA 4.2
+# GENIOSA 4.3
 # Personal Business Advisor
-# Fact Engine + Developer Engine + Debug/Fix Engine
+# Fact Engine 2.0 + Developer Engine + Debug/Fix Engine
 # Telegram + Gemini + PostgreSQL
 # ============================================================
 
@@ -24,9 +24,20 @@ from fastapi import FastAPI
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
+
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+).strip()
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    ""
+).strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
@@ -45,7 +56,7 @@ OWNER_ID = os.getenv(
 
 app = FastAPI(
     title="Geniosa",
-    version="4.2"
+    version="4.3"
 )
 
 
@@ -57,13 +68,19 @@ def configuration_status():
     missing = []
 
     if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
+        missing.append(
+            "TELEGRAM_BOT_TOKEN"
+        )
 
     if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
+        missing.append(
+            "GEMINI_API_KEY"
+        )
 
     if not DATABASE_URL:
-        missing.append("DATABASE_URL")
+        missing.append(
+            "DATABASE_URL"
+        )
 
     return missing
 
@@ -92,6 +109,10 @@ def init_database():
     conn = get_db()
     cur = conn.cursor()
 
+    # --------------------------------------------------------
+    # MESSAGES
+    # --------------------------------------------------------
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -103,6 +124,10 @@ def init_database():
         )
         """
     )
+
+    # --------------------------------------------------------
+    # MEMORIES
+    # --------------------------------------------------------
 
     cur.execute(
         """
@@ -118,6 +143,10 @@ def init_database():
         """
     )
 
+    # --------------------------------------------------------
+    # PROJECTS
+    # --------------------------------------------------------
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -132,6 +161,10 @@ def init_database():
         """
     )
 
+    # --------------------------------------------------------
+    # LEGACY FACTS TABLE
+    # --------------------------------------------------------
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS facts (
@@ -139,14 +172,149 @@ def init_database():
             chat_id BIGINT NOT NULL,
             fact_key TEXT NOT NULL,
             fact_value TEXT NOT NULL,
-            source TEXT DEFAULT 'USER_CONFIRMED',
-            confidence TEXT DEFAULT 'confirmed',
+            source TEXT DEFAULT 'USER',
+            confidence TEXT DEFAULT 'pending',
+            status TEXT DEFAULT 'PENDING',
+            source_message_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(chat_id, fact_key)
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+
+    # --------------------------------------------------------
+    # FACT ENGINE 2.0 MIGRATION
+    # --------------------------------------------------------
+
+    # Existing 4.2 installations may already have
+    # UNIQUE(chat_id, fact_key).
+    #
+    # We intentionally remove that constraint because
+    # Fact Engine 2.0 must preserve conflicting/history data
+    # instead of silently replacing it.
+    #
+    # PostgreSQL allows us to inspect constraints safely.
+
+    cur.execute(
+        """
+        DO $$
+        DECLARE
+            constraint_record RECORD;
+        BEGIN
+            FOR constraint_record IN
+                SELECT
+                    conname
+                FROM pg_constraint
+                WHERE conrelid = 'facts'::regclass
+                  AND contype = 'u'
+            LOOP
+                EXECUTE
+                    'ALTER TABLE facts DROP CONSTRAINT IF EXISTS '
+                    || quote_ident(constraint_record.conname);
+            END LOOP;
+        END
+        $$;
+        """
+    )
+
+    # Add missing columns to old 4.2 database.
+
+    cur.execute(
+        """
+        ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS status TEXT
+        """
+    )
+
+    cur.execute(
+        """
+        ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS source_message_id INTEGER
+        """
+    )
+
+    cur.execute(
+        """
+        ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMP
+        """
+    )
+
+    cur.execute(
+        """
+        ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMP
+        """
+    )
+
+    cur.execute(
+        """
+        ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS rejection_reason TEXT
+        """
+    )
+
+    # IMPORTANT:
+    # Existing 4.2 facts were automatically created.
+    # User has now explicitly said they are NOT confirmed.
+    #
+    # Therefore any old record that has not been explicitly
+    # confirmed through Fact Engine 2.0 becomes PENDING.
+
+    cur.execute(
+        """
+        UPDATE facts
+        SET status = 'PENDING'
+        WHERE status IS NULL
+           OR status = ''
+           OR (
+                confidence = 'confirmed'
+                AND confirmed_at IS NULL
+              )
+        """
+    )
+
+    cur.execute(
+        """
+        UPDATE facts
+        SET source = 'LEGACY_4_2_UNCONFIRMED'
+        WHERE source = 'USER_CONFIRMED'
+          AND confirmed_at IS NULL
+        """
+    )
+
+    cur.execute(
+        """
+        UPDATE facts
+        SET confidence = 'pending'
+        WHERE status = 'PENDING'
+          AND confirmed_at IS NULL
+        """
+    )
+
+    # --------------------------------------------------------
+    # FACT HISTORY
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fact_history (
+            id SERIAL PRIMARY KEY,
+            fact_id INTEGER,
+            chat_id BIGINT NOT NULL,
+            action TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            reason TEXT,
+            source_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # CODE PROJECTS
+    # --------------------------------------------------------
 
     cur.execute(
         """
@@ -162,6 +330,10 @@ def init_database():
         )
         """
     )
+
+    # --------------------------------------------------------
+    # CODE VERSIONS
+    # --------------------------------------------------------
 
     cur.execute(
         """
@@ -192,7 +364,11 @@ def init_database():
 # MESSAGE STORAGE
 # ============================================================
 
-def save_message(chat_id, role, text):
+def save_message(
+    chat_id,
+    role,
+    text
+):
     conn = get_db()
     cur = conn.cursor()
 
@@ -202,6 +378,7 @@ def save_message(chat_id, role, text):
             (chat_id, role, text)
         VALUES
             (%s, %s, %s)
+        RETURNING id
         """,
         (
             chat_id,
@@ -210,13 +387,20 @@ def save_message(chat_id, role, text):
         )
     )
 
+    row = cur.fetchone()
+
     conn.commit()
 
     cur.close()
     conn.close()
 
+    return row[0] if row else None
 
-def get_recent_messages(chat_id, limit=20):
+
+def get_recent_messages(
+    chat_id,
+    limit=20
+):
     conn = get_db()
     cur = conn.cursor(
         cursor_factory=RealDictCursor
@@ -224,7 +408,11 @@ def get_recent_messages(chat_id, limit=20):
 
     cur.execute(
         """
-        SELECT role, text, created_at
+        SELECT
+            id,
+            role,
+            text,
+            created_at
         FROM messages
         WHERE chat_id = %s
         ORDER BY id DESC
@@ -381,18 +569,134 @@ def get_projects(chat_id):
 
 
 # ============================================================
-# FACT ENGINE
+# FACT ENGINE 2.0
 # ============================================================
 
-def save_fact(
+FACT_STATUS_PENDING = "PENDING"
+FACT_STATUS_CONFIRMED = "CONFIRMED"
+FACT_STATUS_REJECTED = "REJECTED"
+FACT_STATUS_CONFLICT = "CONFLICT"
+
+FACT_TYPE_FACT = "FACT"
+FACT_TYPE_ASSUMPTION = "ASSUMPTION"
+FACT_TYPE_CALCULATED = "CALCULATED"
+FACT_TYPE_SOURCE = "SOURCE"
+
+
+def normalize_fact_key(value):
+    value = str(value or "").strip().lower()
+
+    value = re.sub(
+        r"\s+",
+        "_",
+        value
+    )
+
+    value = re.sub(
+        r"[^a-zA-Z0-9ა-ჰ_]+",
+        "_",
+        value
+    )
+
+    value = re.sub(
+        r"_+",
+        "_",
+        value
+    )
+
+    return value.strip("_")
+
+
+def save_fact_candidate(
     chat_id,
     fact_key,
     fact_value,
-    source="USER_CONFIRMED",
-    confidence="confirmed"
+    source="USER_STATED",
+    confidence="pending",
+    status=FACT_STATUS_PENDING,
+    source_message_id=None,
+    reason="User-stated information awaiting confirmation."
 ):
+    fact_key = normalize_fact_key(
+        fact_key
+    )
+
+    if not fact_key:
+        return None
+
+    fact_value = str(
+        fact_value
+    ).strip()
+
+    if not fact_value:
+        return None
+
     conn = get_db()
     cur = conn.cursor()
+
+    # --------------------------------------------------------
+    # Check for an identical active record.
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            status
+        FROM facts
+        WHERE chat_id = %s
+          AND fact_key = %s
+          AND fact_value = %s
+          AND status IN ('PENDING', 'CONFIRMED')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            chat_id,
+            fact_key,
+            fact_value
+        )
+    )
+
+    existing = cur.fetchone()
+
+    if existing:
+        cur.close()
+        conn.close()
+
+        return {
+            "id": existing[0],
+            "status": existing[1],
+            "existing": True
+        }
+
+    # --------------------------------------------------------
+    # If another CONFIRMED value exists for same key,
+    # do NOT overwrite it.
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            fact_value
+        FROM facts
+        WHERE chat_id = %s
+          AND fact_key = %s
+          AND status = 'CONFIRMED'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            chat_id,
+            fact_key
+        )
+    )
+
+    confirmed = cur.fetchone()
+
+    if confirmed:
+        status = FACT_STATUS_CONFLICT
 
     cur.execute(
         """
@@ -402,23 +706,52 @@ def save_fact(
                 fact_key,
                 fact_value,
                 source,
-                confidence
+                confidence,
+                status,
+                source_message_id
             )
         VALUES
-            (%s, %s, %s, %s, %s)
-        ON CONFLICT (chat_id, fact_key)
-        DO UPDATE SET
-            fact_value = EXCLUDED.fact_value,
-            source = EXCLUDED.source,
-            confidence = EXCLUDED.confidence,
-            updated_at = CURRENT_TIMESTAMP
+            (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
         """,
         (
             chat_id,
             fact_key,
             fact_value,
             source,
-            confidence
+            confidence,
+            status,
+            source_message_id
+        )
+    )
+
+    row = cur.fetchone()
+
+    fact_id = row[0] if row else None
+
+    cur.execute(
+        """
+        INSERT INTO fact_history
+            (
+                fact_id,
+                chat_id,
+                action,
+                old_value,
+                new_value,
+                reason,
+                source_message_id
+            )
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            fact_id,
+            chat_id,
+            "CREATED",
+            None,
+            fact_value,
+            reason,
+            source_message_id
         )
     )
 
@@ -427,8 +760,17 @@ def save_fact(
     cur.close()
     conn.close()
 
+    return {
+        "id": fact_id,
+        "status": status,
+        "existing": False
+    }
 
-def get_facts(chat_id):
+
+def get_facts(
+    chat_id,
+    status=FACT_STATUS_CONFIRMED
+):
     conn = get_db()
     cur = conn.cursor(
         cursor_factory=RealDictCursor
@@ -442,13 +784,22 @@ def get_facts(chat_id):
             fact_value,
             source,
             confidence,
+            status,
+            source_message_id,
             created_at,
-            updated_at
+            updated_at,
+            confirmed_at,
+            rejected_at,
+            rejection_reason
         FROM facts
         WHERE chat_id = %s
+          AND status = %s
         ORDER BY id
         """,
-        (chat_id,)
+        (
+            chat_id,
+            status
+        )
     )
 
     rows = cur.fetchall()
@@ -459,18 +810,335 @@ def get_facts(chat_id):
     return rows
 
 
+def get_pending_facts(chat_id):
+    return get_facts(
+        chat_id,
+        FACT_STATUS_PENDING
+    )
+
+
+def get_conflict_facts(chat_id):
+    return get_facts(
+        chat_id,
+        FACT_STATUS_CONFLICT
+    )
+
+
+def get_fact_by_id(
+    chat_id,
+    fact_id
+):
+    conn = get_db()
+    cur = conn.cursor(
+        cursor_factory=RealDictCursor
+    )
+
+    cur.execute(
+        """
+        SELECT *
+        FROM facts
+        WHERE chat_id = %s
+          AND id = %s
+        LIMIT 1
+        """,
+        (
+            chat_id,
+            fact_id
+        )
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return row
+
+
+def confirm_fact(
+    chat_id,
+    fact_id
+):
+    conn = get_db()
+    cur = conn.cursor(
+        cursor_factory=RealDictCursor
+    )
+
+    cur.execute(
+        """
+        SELECT *
+        FROM facts
+        WHERE chat_id = %s
+          AND id = %s
+        FOR UPDATE
+        """,
+        (
+            chat_id,
+            fact_id
+        )
+    )
+
+    fact = cur.fetchone()
+
+    if not fact:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": False,
+            "message": "ფაქტი ვერ მოიძებნა."
+        }
+
+    if fact["status"] == FACT_STATUS_CONFIRMED:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": True,
+            "message": "ეს ფაქტი უკვე დადასტურებულია."
+        }
+
+    if fact["status"] == FACT_STATUS_REJECTED:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": False,
+            "message": "ეს ფაქტი უკვე უარყოფილია."
+        }
+
+    # --------------------------------------------------------
+    # Check whether a different confirmed value exists.
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            fact_value
+        FROM facts
+        WHERE chat_id = %s
+          AND fact_key = %s
+          AND status = 'CONFIRMED'
+          AND id <> %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            chat_id,
+            fact["fact_key"],
+            fact_id
+        )
+    )
+
+    existing_confirmed = cur.fetchone()
+
+    if existing_confirmed:
+        cur.execute(
+            """
+            UPDATE facts
+            SET
+                status = 'CONFLICT',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (fact_id,)
+        )
+
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": False,
+            "conflict": True,
+            "message": (
+                "ამ ფაქტისთვის უკვე არსებობს "
+                "სხვა დადასტურებული მნიშვნელობა."
+            ),
+            "existing_value": existing_confirmed[
+                "fact_value"
+            ],
+            "new_value": fact[
+                "fact_value"
+            ]
+        }
+
+    cur.execute(
+        """
+        UPDATE facts
+        SET
+            status = 'CONFIRMED',
+            confidence = 'confirmed',
+            source = 'USER_CONFIRMED',
+            confirmed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (fact_id,)
+    )
+
+    cur.execute(
+        """
+        INSERT INTO fact_history
+            (
+                fact_id,
+                chat_id,
+                action,
+                old_value,
+                new_value,
+                reason,
+                source_message_id
+            )
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            fact_id,
+            chat_id,
+            "CONFIRMED",
+            fact["fact_value"],
+            fact["fact_value"],
+            "Confirmed explicitly by user.",
+            fact["source_message_id"]
+        )
+    )
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return {
+        "ok": True,
+        "fact": fact
+    }
+
+
+def reject_fact(
+    chat_id,
+    fact_id,
+    reason="Rejected by user."
+):
+    conn = get_db()
+    cur = conn.cursor(
+        cursor_factory=RealDictCursor
+    )
+
+    cur.execute(
+        """
+        SELECT *
+        FROM facts
+        WHERE chat_id = %s
+          AND id = %s
+        FOR UPDATE
+        """,
+        (
+            chat_id,
+            fact_id
+        )
+    )
+
+    fact = cur.fetchone()
+
+    if not fact:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": False,
+            "message": "ფაქტი ვერ მოიძებნა."
+        }
+
+    if fact["status"] == FACT_STATUS_CONFIRMED:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+        return {
+            "ok": False,
+            "message": (
+                "დადასტურებული ფაქტის უარყოფა "
+                "ამ ბრძანებით შეუძლებელია."
+            )
+        }
+
+    cur.execute(
+        """
+        UPDATE facts
+        SET
+            status = 'REJECTED',
+            confidence = 'rejected',
+            rejected_at = CURRENT_TIMESTAMP,
+            rejection_reason = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (
+            reason,
+            fact_id
+        )
+    )
+
+    cur.execute(
+        """
+        INSERT INTO fact_history
+            (
+                fact_id,
+                chat_id,
+                action,
+                old_value,
+                new_value,
+                reason,
+                source_message_id
+            )
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            fact_id,
+            chat_id,
+            "REJECTED",
+            fact["fact_value"],
+            fact["fact_value"],
+            reason,
+            fact["source_message_id"]
+        )
+    )
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return {
+        "ok": True,
+        "fact": fact
+    }
+
+
 def build_fact_context(chat_id):
-    facts = get_facts(chat_id)
+    facts = get_facts(
+        chat_id,
+        FACT_STATUS_CONFIRMED
+    )
 
     if not facts:
         return (
-            "FACT DATABASE: "
-            "No confirmed facts stored yet."
+            "FACT DATABASE:\n"
+            "No confirmed facts stored yet.\n"
+            "Do not present any project/company "
+            "number as confirmed."
         )
 
     lines = [
         "FACT DATABASE:",
-        "Only use confirmed facts as facts."
+        "The following are CONFIRMED facts only."
     ]
 
     for fact in facts:
@@ -481,128 +1149,239 @@ def build_fact_context(chat_id):
             + str(fact["fact_value"])
             + " | source="
             + str(fact["source"])
-            + " | confidence="
-            + str(fact["confidence"])
+            + " | status="
+            + str(fact["status"])
         )
 
     return "\n".join(lines)
 
 
-def extract_explicit_facts(
-    chat_id,
-    user_text
-):
-    text = user_text.strip()
+# ============================================================
+# EXPLICIT FACT DETECTION
+# ============================================================
+
+def contains_explicit_statement(text):
     lower = text.lower()
+
+    statement_words = [
+        "არის",
+        "შეადგენს",
+        "გვაქვს",
+        "აქვს",
+        "უდრის",
+        "ტოლია",
+        "იქნება",
+        "is",
+        "equals",
+        "has",
+        "amounts to",
+        "we have"
+    ]
+
+    return any(
+        word in lower
+        for word in statement_words
+    )
+
+
+def detect_explicit_facts(
+    chat_id,
+    user_text,
+    source_message_id
+):
+    """
+    IMPORTANT:
+    Merely mentioning NIKKEA, Samgori or SAMTISI
+    does NOT create facts.
+
+    A candidate is created only when the user's text
+    appears to contain an explicit factual statement.
+    """
+
+    text = user_text.strip()
+
+    if not text:
+        return []
+
+    if not contains_explicit_statement(
+        text
+    ):
+        return []
 
     detected = []
 
-    if (
-        "samtisi construction" in lower
-        or "samtisi" in lower
-        or "სამთისი" in lower
-        or "სამტისი" in lower
+    lower = text.lower()
+
+    # --------------------------------------------------------
+    # SAMTISI
+    # --------------------------------------------------------
+
+    company_patterns = [
+        (
+            r"(?:samtisi\s+construction\s+llc)"
+        ),
+        (
+            r"(?:სამტისი\s+კონსტრაქშენ)"
+        ),
+        (
+            r"(?:სამთისი\s+კონსტრაქშენ)"
+        )
+    ]
+
+    if any(
+        re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+        for pattern in company_patterns
     ):
-        save_fact(
+        result = save_fact_candidate(
             chat_id,
             "company_name",
             "SAMTISI CONSTRUCTION LLC",
-            "USER_CONFIRMED",
-            "confirmed"
+            source="USER_STATED",
+            confidence="pending",
+            status=FACT_STATUS_PENDING,
+            source_message_id=source_message_id,
+            reason=(
+                "Company name explicitly stated by user."
+            )
         )
 
-        detected.append(
-            "company_name"
-        )
+        if result and not result.get(
+            "existing"
+        ):
+            detected.append(result)
+
+    # --------------------------------------------------------
+    # NIKKEA 12
+    # --------------------------------------------------------
 
     if (
         "nikkea 12" in lower
         or "ნიკეა 12" in lower
     ):
-        save_fact(
-            chat_id,
-            "nikkea_12_land_area",
-            "3,070 m²",
-            "USER_CONFIRMED",
-            "confirmed"
+
+        # Land area
+        land_match = re.search(
+            r"(?:
+                მიწის\s*(?:ფართობი|ფართი)
+                |
+                land\s*(?:area|size)
+            )
+            \D{0,80}
+            ([0-9][0-9,\.\s]*)
+            \s*(?:m2|m²|მ2|მ²|კვ\.?\s*მ)",
+            text,
+            flags=re.IGNORECASE | re.VERBOSE
         )
 
-        save_fact(
-            chat_id,
-            "nikkea_12_total_saleable_area",
-            "10,854 m²",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
+        if land_match:
+            value = (
+                land_match.group(1)
+                .strip()
+                + " m²"
+            )
 
-        save_fact(
-            chat_id,
-            "nikkea_12_hotel_rooms_area",
-            "7,212 m²",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
-
-        detected.extend(
-            [
+            result = save_fact_candidate(
+                chat_id,
                 "nikkea_12_land_area",
+                value,
+                source="USER_STATED",
+                confidence="pending",
+                status=FACT_STATUS_PENDING,
+                source_message_id=source_message_id,
+                reason=(
+                    "NIKKEA 12 land area explicitly "
+                    "stated by user."
+                )
+            )
+
+            if result and not result.get(
+                "existing"
+            ):
+                detected.append(result)
+
+        # Saleable area
+        saleable_match = re.search(
+            r"(?:
+                გასაყიდი\s*(?:ფართობი|ფართი)
+                |
+                saleable\s*area
+            )
+            \D{0,80}
+            ([0-9][0-9,\.\s]*)
+            \s*(?:m2|m²|მ2|მ²|კვ\.?\s*მ)",
+            text,
+            flags=re.IGNORECASE | re.VERBOSE
+        )
+
+        if saleable_match:
+            value = (
+                saleable_match.group(1)
+                .strip()
+                + " m²"
+            )
+
+            result = save_fact_candidate(
+                chat_id,
                 "nikkea_12_total_saleable_area",
-                "nikkea_12_hotel_rooms_area"
-            ]
+                value,
+                source="USER_STATED",
+                confidence="pending",
+                status=FACT_STATUS_PENDING,
+                source_message_id=source_message_id,
+                reason=(
+                    "NIKKEA 12 saleable area explicitly "
+                    "stated by user."
+                )
+            )
+
+            if result and not result.get(
+                "existing"
+            ):
+                detected.append(result)
+
+        # Hotel rooms area
+        hotel_match = re.search(
+            r"(?:
+                სასტუმროს\s*(?:ნომრების\s*)?(?:ფართობი|ფართი)
+                |
+                hotel\s*(?:rooms\s*)?area
+            )
+            \D{0,80}
+            ([0-9][0-9,\.\s]*)
+            \s*(?:m2|m²|მ2|მ²|კვ\.?\s*მ)",
+            text,
+            flags=re.IGNORECASE | re.VERBOSE
         )
 
-    if (
-        "samgori" in lower
-        or "სამგორი" in lower
-    ):
-        save_fact(
-            chat_id,
-            "samgori_land_area",
-            "7,390 m²",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
+        if hotel_match:
+            value = (
+                hotel_match.group(1)
+                .strip()
+                + " m²"
+            )
 
-        save_fact(
-            chat_id,
-            "samgori_build_area",
-            "46,131 m²",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
+            result = save_fact_candidate(
+                chat_id,
+                "nikkea_12_hotel_rooms_area",
+                value,
+                source="USER_STATED",
+                confidence="pending",
+                status=FACT_STATUS_PENDING,
+                source_message_id=source_message_id,
+                reason=(
+                    "NIKKEA 12 hotel rooms area "
+                    "explicitly stated by user."
+                )
+            )
 
-        save_fact(
-            chat_id,
-            "samgori_saleable_area",
-            "30,540 m²",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
-
-        detected.extend(
-            [
-                "samgori_land_area",
-                "samgori_build_area",
-                "samgori_saleable_area"
-            ]
-        )
-
-    if (
-        "golden lake" in lower
-        or "oqri lake" in lower
-        or "ოქროს ტბა" in lower
-    ):
-        save_fact(
-            chat_id,
-            "golden_lake_main_land",
-            "approximately 46 hectares",
-            "USER_CONFIRMED",
-            "confirmed"
-        )
-
-        detected.append(
-            "golden_lake_main_land"
-        )
+            if result and not result.get(
+                "existing"
+            ):
+                detected.append(result)
 
     return detected
 
@@ -615,6 +1394,14 @@ def detect_memories(
     chat_id,
     user_text
 ):
+    """
+    Legacy memory is intentionally kept separate
+    from the confirmed Fact Engine.
+
+    Mentioning a project may update legacy memory,
+    but it does NOT create a confirmed fact.
+    """
+
     text = user_text.lower()
 
     if (
@@ -637,9 +1424,10 @@ def detect_memories(
             "project_nikkea_12",
             (
                 "Kutaisi, Nikkea 12. "
-                "Land 3,070 m². "
-                "Total saleable area 10,854 m². "
-                "Hotel rooms area 7,212 m²."
+                "Project information exists in "
+                "conversation history, but numerical "
+                "data is not automatically treated as "
+                "confirmed facts."
             )
         )
 
@@ -653,9 +1441,10 @@ def detect_memories(
             (
                 "Tbilisi, Samgori, "
                 "Giorgi Naderishvili Street. "
-                "Land 7,390 m². "
-                "Build area 46,131 m². "
-                "Saleable area 30,540 m²."
+                "Project information exists in "
+                "conversation history, but numerical "
+                "data is not automatically treated as "
+                "confirmed facts."
             )
         )
 
@@ -670,7 +1459,8 @@ def detect_memories(
             (
                 "Golden Lake / Oqri Lake "
                 "development concept. "
-                "Main land approximately 46 ha."
+                "Numerical information is not "
+                "automatically treated as confirmed facts."
             )
         )
 
@@ -749,7 +1539,11 @@ def get_next_code_version(
     cur.close()
     conn.close()
 
-    current = row[0] if row else 0
+    current = (
+        row[0]
+        if row
+        else 0
+    )
 
     return int(current) + 1
 
@@ -898,6 +1692,7 @@ def get_code_versions(
                 limit
             )
         )
+
     else:
         cur.execute(
             """
@@ -961,6 +1756,7 @@ def telegram_request(
                 files=files,
                 timeout=timeout
             )
+
         else:
             response = requests.post(
                 telegram_url(method),
@@ -1037,6 +1833,7 @@ def send_message(
     current = ""
 
     for paragraph in text.split("\n"):
+
         if (
             len(current)
             + len(paragraph)
@@ -1044,18 +1841,23 @@ def send_message(
             > max_length
         ):
             if current:
-                parts.append(current)
+                parts.append(
+                    current
+                )
 
             current = paragraph
 
         else:
+
             if current:
                 current += "\n"
 
             current += paragraph
 
     if current:
-        parts.append(current)
+        parts.append(
+            current
+        )
 
     results = []
 
@@ -1078,7 +1880,9 @@ def send_document_to_chat(
     filepath,
     caption=""
 ):
-    if not os.path.exists(filepath):
+    if not os.path.exists(
+        filepath
+    ):
         return None
 
     try:
@@ -1187,10 +1991,15 @@ def call_gemini(prompt):
         answer_parts = []
 
         for part in parts:
-            text = part.get("text")
+
+            text = part.get(
+                "text"
+            )
 
             if text:
-                answer_parts.append(text)
+                answer_parts.append(
+                    text
+                )
 
         answer = "\n".join(
             answer_parts
@@ -1250,6 +2059,17 @@ def constitution():
         "დადასტურების გარეშე დაუშვებელია.\n"
         "12. საიდუმლო API keys და პაროლები კოდში "
         "არ ჩაწერო.\n"
+        "13. მხოლოდ CONFIRMED სტატუსის მქონე მონაცემი "
+        "შეიძლება წარმოდგენილი იყოს როგორც დადასტურებული "
+        "ფაქტი.\n"
+        "14. მომხმარებლის მიერ ნათქვამი ინფორმაცია "
+        "ავტომატურად არ არის დადასტურებული ფაქტი.\n"
+        "15. PENDING მონაცემი უნდა გამოცხადდეს "
+        "დასადასტურებელ ინფორმაციად.\n"
+        "16. CONFIRMED ფაქტი არ გადაიწეროს ახალი "
+        "მნიშვნელობით ავტომატურად.\n"
+        "17. განსხვავებული ახალი მნიშვნელობის შემთხვევაში "
+        "შექმენი CONFLICT და აცნობე მომხმარებელს.\n"
     )
 
 
@@ -1258,11 +2078,13 @@ def constitution():
 # ============================================================
 
 def build_memory_context(chat_id):
-    memories = get_memories(chat_id)
+    memories = get_memories(
+        chat_id
+    )
 
     if not memories:
         return (
-            "Legacy memory: empty."
+            "LEGACY MEMORY: empty."
         )
 
     lines = [
@@ -1281,7 +2103,9 @@ def build_memory_context(chat_id):
 
 
 def build_project_context(chat_id):
-    projects = get_projects(chat_id)
+    projects = get_projects(
+        chat_id
+    )
 
     if not projects:
         return (
@@ -1298,7 +2122,9 @@ def build_project_context(chat_id):
             + str(project["name"])
             + ": "
             + str(
-                project.get("description")
+                project.get(
+                    "description"
+                )
                 or ""
             )
         )
@@ -1322,16 +2148,26 @@ def build_history_context(chat_id):
     ]
 
     for row in rows:
+
         role = str(
-            row.get("role", "")
+            row.get(
+                "role",
+                ""
+            )
         )
 
         text = str(
-            row.get("text", "")
+            row.get(
+                "text",
+                ""
+            )
         )
 
         if len(text) > 1200:
-            text = text[:1200] + "..."
+            text = (
+                text[:1200]
+                + "..."
+            )
 
         lines.append(
             role
@@ -1339,7 +2175,9 @@ def build_history_context(chat_id):
             + text
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -1364,7 +2202,9 @@ def extract_code(text):
 
 def check_python_syntax(code):
     try:
-        ast.parse(code)
+        ast.parse(
+            code
+        )
 
         return {
             "ok": True,
@@ -1372,6 +2212,7 @@ def check_python_syntax(code):
         }
 
     except SyntaxError as exc:
+
         message = (
             "SyntaxError: "
             + str(exc)
@@ -1395,22 +2236,26 @@ def check_python_syntax(code):
         }
 
     except Exception as exc:
+
         return {
             "ok": False,
             "error": str(exc)
         }
 
 
-def detect_common_python_problems(code):
+def detect_common_python_problems(
+    code
+):
     problems = []
 
     if "inplace-True" in code:
         problems.append(
             {
-                "type": "runtime/API",
+                "type": "runtime",
                 "message": (
-                    "აღმოჩნდა 'inplace-True'. "
-                    "სავარაუდოდ უნდა იყოს 'inplace=True'."
+                    "'inplace-True' არ არის Syntax Error. "
+                    "Python ამას გამოხატულებად აღიქვამს. "
+                    "სავარაუდოდ სწორი ფორმაა 'inplace=True'."
                 )
             }
         )
@@ -1418,15 +2263,16 @@ def detect_common_python_problems(code):
     if "inplace-False" in code:
         problems.append(
             {
-                "type": "runtime/API",
+                "type": "runtime",
                 "message": (
-                    "აღმოჩნდა 'inplace-False'. "
-                    "სავარაუდოდ უნდა იყოს 'inplace=False'."
+                    "'inplace-False' არ არის Syntax Error. "
+                    "სავარაუდოდ სწორი ფორმაა 'inplace=False'."
                 )
             }
         )
 
     if "pd.ExcelWriter" in code:
+
         if (
             "openpyxl" not in code
             and "engine=" not in code
@@ -1436,7 +2282,8 @@ def detect_common_python_problems(code):
                     "type": "dependency",
                     "message": (
                         "ExcelWriter-ისთვის შეიძლება "
-                        "საჭირო იყოს openpyxl."
+                        "საჭირო იყოს შესაბამისი Excel "
+                        "engine, მაგალითად openpyxl."
                     )
                 }
             )
@@ -1444,7 +2291,9 @@ def detect_common_python_problems(code):
     return problems
 
 
-def analyze_python_code(code):
+def analyze_python_code(
+    code
+):
     syntax = check_python_syntax(
         code
     )
@@ -1473,9 +2322,13 @@ def create_code_file(
     )
 
     if not safe_name:
-        safe_name = "geniosa_code.py"
+        safe_name = (
+            "geniosa_code.py"
+        )
 
-    if not safe_name.endswith(".py"):
+    if not safe_name.endswith(
+        ".py"
+    ):
         safe_name += ".py"
 
     filepath = os.path.join(
@@ -1488,7 +2341,10 @@ def create_code_file(
         "w",
         encoding="utf-8"
     ) as file:
-        file.write(code)
+
+        file.write(
+            code
+        )
 
     return filepath
 
@@ -1536,7 +2392,8 @@ def build_developer_prompt(
         "\n"
         "FACT RULE:\n"
         "Only confirmed user facts may be presented "
-        "as facts.\n"
+        "as confirmed facts.\n"
+        "PENDING facts are NOT confirmed facts.\n"
         "Do not invent missing project information.\n"
         "\n"
         "CODE RULE:\n"
@@ -1547,7 +2404,8 @@ def build_developer_prompt(
         "DEBUG RULE:\n"
         "Distinguish between:\n"
         "- syntax error\n"
-        "- runtime/API error\n"
+        "- runtime error\n"
+        "- API error\n"
         "- dependency error\n"
         "- logic error\n"
         "- configuration error\n"
@@ -1558,19 +2416,27 @@ def build_developer_prompt(
     )
 
     parts.append(
-        build_fact_context(chat_id)
+        build_fact_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_memory_context(chat_id)
+        build_memory_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_project_context(chat_id)
+        build_project_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_history_context(chat_id)
+        build_history_context(
+            chat_id
+        )
     )
 
     parts.append(
@@ -1578,7 +2444,9 @@ def build_developer_prompt(
         + task
     )
 
-    return "\n\n".join(parts)
+    return "\n\n".join(
+        parts
+    )
 
 
 # ============================================================
@@ -1608,7 +2476,9 @@ def developer_generate(
         code
     )
 
-    filename = "geniosa_generated.py"
+    filename = (
+        "geniosa_generated.py"
+    )
 
     lowered = task.lower()
 
@@ -1616,10 +2486,14 @@ def developer_generate(
         filename = "app.py"
 
     elif "requirements" in lowered:
-        filename = "requirements.txt"
+        filename = (
+            "requirements.txt"
+        )
 
     elif "telegram" in lowered:
-        filename = "telegram_bot.py"
+        filename = (
+            "telegram_bot.py"
+        )
 
     save_code_project(
         chat_id,
@@ -1628,6 +2502,8 @@ def developer_generate(
         task[:1000]
     )
 
+    saved = None
+
     if code:
         saved = save_code_version(
             chat_id,
@@ -1635,12 +2511,14 @@ def developer_generate(
             filename,
             "python",
             code,
-            analysis["syntax_ok"],
-            analysis["syntax_error"],
+            analysis[
+                "syntax_ok"
+            ],
+            analysis[
+                "syntax_error"
+            ],
             "initial generation"
         )
-    else:
-        saved = None
 
     return {
         "answer": answer,
@@ -1718,8 +2596,12 @@ def developer_debug(
             "geniosa_fixed.py",
             "python",
             fixed_code,
-            after["syntax_ok"],
-            after["syntax_error"],
+            after[
+                "syntax_ok"
+            ],
+            after[
+                "syntax_error"
+            ],
             "debug/fix",
             parent_id
         )
@@ -1748,19 +2630,36 @@ def generate_general_response(
     )
 
     parts.append(
-        build_fact_context(chat_id)
+        build_fact_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_memory_context(chat_id)
+        build_memory_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_project_context(chat_id)
+        build_project_context(
+            chat_id
+        )
     )
 
     parts.append(
-        build_history_context(chat_id)
+        build_history_context(
+            chat_id
+        )
+    )
+
+    parts.append(
+        "IMPORTANT FACT POLICY:\n"
+        "Only CONFIRMED facts may be stated as facts.\n"
+        "PENDING information must be described as "
+        "unconfirmed.\n"
+        "If no confirmed fact exists, say so.\n"
+        "Do not convert legacy memory into confirmed facts."
     )
 
     parts.append(
@@ -1775,7 +2674,9 @@ def generate_general_response(
     )
 
     return call_gemini(
-        "\n\n".join(parts)
+        "\n\n".join(
+            parts
+        )
     )
 
 
@@ -1785,7 +2686,7 @@ def generate_general_response(
 
 def command_start():
     return (
-        "გამარჯობა. მე ვარ Geniosa 4.2. 🤖\n\n"
+        "გამარჯობა. მე ვარ Geniosa 4.3. 🤖\n\n"
         "მე შემიძლია დაგეხმარო:\n"
         "• ბიზნესის ანალიზში\n"
         "• საინვესტიციო პროექტებში\n"
@@ -1794,17 +2695,18 @@ def command_start():
         "• კოდის წერაში\n"
         "• debugging-ში\n"
         "• კოდის ვერსიების მართვაში\n"
-        "• ფაქტების უსაფრთხო მეხსიერებაში\n\n"
+        "• ფაქტების უსაფრთხო მართვაში\n\n"
+        "Fact Engine 2.0:\n"
+        "/facts — დადასტურებული ფაქტები\n"
+        "/pending_facts — დასადასტურებელი ფაქტები\n"
+        "/confirm_fact <ID> — ფაქტის დადასტურება\n"
+        "/reject_fact <ID> — ფაქტის უარყოფა\n"
+        "/fact_conflicts — კონფლიქტური ფაქტები\n\n"
         "Developer:\n"
-        "/developer\n\n"
-        "კოდის შექმნა:\n"
-        "/code <დავალება>\n\n"
-        "კოდის debugging:\n"
-        "/debug <დავალება>\n\n"
-        "კოდის ისტორია:\n"
+        "/developer\n"
+        "/code <დავალება>\n"
+        "/debug <დავალება>\n"
         "/code_history\n\n"
-        "ფაქტები:\n"
-        "/facts\n\n"
         "მეხსიერება:\n"
         "/memory\n\n"
         "პროექტები:\n"
@@ -1815,25 +2717,38 @@ def command_start():
 
 def command_help():
     return (
-        "GENIOSA 4.2\n\n"
+        "GENIOSA 4.3\n\n"
+        "FACT ENGINE 2.0\n"
+        "/facts — დადასტურებული ფაქტები\n"
+        "/pending_facts — დასადასტურებელი ფაქტები\n"
+        "/confirm_fact <ID> — დადასტურება\n"
+        "/reject_fact <ID> — უარყოფა\n"
+        "/fact_conflicts — კონფლიქტები\n\n"
+        "GENERAL\n"
         "/start — დაწყება\n"
         "/help — დახმარება\n"
-        "/facts — დადასტურებული ფაქტები\n"
         "/memory — მეხსიერება\n"
-        "/projects — პროექტები\n"
+        "/projects — პროექტები\n\n"
+        "DEVELOPER\n"
         "/developer — Developer რეჟიმი\n"
         "/code <task> — კოდის შექმნა\n"
-        "/debug <task> — კოდის debugging\n"
+        "/debug <task> — debugging\n"
         "/code_history — კოდის ვერსიები"
     )
 
 
 def command_facts(chat_id):
-    facts = get_facts(chat_id)
+    facts = get_facts(
+        chat_id,
+        FACT_STATUS_CONFIRMED
+    )
 
     if not facts:
         return (
-            "დადასტურებული ფაქტები ჯერ არ არის."
+            "დადასტურებული ფაქტები ჯერ არ არის.\n\n"
+            "ეს სწორია — Geniosa ახლა ინფორმაციას "
+            "ავტომატურად დადასტურებულ ფაქტად აღარ "
+            "ჩათვლის."
         )
 
     lines = [
@@ -1842,19 +2757,203 @@ def command_facts(chat_id):
 
     for fact in facts:
         lines.append(
-            "\n"
+            "\nID: "
+            + str(fact["id"])
+            + "\n"
             + str(fact["fact_key"])
             + "\n"
             + str(fact["fact_value"])
             + "\nsource: "
             + str(fact["source"])
+            + "\nstatus: "
+            + str(fact["status"])
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
-def command_memory(chat_id):
-    memories = get_memories(chat_id)
+def command_pending_facts(
+    chat_id
+):
+    facts = get_pending_facts(
+        chat_id
+    )
+
+    if not facts:
+        return (
+            "დასადასტურებელი ფაქტები არ არის."
+        )
+
+    lines = [
+        "დასადასტურებელი ფაქტები:",
+        "",
+        "თუ მონაცემი სწორია, გამოიყენე:",
+        "/confirm_fact <ID>",
+        "",
+        "თუ არასწორია:",
+        "/reject_fact <ID>"
+    ]
+
+    for fact in facts:
+        lines.append(
+            "\nID: "
+            + str(fact["id"])
+            + "\n"
+            + str(fact["fact_key"])
+            + " = "
+            + str(fact["fact_value"])
+            + "\nsource: "
+            + str(fact["source"])
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def command_fact_conflicts(
+    chat_id
+):
+    facts = get_conflict_facts(
+        chat_id
+    )
+
+    if not facts:
+        return (
+            "კონფლიქტური ფაქტები არ არის."
+        )
+
+    lines = [
+        "კონფლიქტური ფაქტები:"
+    ]
+
+    for fact in facts:
+        lines.append(
+            "\nID: "
+            + str(fact["id"])
+            + "\n"
+            + str(fact["fact_key"])
+            + " = "
+            + str(fact["fact_value"])
+            + "\nstatus: CONFLICT"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def command_confirm_fact(
+    chat_id,
+    fact_id
+):
+    result = confirm_fact(
+        chat_id,
+        fact_id
+    )
+
+    if not result["ok"]:
+
+        if result.get(
+            "conflict"
+        ):
+            return (
+                "⚠️ კონფლიქტი აღმოჩნდა.\n\n"
+                "უკვე დადასტურებული მნიშვნელობა:\n"
+                + str(
+                    result.get(
+                        "existing_value"
+                    )
+                )
+                + "\n\n"
+                "ახალი მნიშვნელობა:\n"
+                + str(
+                    result.get(
+                        "new_value"
+                    )
+                )
+                + "\n\n"
+                "ძველი ფაქტი ავტომატურად არ შეიცვალა."
+            )
+
+        return (
+            "❌ "
+            + str(
+                result.get(
+                    "message"
+                )
+            )
+        )
+
+    fact = result["fact"]
+
+    return (
+        "✅ ფაქტი დადასტურდა.\n\n"
+        "ID: "
+        + str(
+            fact["id"]
+        )
+        + "\n"
+        + str(
+            fact["fact_key"]
+        )
+        + " = "
+        + str(
+            fact["fact_value"]
+        )
+        + "\n\n"
+        "ამიერიდან Geniosa-სთვის ეს მონაცემი "
+        "CONFIRMED ფაქტია."
+    )
+
+
+def command_reject_fact(
+    chat_id,
+    fact_id
+):
+    result = reject_fact(
+        chat_id,
+        fact_id
+    )
+
+    if not result["ok"]:
+        return (
+            "❌ "
+            + str(
+                result.get(
+                    "message"
+                )
+            )
+        )
+
+    fact = result["fact"]
+
+    return (
+        "❌ ფაქტი უარყოფილია და აღარ გამოიყენება "
+        "დადასტურებულ მონაცემად.\n\n"
+        "ID: "
+        + str(
+            fact["id"]
+        )
+        + "\n"
+        + str(
+            fact["fact_key"]
+        )
+        + " = "
+        + str(
+            fact["fact_value"]
+        )
+    )
+
+
+def command_memory(
+    chat_id
+):
+    memories = get_memories(
+        chat_id
+    )
 
     if not memories:
         return (
@@ -1868,16 +2967,26 @@ def command_memory(chat_id):
     for item in memories:
         lines.append(
             "\n"
-            + str(item["memory_key"])
+            + str(
+                item["memory_key"]
+            )
             + "\n"
-            + str(item["memory_value"])
+            + str(
+                item["memory_value"]
+            )
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
-def command_projects(chat_id):
-    projects = get_projects(chat_id)
+def command_projects(
+    chat_id
+):
+    projects = get_projects(
+        chat_id
+    )
 
     if not projects:
         return (
@@ -1891,18 +3000,26 @@ def command_projects(chat_id):
     for project in projects:
         lines.append(
             "\n"
-            + str(project["name"])
+            + str(
+                project["name"]
+            )
             + "\n"
             + str(
-                project.get("description")
+                project.get(
+                    "description"
+                )
                 or ""
             )
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
-def command_code_history(chat_id):
+def command_code_history(
+    chat_id
+):
     rows = get_code_versions(
         chat_id,
         limit=20
@@ -1918,6 +3035,7 @@ def command_code_history(chat_id):
     ]
 
     for row in rows:
+
         status = (
             "OK"
             if row["syntax_ok"]
@@ -1926,24 +3044,56 @@ def command_code_history(chat_id):
 
         lines.append(
             "\nV"
-            + str(row["version_number"])
+            + str(
+                row["version_number"]
+            )
             + " | "
-            + str(row["project_name"])
+            + str(
+                row["project_name"]
+            )
             + " | "
-            + str(row["filename"])
+            + str(
+                row["filename"]
+            )
             + " | "
             + status
-            + "\n"
-            + "Change: "
+            + "\nChange: "
             + str(
-                row.get("change_reason")
+                row.get(
+                    "change_reason"
+                )
                 or ""
             )
             + "\n"
-            + str(row["created_at"])
+            + str(
+                row["created_at"]
+            )
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# FACT COMMAND PARSER
+# ============================================================
+
+def parse_integer_argument(
+    command_text
+):
+    parts = command_text.split()
+
+    if len(parts) < 2:
+        return None
+
+    try:
+        return int(
+            parts[1]
+        )
+
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -1987,17 +3137,28 @@ def process_update(update):
         user_text[:500]
     )
 
+    # --------------------------------------------------------
+    # SAVE USER MESSAGE AND KEEP MESSAGE ID
+    # --------------------------------------------------------
+
+    user_message_id = None
+
     try:
-        save_message(
+        user_message_id = save_message(
             chat_id,
             "user",
             user_text
         )
+
     except Exception as exc:
         print(
             "save_message user error:",
             repr(exc)
         )
+
+    # --------------------------------------------------------
+    # LEGACY MEMORY
+    # --------------------------------------------------------
 
     try:
         detect_memories(
@@ -2005,14 +3166,28 @@ def process_update(update):
             user_text
         )
 
-        extract_explicit_facts(
+    except Exception as exc:
+        print(
+            "memory detection error:",
+            repr(exc)
+        )
+
+    # --------------------------------------------------------
+    # FACT DETECTION
+    # --------------------------------------------------------
+
+    detected_facts = []
+
+    try:
+        detected_facts = detect_explicit_facts(
             chat_id,
-            user_text
+            user_text,
+            user_message_id
         )
 
     except Exception as exc:
         print(
-            "fact/memory detection error:",
+            "fact detection error:",
             repr(exc)
         )
 
@@ -2020,25 +3195,32 @@ def process_update(update):
     # START
     # --------------------------------------------------------
 
-    if user_text.startswith("/start"):
+    if user_text.startswith(
+        "/start"
+    ):
         answer = command_start()
 
     # --------------------------------------------------------
     # HELP
     # --------------------------------------------------------
 
-    elif user_text.startswith("/help"):
+    elif user_text.startswith(
+        "/help"
+    ):
         answer = command_help()
 
     # --------------------------------------------------------
     # FACTS
     # --------------------------------------------------------
 
-    elif user_text.startswith("/facts"):
+    elif user_text.startswith(
+        "/facts"
+    ):
         try:
             answer = command_facts(
                 chat_id
             )
+
         except Exception as exc:
             answer = (
                 "ფაქტების წაკითხვა ვერ მოხერხდა:\n"
@@ -2046,14 +3228,114 @@ def process_update(update):
             )
 
     # --------------------------------------------------------
+    # PENDING FACTS
+    # --------------------------------------------------------
+
+    elif user_text.startswith(
+        "/pending_facts"
+    ):
+        try:
+            answer = command_pending_facts(
+                chat_id
+            )
+
+        except Exception as exc:
+            answer = (
+                "დასადასტურებელი ფაქტების "
+                "წაკითხვა ვერ მოხერხდა:\n"
+                + str(exc)
+            )
+
+    # --------------------------------------------------------
+    # CONFIRM FACT
+    # --------------------------------------------------------
+
+    elif user_text.startswith(
+        "/confirm_fact"
+    ):
+        fact_id = parse_integer_argument(
+            user_text
+        )
+
+        if fact_id is None:
+            answer = (
+                "გამოიყენე:\n"
+                "/confirm_fact <ID>"
+            )
+
+        else:
+            try:
+                answer = command_confirm_fact(
+                    chat_id,
+                    fact_id
+                )
+
+            except Exception as exc:
+                answer = (
+                    "ფაქტის დადასტურება ვერ მოხერხდა:\n"
+                    + str(exc)
+                )
+
+    # --------------------------------------------------------
+    # REJECT FACT
+    # --------------------------------------------------------
+
+    elif user_text.startswith(
+        "/reject_fact"
+    ):
+        fact_id = parse_integer_argument(
+            user_text
+        )
+
+        if fact_id is None:
+            answer = (
+                "გამოიყენე:\n"
+                "/reject_fact <ID>"
+            )
+
+        else:
+            try:
+                answer = command_reject_fact(
+                    chat_id,
+                    fact_id
+                )
+
+            except Exception as exc:
+                answer = (
+                    "ფაქტის უარყოფა ვერ მოხერხდა:\n"
+                    + str(exc)
+                )
+
+    # --------------------------------------------------------
+    # FACT CONFLICTS
+    # --------------------------------------------------------
+
+    elif user_text.startswith(
+        "/fact_conflicts"
+    ):
+        try:
+            answer = command_fact_conflicts(
+                chat_id
+            )
+
+        except Exception as exc:
+            answer = (
+                "კონფლიქტების წაკითხვა ვერ მოხერხდა:\n"
+                + str(exc)
+            )
+
+    # --------------------------------------------------------
     # MEMORY
     # --------------------------------------------------------
 
-    elif user_text.startswith("/memory"):
+    elif user_text.startswith(
+        "/memory"
+    ):
         try:
             answer = command_memory(
                 chat_id
             )
+
         except Exception as exc:
             answer = (
                 "მეხსიერების წაკითხვა ვერ მოხერხდა:\n"
@@ -2064,11 +3346,14 @@ def process_update(update):
     # PROJECTS
     # --------------------------------------------------------
 
-    elif user_text.startswith("/projects"):
+    elif user_text.startswith(
+        "/projects"
+    ):
         try:
             answer = command_projects(
                 chat_id
             )
+
         except Exception as exc:
             answer = (
                 "პროექტების წაკითხვა ვერ მოხერხდა:\n"
@@ -2079,7 +3364,10 @@ def process_update(update):
     # DEVELOPER
     # --------------------------------------------------------
 
-    elif user_text.startswith("/developer"):
+    elif user_text.startswith(
+        "/developer"
+    ):
+
         if not developer_access_allowed(
             chat_id
         ):
@@ -2103,6 +3391,7 @@ def process_update(update):
     elif user_text.startswith(
         "/code_history"
     ):
+
         if not developer_access_allowed(
             chat_id
         ):
@@ -2116,6 +3405,7 @@ def process_update(update):
                 answer = command_code_history(
                     chat_id
                 )
+
             except Exception as exc:
                 answer = (
                     "კოდის ისტორიის წაკითხვა "
@@ -2130,6 +3420,7 @@ def process_update(update):
     elif user_text.startswith(
         "/debug"
     ):
+
         if not developer_access_allowed(
             chat_id
         ):
@@ -2139,6 +3430,7 @@ def process_update(update):
             )
 
         else:
+
             task = user_text[
                 len("/debug"):
             ].strip()
@@ -2146,22 +3438,26 @@ def process_update(update):
             if not task:
                 answer = (
                     "მომწერე debugging-ის დავალება "
-                    "და კოდი.\n\n"
-                    "მაგალითად:\n"
-                    "/debug გაასწორე ეს კოდი..."
+                    "და კოდი."
                 )
 
             else:
+
                 send_message(
                     chat_id,
                     "Debug Engine მუშაობს... 🔍"
                 )
 
                 try:
+
+                    code = extract_code(
+                        task
+                    )
+
                     result = developer_debug(
                         chat_id,
                         task,
-                        extract_code(task)
+                        code
                     )
 
                     answer = result[
@@ -2173,22 +3469,26 @@ def process_update(update):
                     ]
 
                     if fixed_code:
+
                         after = result[
                             "after"
                         ]
 
                         caption = (
-                            "Geniosa 4.2 Debug Engine\n"
+                            "Geniosa 4.3 Debug Engine\n"
                             "Fixed version\n"
                             "Python syntax: "
                             + (
                                 "OK"
-                                if after["syntax_ok"]
+                                if after[
+                                    "syntax_ok"
+                                ]
                                 else "ERROR"
                             )
                         )
 
                         try:
+
                             filepath = create_code_file(
                                 fixed_code,
                                 "geniosa_fixed.py"
@@ -2201,6 +3501,7 @@ def process_update(update):
                             )
 
                         except Exception as exc:
+
                             answer += (
                                 "\n\nფაილის შექმნისას "
                                 "მოხდა შეცდომა:\n"
@@ -2210,12 +3511,14 @@ def process_update(update):
                         if after[
                             "syntax_ok"
                         ]:
+
                             answer += (
                                 "\n\n✅ გამოსწორებული "
                                 "კოდის Python syntax OK."
                             )
 
                         else:
+
                             answer += (
                                 "\n\n⚠️ გამოსწორებულ "
                                 "კოდშიც დარჩა syntax "
@@ -2226,6 +3529,7 @@ def process_update(update):
                             )
 
                 except Exception as exc:
+
                     answer = (
                         "Debug Engine-ში მოხდა შეცდომა:\n"
                         + str(exc)
@@ -2238,6 +3542,7 @@ def process_update(update):
     elif user_text.startswith(
         "/code"
     ):
+
         if not developer_access_allowed(
             chat_id
         ):
@@ -2247,22 +3552,26 @@ def process_update(update):
             )
 
         else:
+
             task = user_text[
                 len("/code"):
             ].strip()
 
             if not task:
+
                 answer = (
                     "მომწერე კოდის დავალება."
                 )
 
             else:
+
                 send_message(
                     chat_id,
                     "კოდს ვწერ და ვამოწმებ... ⏳"
                 )
 
                 try:
+
                     result = developer_generate(
                         chat_id,
                         task
@@ -2277,6 +3586,7 @@ def process_update(update):
                     ]
 
                     if code:
+
                         analysis = result[
                             "analysis"
                         ]
@@ -2298,12 +3608,18 @@ def process_update(update):
                         ]
 
                         if common:
+
                             caption += (
                                 "\nStatic issues: "
-                                + str(len(common))
+                                + str(
+                                    len(
+                                        common
+                                    )
+                                )
                             )
 
                         try:
+
                             filepath = create_code_file(
                                 code,
                                 result[
@@ -2318,6 +3634,7 @@ def process_update(update):
                             )
 
                         except Exception as exc:
+
                             answer += (
                                 "\n\nფაილის შექმნისას "
                                 "მოხდა შეცდომა:\n"
@@ -2327,11 +3644,13 @@ def process_update(update):
                         if analysis[
                             "syntax_ok"
                         ]:
+
                             answer += (
                                 "\n\n✅ Python syntax OK."
                             )
 
                         else:
+
                             answer += (
                                 "\n\n⚠️ Syntax error:\n"
                                 + analysis[
@@ -2340,12 +3659,14 @@ def process_update(update):
                             )
 
                         if common:
+
                             answer += (
                                 "\n\n⚠️ დამატებითი "
                                 "პრობლემები:"
                             )
 
                             for problem in common:
+
                                 answer += (
                                     "\n- "
                                     + problem[
@@ -2358,6 +3679,7 @@ def process_update(update):
                                 )
 
                 except Exception as exc:
+
                     answer = (
                         "Developer Engine-ში "
                         "მოხდა შეცდომა:\n"
@@ -2369,13 +3691,16 @@ def process_update(update):
     # --------------------------------------------------------
 
     else:
+
         try:
+
             answer = generate_general_response(
                 chat_id,
                 user_text
             )
 
         except Exception as exc:
+
             print(
                 "general response error:",
                 repr(exc)
@@ -2388,16 +3713,55 @@ def process_update(update):
             )
 
     # --------------------------------------------------------
+    # ADD FACT CONFIRMATION PROMPT
+    # --------------------------------------------------------
+
+    if detected_facts:
+
+        answer += (
+            "\n\n"
+            "📌 Geniosa-მ აღმოაჩინა ახალი ინფორმაცია, "
+            "რომელიც ჯერ დადასტურებული ფაქტი არ არის."
+            "\n\n"
+            "დასადასტურებლად გამოიყენე:"
+        )
+
+        for item in detected_facts:
+
+            answer += (
+                "\n/confirm_fact "
+                + str(
+                    item["id"]
+                )
+            )
+
+        answer += (
+            "\n\n"
+            "თუ ინფორმაცია არასწორია:"
+        )
+
+        for item in detected_facts:
+
+            answer += (
+                "\n/reject_fact "
+                + str(
+                    item["id"]
+                )
+            )
+
+    # --------------------------------------------------------
     # SEND FINAL ANSWER
     # --------------------------------------------------------
 
     try:
+
         send_message(
             chat_id,
             answer
         )
 
     except Exception as exc:
+
         print(
             "final send error:",
             repr(exc)
@@ -2408,6 +3772,7 @@ def process_update(update):
     # --------------------------------------------------------
 
     try:
+
         save_message(
             chat_id,
             "assistant",
@@ -2415,6 +3780,7 @@ def process_update(update):
         )
 
     except Exception as exc:
+
         print(
             "assistant message save error:",
             repr(exc)
@@ -2433,7 +3799,9 @@ def telegram_polling():
     offset = None
 
     while True:
+
         try:
+
             params = {
                 "timeout": 30
             }
@@ -2452,33 +3820,47 @@ def telegram_polling():
             )
 
             if response.status_code == 409:
+
                 print(
                     "Telegram 409 Conflict. "
                     "Another polling process may be active."
                 )
 
-                time.sleep(10)
+                time.sleep(
+                    10
+                )
+
                 continue
 
             if response.status_code != 200:
+
                 print(
                     "getUpdates error:",
                     response.status_code,
                     response.text[:1000]
                 )
 
-                time.sleep(5)
+                time.sleep(
+                    5
+                )
+
                 continue
 
             data = response.json()
 
-            if not data.get("ok"):
+            if not data.get(
+                "ok"
+            ):
+
                 print(
                     "getUpdates not ok:",
                     data
                 )
 
-                time.sleep(5)
+                time.sleep(
+                    5
+                )
+
                 continue
 
             updates = data.get(
@@ -2487,36 +3869,45 @@ def telegram_polling():
             )
 
             for update in updates:
+
                 update_id = update.get(
                     "update_id"
                 )
 
                 if update_id is not None:
+
                     offset = (
-                        update_id + 1
+                        update_id
+                        + 1
                     )
 
                 try:
+
                     process_update(
                         update
                     )
 
                 except Exception as exc:
+
                     print(
                         "process_update error:",
                         repr(exc)
                     )
 
         except requests.exceptions.Timeout:
+
             continue
 
         except Exception as exc:
+
             print(
                 "Polling exception:",
                 repr(exc)
             )
 
-            time.sleep(5)
+            time.sleep(
+                5
+            )
 
 
 # ============================================================
@@ -2527,7 +3918,7 @@ def telegram_polling():
 def root():
     return {
         "service": "Geniosa",
-        "version": "4.2",
+        "version": "4.3",
         "status": "online"
     }
 
@@ -2539,7 +3930,9 @@ def health():
     database = "unknown"
 
     if DATABASE_URL:
+
         try:
+
             conn = get_db()
             cur = conn.cursor()
 
@@ -2555,6 +3948,7 @@ def health():
             database = "ok"
 
         except Exception as exc:
+
             database = (
                 "error: "
                 + str(exc)
@@ -2562,7 +3956,7 @@ def health():
 
     return {
         "service": "Geniosa",
-        "version": "4.2",
+        "version": "4.3",
         "configuration_missing": missing,
         "database": database,
         "telegram_configured": bool(
@@ -2579,14 +3973,17 @@ def health():
 # STARTUP
 # ============================================================
 
-@app.on_event("startup")
+@app.on_event(
+    "startup"
+)
 def startup_event():
+
     print(
         "=" * 60
     )
 
     print(
-        "GENIOSA 4.2 STARTING"
+        "GENIOSA 4.3 STARTING"
     )
 
     print(
@@ -2596,12 +3993,14 @@ def startup_event():
     missing = configuration_status()
 
     if missing:
+
         print(
             "Missing environment variables:",
             missing
         )
 
     try:
+
         init_database()
 
         print(
@@ -2609,16 +4008,20 @@ def startup_event():
         )
 
     except Exception as exc:
+
         print(
             "Database initialization error:",
             repr(exc)
         )
 
     if TELEGRAM_BOT_TOKEN:
+
         try:
+
             delete_webhook()
 
         except Exception as exc:
+
             print(
                 "deleteWebhook error:",
                 repr(exc)
@@ -2633,13 +4036,14 @@ def startup_event():
         thread.start()
 
     else:
+
         print(
             "Telegram token missing. "
             "Polling not started."
         )
 
     print(
-        "Geniosa 4.2 startup complete."
+        "Geniosa 4.3 startup complete."
     )
 
 
