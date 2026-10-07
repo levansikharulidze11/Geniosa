@@ -221,12 +221,16 @@ app = FastAPI(
 
 
 # ============================================================
+
 # GLOBAL POLLING STATE
+
 # ============================================================
 
 POLLING_STOP = threading.Event()
 
 POLLING_THREAD = None
+
+POLLING_THREAD_LOCK = threading.Lock()
 
 POLLING_LOCK_CONNECTION = None
 
@@ -238,7 +242,6 @@ LAST_UPDATE_ID = 0
 # ============================================================
 # DATABASE LOCK ID
 # ============================================================
-
 POLLING_LOCK_ID = int(
     os.getenv(
         "POLLING_LOCK_ID",
