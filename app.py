@@ -1,18 +1,14 @@
 # ============================================================
-# GENIOSA 4.9
+# GENIOSA 5.0
 # Personal Business Advisor
-# Telegram + Gemini + PostgreSQL
-#
-# MEMORY OPTIMIZED
-# BACKWARD COMPATIBLE DATABASE
+# Telegram + Gemini + PostgreSQL + FastAPI
 #
 # IMPORTANT:
 # - Existing PostgreSQL data is preserved.
-# - Existing tables are migrated automatically.
-# - No DELETE / DROP of user data.
-# - System facts are seeded only when needed.
-# - Gemini fact extraction is NOT performed on every message.
-# - Context is bounded for better speed.
+# - No DROP TABLE.
+# - Legacy schemas are migrated automatically.
+# - Telegram polling uses PostgreSQL advisory lock.
+# - System facts are seeded only once per chat/version.
 # ============================================================
 
 import os
@@ -31,10 +27,10 @@ from fastapi import FastAPI
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-APP_VERSION = "4.9"
+APP_VERSION = "5.0"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -45,46 +41,15 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.5-flash-lite"
 ).strip()
 
-OWNER_ID = os.getenv(
-    "GENIOSA_OWNER_ID",
-    ""
-).strip()
+OWNER_ID = os.getenv("GENIOSA_OWNER_ID", "").strip()
 
-TELEGRAM_TIMEOUT = 30
-TELEGRAM_SEND_TIMEOUT = 30
-GEMINI_TIMEOUT = 45
+TELEGRAM_TIMEOUT = 35
+POLLING_SLEEP = 2
+MAX_MESSAGE_LENGTH = 3800
 
-POLL_SLEEP = 1.5
+SEED_VERSION = "5.0-v1"
 
-MAX_TELEGRAM_MESSAGE = 3900
-MAX_CONTEXT_MESSAGES = 10
-MAX_CONTEXT_FACTS = 35
-MAX_CONTEXT_MEMORIES = 25
-MAX_PENDING_FACTS = 10
-MAX_CONFLICT_FACTS = 10
-
-SYSTEM_SEED_VERSION = "4.9-v1"
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-app = FastAPI(title="GENIOSA", version=APP_VERSION)
-
-db_pool = None
-
-database_ready = False
-polling_started = False
-startup_completed = False
-
-polling_lock = threading.Lock()
-
-last_update_id = None
-last_poll_error = None
-
-telegram_ok = False
-gemini_ok = False
+app = FastAPI(title="GENIOSA 5.0")
 
 
 # ============================================================
@@ -97,58 +62,59 @@ def log(message):
 
 
 # ============================================================
+# CONFIG STATUS
+# ============================================================
+
+def config_status():
+    return {
+        "telegram": bool(TELEGRAM_BOT_TOKEN),
+        "gemini": bool(GEMINI_API_KEY),
+        "database": bool(DATABASE_URL),
+        "model": GEMINI_MODEL,
+    }
+
+
+# ============================================================
 # DATABASE POOL
 # ============================================================
 
+DB_POOL = None
+DB_POOL_LOCK = threading.Lock()
+
+
 def init_db_pool():
-    global db_pool
+    global DB_POOL
 
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
 
-    if db_pool is not None:
-        return
+    with DB_POOL_LOCK:
+        if DB_POOL is not None:
+            return
 
-    db_pool = pool.SimpleConnectionPool(
-        1,
-        5,
-        DATABASE_URL,
-        connect_timeout=15
-    )
+        DB_POOL = psycopg2.pool.ThreadedConnectionPool(
+            1,
+            5,
+            DATABASE_URL
+        )
 
-    log("DATABASE CONNECTION POOL READY")
+        log("DATABASE CONNECTION POOL READY")
 
 
-def get_connection():
-    if db_pool is None:
+def db_connection():
+    if DB_POOL is None:
         init_db_pool()
 
-    return db_pool.getconn()
+    return DB_POOL.getconn()
 
 
 def release_connection(conn):
-    if db_pool is not None and conn is not None:
-        db_pool.putconn(conn)
+    if DB_POOL is not None and conn is not None:
+        DB_POOL.putconn(conn)
 
-
-def close_db_pool():
-    global db_pool
-
-    if db_pool is not None:
-        try:
-            db_pool.closeall()
-        except Exception:
-            pass
-
-        db_pool = None
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
 
 def db_execute(
-    query,
+    sql,
     params=None,
     fetch=False,
     fetchone=False,
@@ -158,173 +124,104 @@ def db_execute(
     cur = None
 
     try:
-        conn = get_connection()
+        conn = db_connection()
 
         cur = conn.cursor(
-            cursor_factory=RealDictCursor
+            RealDictCursor if fetch or fetchone else None
         )
 
-        cur.execute(query, params or ())
+        cur.execute(sql, params or ())
 
-        rows = None
+        result = None
 
-        if fetchone:
-            rows = cur.fetchone()
+        if fetch:
+            result = cur.fetchall()
 
-        elif fetch:
-            rows = cur.fetchall()
+        elif fetchone:
+            result = cur.fetchone()
 
         if commit:
             conn.commit()
 
-        return rows
-
-    except Exception as e:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-
-        raise e
-
-    finally:
-        if cur is not None:
-            try:
-                cur.close()
-            except Exception:
-                pass
-
-        release_connection(conn)
-
-
-# ============================================================
-# DATABASE TRANSACTION
-# ============================================================
-
-def db_transaction(callback):
-    conn = None
-    cur = None
-
-    try:
-        conn = get_connection()
-
-        cur = conn.cursor(
-            cursor_factory=RealDictCursor
-        )
-
-        result = callback(cur)
-
-        conn.commit()
-
         return result
 
     except Exception:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-
+        if conn:
+            conn.rollback()
         raise
 
     finally:
-        if cur is not None:
-            try:
-                cur.close()
-            except Exception:
-                pass
-
-        release_connection(conn)
+        if cur:
+            cur.close()
+        if conn:
+            release_connection(conn)
 
 
 # ============================================================
-# DATABASE SCHEMA HELPERS
+# SCHEMA HELPERS
 # ============================================================
 
 def table_exists(table_name):
     row = db_execute(
         """
-        SELECT EXISTS (
+        SELECT EXISTS(
             SELECT 1
             FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = %s
+            WHERE table_schema='public'
+              AND table_name=%s
         ) AS exists
         """,
         (table_name,),
         fetchone=True
     )
 
-    return bool(row and row["exists"])
+    return bool(row["exists"])
 
 
-def get_columns(table_name):
-    rows = db_execute(
+def column_exists(table_name, column_name):
+    row = db_execute(
         """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        ORDER BY ordinal_position
+        SELECT EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name=%s
+              AND column_name=%s
+        ) AS exists
         """,
-        (table_name,),
-        fetch=True
+        (table_name, column_name),
+        fetchone=True
     )
 
-    return {
-        row["column_name"]
-        for row in (rows or [])
-    }
+    return bool(row["exists"])
 
 
-def ensure_column(
-    table_name,
-    column_name,
-    column_definition
-):
-    columns = get_columns(table_name)
-
-    if column_name in columns:
-        return
-
-    # Table/column names here are internal constants,
-    # not user input.
-    db_execute(
-        f"""
-        ALTER TABLE {table_name}
-        ADD COLUMN {column_name} {column_definition}
-        """
-    )
-
-    log(
-        f"ADDED COLUMN {table_name}.{column_name}"
-    )
-
-
-def create_index_safe(index_name, sql):
-    try:
-        db_execute(sql)
-    except Exception as e:
-        log(
-            f"INDEX WARNING {index_name}: {repr(e)}"
+def add_column(table_name, column_name, definition):
+    if not column_exists(table_name, column_name):
+        db_execute(
+            f'ALTER TABLE "{table_name}" '
+            f'ADD COLUMN "{column_name}" {definition}'
         )
+        log(f"ADDED COLUMN {table_name}.{column_name}")
+
+
+def create_table_if_missing(sql):
+    db_execute(sql)
 
 
 # ============================================================
-# DATABASE INITIALIZATION
+# DATABASE MIGRATION
 # ============================================================
 
-def init_db():
-    global database_ready
+def migrate_database():
 
     init_db_pool()
 
     # --------------------------------------------------------
-    # MESSAGES
+    # messages
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS messages (
             id BIGSERIAL PRIMARY KEY,
@@ -337,44 +234,22 @@ def init_db():
         """
     )
 
-    ensure_column(
-        "messages",
-        "chat_id",
-        "BIGINT"
-    )
-
-    ensure_column(
-        "messages",
-        "role",
-        "TEXT"
-    )
-
-    ensure_column(
-        "messages",
-        "message",
-        "TEXT"
-    )
-
-    ensure_column(
-        "messages",
-        "text",
-        "TEXT"
-    )
-
-    ensure_column(
+    add_column("messages", "chat_id", "BIGINT")
+    add_column("messages", "role", "TEXT")
+    add_column("messages", "message", "TEXT")
+    add_column("messages", "text", "TEXT")
+    add_column(
         "messages",
         "created_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
 
-    # Old schema compatibility:
-    # if old records have text but message is NULL,
-    # copy text into message.
+    # Preserve old text/message data.
     db_execute(
         """
         UPDATE messages
         SET message = text
-        WHERE message IS NULL
+        WHERE (message IS NULL OR message='')
           AND text IS NOT NULL
         """
     )
@@ -383,21 +258,22 @@ def init_db():
         """
         UPDATE messages
         SET text = message
-        WHERE text IS NULL
+        WHERE (text IS NULL OR text='')
           AND message IS NOT NULL
         """
     )
 
     # --------------------------------------------------------
-    # MEMORIES
+    # memories
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS memories (
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT,
             content TEXT,
+            memory TEXT,
             memory_type TEXT DEFAULT 'general',
             importance INTEGER DEFAULT 5,
             source TEXT DEFAULT 'user',
@@ -407,76 +283,58 @@ def init_db():
         """
     )
 
-    ensure_column(
-        "memories",
-        "chat_id",
-        "BIGINT"
-    )
-
-    # IMPORTANT:
-    # Older versions may have used "memory" instead of "content".
-    memory_columns = get_columns("memories")
-
-    if "content" not in memory_columns:
-
-        if "memory" in memory_columns:
-            ensure_column(
-                "memories",
-                "content",
-                "TEXT"
-            )
-
-            db_execute(
-                """
-                UPDATE memories
-                SET content = memory
-                WHERE content IS NULL
-                  AND memory IS NOT NULL
-                """
-            )
-
-        else:
-            ensure_column(
-                "memories",
-                "content",
-                "TEXT"
-            )
-
-    ensure_column(
+    add_column("memories", "chat_id", "BIGINT")
+    add_column("memories", "content", "TEXT")
+    add_column("memories", "memory", "TEXT")
+    add_column(
         "memories",
         "memory_type",
         "TEXT DEFAULT 'general'"
     )
-
-    ensure_column(
+    add_column(
         "memories",
         "importance",
         "INTEGER DEFAULT 5"
     )
-
-    ensure_column(
+    add_column(
         "memories",
         "source",
         "TEXT DEFAULT 'user'"
     )
-
-    ensure_column(
+    add_column(
         "memories",
         "created_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
-
-    ensure_column(
+    add_column(
         "memories",
         "updated_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
 
-    # --------------------------------------------------------
-    # MEMORY EVENTS
-    # --------------------------------------------------------
+    db_execute(
+        """
+        UPDATE memories
+        SET content = memory
+        WHERE (content IS NULL OR content='')
+          AND memory IS NOT NULL
+        """
+    )
 
     db_execute(
+        """
+        UPDATE memories
+        SET memory = content
+        WHERE (memory IS NULL OR memory='')
+          AND content IS NOT NULL
+        """
+    )
+
+    # --------------------------------------------------------
+    # memory_events
+    # --------------------------------------------------------
+
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS memory_events (
             id BIGSERIAL PRIMARY KEY,
@@ -488,169 +346,165 @@ def init_db():
         """
     )
 
-    ensure_column(
-        "memory_events",
-        "chat_id",
-        "BIGINT"
-    )
-
-    ensure_column(
-        "memory_events",
-        "event_type",
-        "TEXT"
-    )
-
-    ensure_column(
-        "memory_events",
-        "content",
-        "TEXT"
-    )
-
-    ensure_column(
+    add_column("memory_events", "chat_id", "BIGINT")
+    add_column("memory_events", "event_type", "TEXT")
+    add_column("memory_events", "content", "TEXT")
+    add_column(
         "memory_events",
         "created_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
 
     # --------------------------------------------------------
-    # FACTS
+    # facts
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS facts (
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT,
+            fact_key TEXT,
+            value TEXT,
+            fact TEXT,
             content TEXT,
-            status TEXT DEFAULT 'CONFIRMED',
             source TEXT DEFAULT 'user',
+            status TEXT DEFAULT 'CONFIRMED',
             category TEXT DEFAULT 'general',
+            memory_type TEXT DEFAULT 'fact',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
-    fact_columns = get_columns("facts")
-
-    ensure_column(
-        "facts",
-        "chat_id",
-        "BIGINT"
-    )
-
-    # Very important backward compatibility.
-    # Older versions may have used "fact".
-    fact_columns = get_columns("facts")
-
-    if "content" not in fact_columns:
-
-        if "fact" in fact_columns:
-            ensure_column(
-                "facts",
-                "content",
-                "TEXT"
-            )
-
-            db_execute(
-                """
-                UPDATE facts
-                SET content = fact
-                WHERE content IS NULL
-                  AND fact IS NOT NULL
-                """
-            )
-
-        else:
-            ensure_column(
-                "facts",
-                "content",
-                "TEXT"
-            )
-
-    ensure_column(
-        "facts",
-        "status",
-        "TEXT DEFAULT 'CONFIRMED'"
-    )
-
-    ensure_column(
+    # Legacy compatibility.
+    add_column("facts", "chat_id", "BIGINT")
+    add_column("facts", "fact_key", "TEXT")
+    add_column("facts", "value", "TEXT")
+    add_column("facts", "fact", "TEXT")
+    add_column("facts", "content", "TEXT")
+    add_column(
         "facts",
         "source",
         "TEXT DEFAULT 'user'"
     )
-
-    ensure_column(
+    add_column(
+        "facts",
+        "status",
+        "TEXT DEFAULT 'CONFIRMED'"
+    )
+    add_column(
         "facts",
         "category",
         "TEXT DEFAULT 'general'"
     )
-
-    ensure_column(
+    add_column(
+        "facts",
+        "memory_type",
+        "TEXT DEFAULT 'fact'"
+    )
+    add_column(
         "facts",
         "created_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
-
-    ensure_column(
+    add_column(
         "facts",
         "updated_at",
         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     )
 
-    # Normalize old/null statuses.
+    # Copy all legacy content into the common content/value fields.
+    db_execute(
+        """
+        UPDATE facts
+        SET content = COALESCE(
+            NULLIF(content,''),
+            NULLIF(fact,''),
+            NULLIF(value,'')
+        )
+        WHERE content IS NULL OR content=''
+        """
+    )
+
+    db_execute(
+        """
+        UPDATE facts
+        SET fact = content
+        WHERE (fact IS NULL OR fact='')
+          AND content IS NOT NULL
+        """
+    )
+
+    db_execute(
+        """
+        UPDATE facts
+        SET value = content
+        WHERE (value IS NULL OR value='')
+          AND content IS NOT NULL
+        """
+    )
+
+    # --------------------------------------------------------
+    # CRITICAL LEGACY FIX:
+    # fact_key may be NOT NULL in the old database.
+    # Fill missing keys without deleting anything.
+    # --------------------------------------------------------
+
+    db_execute(
+        """
+        UPDATE facts
+        SET fact_key =
+            CASE
+                WHEN category IS NOT NULL
+                    AND category <> ''
+                THEN category || '_' || id::TEXT
+                ELSE 'legacy_fact_' || id::TEXT
+            END
+        WHERE fact_key IS NULL
+           OR fact_key=''
+        """
+    )
+
+    # Normalize status.
     db_execute(
         """
         UPDATE facts
         SET status = 'CONFIRMED'
         WHERE status IS NULL
-           OR TRIM(status) = ''
-        """
-    )
-
-    db_execute(
-        """
-        UPDATE facts
-        SET status = UPPER(status)
-        WHERE status IS NOT NULL
-        """
-    )
-
-    db_execute(
-        """
-        UPDATE facts
-        SET status = 'CONFIRMED'
-        WHERE status NOT IN (
-            'CONFIRMED',
-            'PENDING',
-            'CONFLICT',
-            'REJECTED'
-        )
+           OR LOWER(status) IN (
+               'confirmed',
+               'confirm',
+               'approved',
+               'active'
+           )
         """
     )
 
     # --------------------------------------------------------
-    # FACT HISTORY
+    # fact_history
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS fact_history (
             id BIGSERIAL PRIMARY KEY,
             fact_id BIGINT,
-            old_status TEXT,
-            new_status TEXT,
-            reason TEXT,
+            chat_id BIGINT,
+            old_value TEXT,
+            new_value TEXT,
+            action TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     # --------------------------------------------------------
-    # DECISIONS
+    # decisions
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS decisions (
             id BIGSERIAL PRIMARY KEY,
@@ -665,10 +519,10 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # TASKS
+    # tasks
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS tasks (
             id BIGSERIAL PRIMARY KEY,
@@ -685,10 +539,10 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # PROJECTS
+    # projects
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS projects (
             id BIGSERIAL PRIMARY KEY,
@@ -703,16 +557,16 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # RESEARCH
+    # research
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS research (
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT,
             topic TEXT,
-            findings TEXT,
+            result TEXT,
             source TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -720,16 +574,16 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # FINANCIAL MODELS
+    # financial_models
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS financial_models (
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT,
             project_name TEXT,
-            model_data TEXT,
+            data JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -737,28 +591,26 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # BOT PROJECTS
+    # bot_projects
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS bot_projects (
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT,
             name TEXT,
             description TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     # --------------------------------------------------------
-    # BOT FILES
+    # bot_files
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS bot_files (
             id BIGSERIAL PRIMARY KEY,
@@ -772,10 +624,10 @@ def init_db():
     )
 
     # --------------------------------------------------------
-    # SYSTEM SEED META
+    # system seed metadata
     # --------------------------------------------------------
 
-    db_execute(
+    create_table_if_missing(
         """
         CREATE TABLE IF NOT EXISTS system_seed_meta (
             chat_id BIGINT PRIMARY KEY,
@@ -789,55 +641,45 @@ def init_db():
     # INDEXES
     # --------------------------------------------------------
 
-    create_index_safe(
-        "idx_messages_chat_created",
+    safe_indexes = [
         """
-        CREATE INDEX IF NOT EXISTS idx_messages_chat_created
+        CREATE INDEX IF NOT EXISTS idx_messages_chat_time
         ON messages(chat_id, created_at DESC)
+        """,
         """
-    )
-
-    create_index_safe(
-        "idx_memories_chat_importance",
+        CREATE INDEX IF NOT EXISTS idx_memories_chat
+        ON memories(chat_id)
+        """,
         """
-        CREATE INDEX IF NOT EXISTS idx_memories_chat_importance
-        ON memories(chat_id, importance DESC, id DESC)
-        """
-    )
-
-    create_index_safe(
-        "idx_facts_chat_status",
+        CREATE INDEX IF NOT EXISTS idx_facts_chat
+        ON facts(chat_id)
+        """,
         """
         CREATE INDEX IF NOT EXISTS idx_facts_chat_status
         ON facts(chat_id, status)
-        """
-    )
-
-    create_index_safe(
-        "idx_tasks_chat_status",
+        """,
         """
         CREATE INDEX IF NOT EXISTS idx_tasks_chat_status
         ON tasks(chat_id, status)
+        """,
         """
-    )
+        CREATE INDEX IF NOT EXISTS idx_projects_chat
+        ON projects(chat_id)
+        """,
+    ]
 
-    create_index_safe(
-        "idx_projects_chat_status",
-        """
-        CREATE INDEX IF NOT EXISTS idx_projects_chat_status
-        ON projects(chat_id, status)
-        """
-    )
+    for sql in safe_indexes:
+        try:
+            db_execute(sql)
+        except Exception as e:
+            log(f"INDEX WARNING: {repr(e)}")
 
-    database_ready = True
-
-    log(
-        "DATABASE INITIALIZED AND MIGRATED SUCCESSFULLY"
-    )
+    log("DATABASE INITIALIZED AND MIGRATED SUCCESSFULLY")
+    log("DATABASE READY")
 
 
 # ============================================================
-# SYSTEM FACTS
+# SYSTEM KNOWLEDGE
 # ============================================================
 
 SYSTEM_FACTS = [
@@ -846,1230 +688,790 @@ SYSTEM_FACTS = [
     # COMPANY
     # --------------------------------------------------------
 
-    {
-        "content": "კომპანიის სახელი: SAMTISI CONSTRUCTION LLC.",
-        "category": "company",
-        "importance": 10
-    },
-
-    {
-        "content": "SAMTISI CONSTRUCTION LLC-ის კომპანიის ID: 406391202.",
-        "category": "company",
-        "importance": 10
-    },
-
-    {
-        "content": "SAMTISI CONSTRUCTION LLC დაარსებულია 2022 წლის 5 დეკემბერს.",
-        "category": "company",
-        "importance": 8
-    },
-
-    {
-        "content": "SAMTISI CONSTRUCTION LLC-ის სათაო ოფისი მდებარეობს თბილისში, საქართველოში.",
-        "category": "company",
-        "importance": 8
-    },
-
-    {
-        "content": "SAMTISI CONSTRUCTION არის Construction & Development Company.",
-        "category": "company",
-        "importance": 9
-    },
-
-    {
-        "content": "SAMTISI-ის საქმიანობა მოიცავს საცხოვრებელ, კომერციულ და ინფრასტრუქტურულ სამშენებლო და დეველოპერულ პროექტებს.",
-        "category": "company",
-        "importance": 8
-    },
-
-    {
-        "content": "SAMTISI-ის გუნდი მართავს დაგეგმვას, საინჟინრო კოორდინაციას, მშენებლობას, დასრულებას, ტექნიკურ მენეჯმენტს და ხარისხის კონტროლს.",
-        "category": "company",
-        "importance": 8
-    },
+    (
+        "company_name",
+        "კომპანიის სახელი: SAMTISI CONSTRUCTION LLC",
+        "company"
+    ),
+    (
+        "company_id",
+        "კომპანიის ID: 406391202",
+        "company"
+    ),
+    (
+        "company_founded",
+        "კომპანია დაარსებულია 2022 წლის 5 დეკემბერს.",
+        "company"
+    ),
+    (
+        "company_location",
+        "კომპანიის სათაო ოფისი მდებარეობს თბილისში, საქართველოში.",
+        "company"
+    ),
+    (
+        "company_industry",
+        "SAMTISI CONSTRUCTION LLC არის Construction & Development Company.",
+        "company"
+    ),
+    (
+        "company_role",
+        "მომხმარებელი არის SAMTISI CONSTRUCTION LLC-ის დამფუძნებელი/ხელმძღვანელი.",
+        "company"
+    ),
+    (
+        "company_scope",
+        "კომპანიის საქმიანობა მოიცავს საცხოვრებელ, კომერციულ და ინფრასტრუქტურულ სამშენებლო/დეველოპერულ პროექტებს.",
+        "company"
+    ),
 
     # --------------------------------------------------------
     # NIKKEA 12
     # --------------------------------------------------------
 
-    {
-        "content": "NIKKEA 12 პროექტი მდებარეობს ქუთაისში, ნიკეას ქუჩა 12-ში.",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის მიწის ფართობია 3,070 მ².",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის საერთო გასაყიდი ფართობია 10,854 მ².",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის სასტუმროს ტიპის აპარტამენტებისა და ოთახების ფართობია 7,212 მ².",
-        "category": "NIKKEA 12",
-        "importance": 9
-    },
-
-    {
-        "content": "NIKKEA 12-ის მონოლითური სამუშაოების მოცულობა არის დაახლოებით 21,500 მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის არქიტექტურული სამუშაოების მოცულობა არის დაახლოებით 16,000 მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის პირველ სართულზე კომერციული ფართობია 836 მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის მეორე სართულზე კომერციული ფართობია 1,006 მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის მე-3-დან მე-14 სართულებამდე განთავსებულია დაახლოებით 7,212 მ² სასტუმროს ტიპის აპარტამენტები/ოთახები.",
-        "category": "NIKKEA 12",
-        "importance": 9
-    },
-
-    {
-        "content": "NIKKEA 12-ის კონცეფცია მოიცავს სასტუმროს ტიპის აპარტამენტებს, კაზინოს, სავაჭრო ცენტრს, რესტორანს და ზედა სართულზე lounge bar-ს.",
-        "category": "NIKKEA 12",
-        "importance": 9
-    },
-
-    {
-        "content": "NIKKEA 12-ის მიწის მესაკუთრის მოთხოვნაა 1,800 მ² აპარტამენტები, 25 საპარკინგე ადგილი და 300,000 აშშ დოლარი ნაღდი თანხა.",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის მონოლითური მშენებლობის ღირებულებად განსაზღვრულია ზუსტად 170 აშშ დოლარი/მ².",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის დარჩენილი სამუშაოების fit-out-ის სამუშაო ვარაუდია მაქსიმუმ 450 აშშ დოლარი/მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის აპარტამენტების საწყისი გასაყიდი ფასის დიაპაზონია მინიმუმ 1,500–1,800 აშშ დოლარი/მ².",
-        "category": "NIKKEA 12",
-        "importance": 9
-    },
-
-    {
-        "content": "NIKKEA 12-ის კომერციული ფართების საწყისი გასაყიდი ფასი განიხილებოდა დაახლოებით 2,500 აშშ დოლარი/მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის განვითარების JV მოდელში ინვესტორის წილი არის 80%, ხოლო SAMTISI-ის ოპერატორის წილი 20%.",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის შემოთავაზებულ მოდელში ინვესტორი აფინანსებს პროექტის მთლიანი ღირებულების დაახლოებით 35%-ს პლუს 300,000 აშშ დოლარს, ხოლო დარჩენილი ნაწილი ფინანსდება ბანკით.",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის ბანკის დაფინანსების სავარაუდო საპროცენტო განაკვეთის ზედა ზღვარი განიხილებოდა დაახლოებით 11.5–13.5%.",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის მოდელში ინვესტორის კაპიტალი უნდა დაბრუნდეს პროექტის მოგებიდან, რის შემდეგაც ინვესტორი იღებს წმინდა მოგების 80%-ს.",
-        "category": "NIKKEA 12",
-        "importance": 9
-    },
-
-    {
-        "content": "NIKKEA 12-ის ქონების/სერვისის ცალკე კომპანიაში SAMTISI-სა და ინვესტორის წილები განიხილებოდა 50/50.",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის გაქირავების მოდელში განიხილებოდა გაქირავებიდან მიღებული შემოსავლის 30% ქონების/სერვისის კომპანიას და 70% მესაკუთრეს.",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის აპარტამენტების სავარაუდო დღიური გაქირავების ფასი განიხილებოდა 150–300 აშშ დოლარის ფარგლებში.",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის 1,006 მ² კაზინოს ფართობი არ უნდა გაიყიდოს და უნდა დარჩეს პროექტის შემოსავლის მომტან აქტივად.",
-        "category": "NIKKEA 12",
-        "importance": 10
-    },
-
-    {
-        "content": "NIKKEA 12-ის კაზინოს ფართობის სავარაუდო ღირებულება განიხილებოდა მინიმუმ 2,000 აშშ დოლარი/მ².",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
-
-    {
-        "content": "NIKKEA 12-ის კაზინოს გაქირავების სავარაუდო მინიმალურ დონედ განიხილებოდა დაახლოებით 50 აშშ დოლარი/მ² თვეში.",
-        "category": "NIKKEA 12",
-        "importance": 8
-    },
+    (
+        "nikkea_location",
+        "NIKKEA 12 პროექტი მდებარეობს ქუთაისში, ნიკეას ქუჩა 12-ში.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_land",
+        "NIKKEA 12-ის მიწის ფართობია 3,070 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_saleable",
+        "NIKKEA 12-ის საერთო გასაყიდი ფართობია 10,854 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_rooms",
+        "NIKKEA 12-ში სასტუმროს ტიპის აპარტამენტების/ნომრების ფართობია 7,212 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_monolith",
+        "NIKKEA 12-ის მონოლითური სამუშაოების მოცულობაა დაახლოებით 21,500 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_architecture",
+        "NIKKEA 12-ის არქიტექტურული ფართობი შეადგენს დაახლოებით 16,000 მ²-ს.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_commercial_1",
+        "NIKKEA 12-ის პირველი სართულის კომერციული ფართობია 836 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_commercial_2",
+        "NIKKEA 12-ის მეორე სართულის კომერციული ფართობია 1,006 მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_concept",
+        "NIKKEA 12-ის კონცეფცია მოიცავს სასტუმროს ტიპის აპარტამენტებს, კაზინოს, სავაჭრო ცენტრს, რესტორანს და ზედა სართულზე lounge bar-ს.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_landowner",
+        "NIKKEA 12-ის მიწის მესაკუთრის მოთხოვნაა 1,800 მ² აპარტამენტები, 25 საპარკინგე ადგილი და მხოლოდ 300,000 აშშ დოლარი ნაღდი თანხა.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_monolith_cost",
+        "NIKKEA 12-ში მონოლითური მშენებლობის გათვალისწინებული ფასი არის ზუსტად 170 აშშ დოლარი/მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_fitout",
+        "NIKKEA 12-ის დარჩენილი ფართების fit-out-ის სამუშაოებში გამოყენებული მაქსიმალური გათვლითი დაშვებაა 450 აშშ დოლარი/მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_apartment_price",
+        "NIKKEA 12-ში აპარტამენტების საწყისი გასაყიდი ფასის სამუშაო დიაპაზონია 1,500–1,800 აშშ დოლარი/მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_commercial_price",
+        "NIKKEA 12-ში კომერციული ფართების სამუშაო გასაყიდი ფასი არის 2,500 აშშ დოლარი/მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_jv",
+        "NIKKEA 12-ის განვითარების JV მოდელში ინვესტორის წილია 80%, ხოლო SAMTISI-ის ოპერატორის წილი 20%.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_investor",
+        "NIKKEA 12-ში ინვესტორის მოთხოვნილი მონაწილეობა განიხილებოდა პროექტის საერთო ღირებულების 35% + 300,000 აშშ დოლარის ოდენობით.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_bank",
+        "NIKKEA 12-ის დაფინანსების დარჩენილი ნაწილი განიხილება საბანკო დაფინანსებით; სამუშაო დაშვება ბანკის პროცენტზე არის დაახლოებით 11.5–13.5% მაქსიმუმ.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_casino",
+        "NIKKEA 12-ში 1,006 მ² ფართობის კაზინოს გაყიდვა არ არის დაგეგმილი.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_casino_value",
+        "NIKKEA 12-ის კაზინოს ფართობის სამუშაო შეფასება არის მინიმუმ 2,000 აშშ დოლარი/მ².",
+        "nikkea12"
+    ),
+    (
+        "nikkea_casino_rent",
+        "NIKKEA 12-ის კაზინოს შესაძლო მინიმალურ ქირად განხილულია დაახლოებით 50 აშშ დოლარი/მ²/თვეში.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_property_company",
+        "NIKKEA 12-ის აპარტამენტების გაქირავებისა და მომსახურებისთვის განიხილება ცალკე property/service კომპანია, სადაც ინვესტორისა და SAMTISI-ის წილები 50/50 იქნება.",
+        "nikkea12"
+    ),
+    (
+        "nikkea_rental",
+        "NIKKEA 12-ის აპარტამენტების შესაძლო დღიური გაქირავების სამუშაო დიაპაზონია 150–300 აშშ დოლარი.",
+        "nikkea12"
+    ),
 
     # --------------------------------------------------------
     # SAMGORI
     # --------------------------------------------------------
 
-    {
-        "content": "Samgori პროექტი მდებარეობს თბილისში, სამგორის რაიონში, გიორგი ნადერიშვილის ქუჩაზე.",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის მიწის ფართობია 7,390 მ².",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის საერთო აშენებული ფართობია 46,131 მ².",
-        "category": "Samgori",
-        "importance": 9
-    },
-
-    {
-        "content": "Samgori პროექტის სამშენებლო მოცულობა არის 41,874 მ³.",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტის გასაყიდი ფართობი პარკინგის გარეშე არის 30,540 მ².",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის პარკინგის ფართობია 6,516 მ².",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტში საცხოვრებელი ფართობია 22,143 მ².",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტში summer area-ის ფართობია 5,040 მ².",
-        "category": "Samgori",
-        "importance": 7
-    },
-
-    {
-        "content": "Samgori პროექტში კომერციული ფართობია 1,647 მ².",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტში საოფისე ფართობია 1,710 მ².",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტის მშენებლობის ღირებულება განიხილებოდა დაახლოებით 253 აშშ დოლარი/მ² გასაყიდ ფართობზე.",
-        "category": "Samgori",
-        "importance": 8
-    },
-
-    {
-        "content": "Samgori პროექტის მიწის მესაკუთრის მოთხოვნაა დაახლოებით 7,750,000 აშშ დოლარი.",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის მშენებლობისთვის საჭირო კაპიტალი განიხილებოდა დაახლოებით 15,000,000 აშშ დოლარი.",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის საერთო კაპიტალის საჭიროება განიხილებოდა დაახლოებით 23,500,000 აშშ დოლარი.",
-        "category": "Samgori",
-        "importance": 10
-    },
-
-    {
-        "content": "Samgori პროექტის მოსალოდნელი წმინდა მოგება დაახლოებით 10,000,000 აშშ დოლარია.",
-        "category": "Samgori",
-        "importance": 9
-    },
+    (
+        "samgori_location",
+        "Samgori პროექტი მდებარეობს თბილისში, სამგორის რაიონში, გიორგი ნადერიშვილის ქუჩაზე.",
+        "samgori"
+    ),
+    (
+        "samgori_land",
+        "Samgori პროექტის მიწის ფართობია 7,390 მ².",
+        "samgori"
+    ),
+    (
+        "samgori_build",
+        "Samgori პროექტის აშენებადი ფართობია 46,131 მ².",
+        "samgori"
+    ),
+    (
+        "samgori_volume",
+        "Samgori პროექტის სამშენებლო მოცულობაა 41,874 მ³.",
+        "samgori"
+    ),
+    (
+        "samgori_saleable",
+        "Samgori პროექტის გასაყიდი ფართობი, პარკინგის გამოკლებით, არის 30,540 მ².",
+        "samgori"
+    ),
+    (
+        "samgori_parking",
+        "Samgori პროექტის პარკინგის ფართობია 6,516 მ².",
+        "samgori"
+    ),
+    (
+        "samgori_land_price",
+        "Samgori პროექტის მიწის მესაკუთრის მოთხოვნაა 7,750,000 აშშ დოლარი.",
+        "samgori"
+    ),
+    (
+        "samgori_construction",
+        "Samgori პროექტის მშენებლობის საჭირო ბიუჯეტად განიხილება დაახლოებით 15,000,000 აშშ დოლარი.",
+        "samgori"
+    ),
+    (
+        "samgori_total",
+        "Samgori პროექტის საერთო კაპიტალის სამუშაო შეფასებაა დაახლოებით 23,500,000 აშშ დოლარი.",
+        "samgori"
+    ),
+    (
+        "samgori_profit",
+        "Samgori პროექტის მოსალოდნელ წმინდა მოგებად განხილულია დაახლოებით 10,000,000 აშშ დოლარი.",
+        "samgori"
+    ),
+    (
+        "samgori_construction_unit",
+        "Samgori პროექტის სამუშაო სამშენებლო თვითღირებულების გათვლა არის დაახლოებით 253 აშშ დოლარი/მ² გასაყიდ ფართზე.",
+        "samgori"
+    ),
 
     # --------------------------------------------------------
     # GOLDEN LAKE / OQRI
     # --------------------------------------------------------
 
-    {
-        "content": "Golden Lake / Oqri Lake პროექტის ძირითადი მიწის ფართობი არის დაახლოებით 46 ჰექტარი.",
-        "category": "Golden Lake",
-        "importance": 9
-    },
+    (
+        "goldenlake_land",
+        "Golden Lake / Oqri Lake კონცეფციის ძირითადი მიწის ფართობია დაახლოებით 46 ჰა.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_area",
+        "ტბისა და მიმდებარე ტერიტორიის საერთო კონცეფციური მასშტაბი განიხილებოდა დაახლოებით 70–80 ჰა.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_land_cost",
+        "Golden Lake / Oqri პროექტისთვის მიწის ღირებულების სამუშაო დიაპაზონია 35–40 მილიონი აშშ დოლარი.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_construction",
+        "Golden Lake / Oqri პროექტის დაგეგმილი სამშენებლო პროგრამაა დაახლოებით 250,000 მ².",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_hotel",
+        "კონცეფცია მოიცავს 5-ვარსკვლავიან 200-ნომრიან სასტუმროს, aquapark-ს და კაზინოს.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_fourstar",
+        "კონცეფცია ასევე მოიცავს 4-ვარსკვლავიან სასტუმროს დაახლოებით 100–120 ნომრით.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_arena",
+        "Golden Lake / Oqri-ის კონცეფციაში განიხილება დაახლოებით 10,000 მაყურებელზე გათვლილი სპორტული/ღონისძიებების არენა, დაახლოებით 20,000–30,000 მ² ფართობით.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_apartments",
+        "Golden Lake / Oqri-ის კონცეფციაში განიხილება დაახლოებით 150,000 მ² გასაყიდი აპარტამენტები.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_commercial",
+        "Golden Lake / Oqri-ის კონცეფციაში განიხილება დაახლოებით 30,000 მ² კომერციული ფართები.",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_apartment_price",
+        "Golden Lake / Oqri-ის აპარტამენტების სამუშაო გასაყიდი ფასი განიხილებოდა დაახლოებით 2,500–3,000 აშშ დოლარი/მ².",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_commercial_price",
+        "Golden Lake / Oqri-ის კომერციული ფართების სამუშაო ფასი განიხილებოდა დაახლოებით 3,500–5,000 აშშ დოლარი/მ².",
+        "goldenlake"
+    ),
+    (
+        "goldenlake_fitout",
+        "Golden Lake / Oqri-ის აპარტამენტების fit-out-ის სამუშაო დაშვებაა დაახლოებით 1,000–1,200 აშშ დოლარი/მ².",
+        "goldenlake"
+    ),
 
-    {
-        "content": "Golden Lake / Oqri Lake პროექტისთვის ტბისა და მიმდებარე ტერიტორიის საერთო კონცეფციური არეალი დაახლოებით 70–80 ჰექტარია.",
-        "category": "Golden Lake",
-        "importance": 8
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტის მიწის ღირებულება განიხილებოდა დაახლოებით 35–40 მილიონი აშშ დოლარი.",
-        "category": "Golden Lake",
-        "importance": 9
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში დაგეგმილი სამშენებლო ფართობი დაახლოებით 250,000 მ²-ია.",
-        "category": "Golden Lake",
-        "importance": 9
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტი მოიცავს 5-ვარსკვლავიან დაახლოებით 200-ოთახიან სასტუმროს, aquapark-ს და კაზინოს.",
-        "category": "Golden Lake",
-        "importance": 8
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში განიხილება 4-ვარსკვლავიანი სასტუმრო დაახლოებით 100–120 ოთახით.",
-        "category": "Golden Lake",
-        "importance": 7
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში დაგეგმილია დაახლოებით 10,000 მაყურებელზე გათვლილი სპორტული/საკონცერტო არენა.",
-        "category": "Golden Lake",
-        "importance": 8
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში არენის ფართობი განიხილებოდა დაახლოებით 20,000–30,000 მ².",
-        "category": "Golden Lake",
-        "importance": 7
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში აპარტამენტების გასაყიდი ფართობი დაახლოებით 150,000 მ²-ია.",
-        "category": "Golden Lake",
-        "importance": 9
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში კომერციული ფართობი დაახლოებით 30,000 მ²-ია.",
-        "category": "Golden Lake",
-        "importance": 8
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში აპარტამენტების fit-out ღირებულება განიხილებოდა დაახლოებით 1,000–1,200 აშშ დოლარი/მ².",
-        "category": "Golden Lake",
-        "importance": 7
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში აპარტამენტების გასაყიდი ფასი განიხილებოდა დაახლოებით 2,500–3,000 აშშ დოლარი/მ².",
-        "category": "Golden Lake",
-        "importance": 8
-    },
-
-    {
-        "content": "Golden Lake / Oqri Lake პროექტში კომერციული ფართების გასაყიდი ფასი განიხილებოდა დაახლოებით 3,500–5,000 აშშ დოლარი/მ².",
-        "category": "Golden Lake",
-        "importance": 8
-    }
 ]
 
 
 # ============================================================
-# SYSTEM FACT SEEDING
+# SAFE KEY
 # ============================================================
 
-def ensure_system_facts(chat_id):
-    """
-    Seed system facts only once per chat/version.
+def safe_key(value):
+    value = str(value or "").strip().lower()
 
-    This is one of the biggest performance improvements
-    compared with GENIOSA 4.8.
-    """
+    value = re.sub(
+        r"[^a-zA-Z0-9ა-ჰ_-]+",
+        "_",
+        value
+    )
 
-    if not database_ready:
-        return
+    value = re.sub(
+        r"_+",
+        "_",
+        value
+    )
+
+    value = value.strip("_")
+
+    if not value:
+        value = "fact"
+
+    return value[:180]
+
+
+# ============================================================
+# FACT INSERT — LEGACY COMPATIBLE
+# ============================================================
+
+def create_fact(
+    chat_id,
+    content,
+    category="general",
+    source="user",
+    status="CONFIRMED",
+    fact_key=None
+):
+    content = str(content or "").strip()
+
+    if not content:
+        return None
+
+    key = safe_key(
+        fact_key or
+        f"{category}_{content[:80]}"
+    )
 
     try:
+
+        # First try to update an existing matching fact.
         row = db_execute(
             """
-            SELECT seed_version
-            FROM system_seed_meta
-            WHERE chat_id = %s
+            SELECT id
+            FROM facts
+            WHERE chat_id=%s
+              AND LOWER(COALESCE(content, fact, value, ''))
+                  = LOWER(%s)
+            ORDER BY id
+            LIMIT 1
             """,
-            (chat_id,),
+            (chat_id, content),
             fetchone=True
         )
 
-        if row and row["seed_version"] == SYSTEM_SEED_VERSION:
-            return
-
-        def transaction(cur):
-
-            for item in SYSTEM_FACTS:
-
-                content = item["content"]
-                category = item.get(
-                    "category",
-                    "general"
-                )
-                importance = item.get(
-                    "importance",
-                    5
-                )
-
-                # ------------------------------------------------
-                # FACT
-                # ------------------------------------------------
-
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM facts
-                    WHERE chat_id = %s
-                      AND content IS NOT NULL
-                      AND LOWER(TRIM(content))
-                          = LOWER(TRIM(%s))
-                    LIMIT 1
-                    """,
-                    (
-                        chat_id,
-                        content
-                    )
-                )
-
-                existing_fact = cur.fetchone()
-
-                if not existing_fact:
-
-                    cur.execute(
-                        """
-                        INSERT INTO facts (
-                            chat_id,
-                            content,
-                            status,
-                            source,
-                            category,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (
-                            %s,
-                            %s,
-                            'CONFIRMED',
-                            'system',
-                            %s,
-                            CURRENT_TIMESTAMP,
-                            CURRENT_TIMESTAMP
-                        )
-                        """,
-                        (
-                            chat_id,
-                            content,
-                            category
-                        )
-                    )
-
-                # ------------------------------------------------
-                # MEMORY
-                # ------------------------------------------------
-
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM memories
-                    WHERE chat_id = %s
-                      AND content IS NOT NULL
-                      AND LOWER(TRIM(content))
-                          = LOWER(TRIM(%s))
-                    LIMIT 1
-                    """,
-                    (
-                        chat_id,
-                        content
-                    )
-                )
-
-                existing_memory = cur.fetchone()
-
-                if not existing_memory:
-
-                    cur.execute(
-                        """
-                        INSERT INTO memories (
-                            chat_id,
-                            content,
-                            memory_type,
-                            importance,
-                            source,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (
-                            %s,
-                            %s,
-                            'system_fact',
-                            %s,
-                            'system',
-                            CURRENT_TIMESTAMP,
-                            CURRENT_TIMESTAMP
-                        )
-                        """,
-                        (
-                            chat_id,
-                            content,
-                            importance
-                        )
-                    )
-
-            # ----------------------------------------------------
-            # SEED VERSION
-            # ----------------------------------------------------
-
-            cur.execute(
+        if row:
+            db_execute(
                 """
-                INSERT INTO system_seed_meta (
-                    chat_id,
-                    seed_version,
-                    seeded_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    CURRENT_TIMESTAMP
-                )
-                ON CONFLICT (chat_id)
-                DO UPDATE SET
-                    seed_version = EXCLUDED.seed_version,
-                    seeded_at = CURRENT_TIMESTAMP
+                UPDATE facts
+                SET
+                    content=%s,
+                    fact=%s,
+                    value=%s,
+                    fact_key=COALESCE(
+                        NULLIF(fact_key,''),
+                        %s
+                    ),
+                    source=%s,
+                    status=%s,
+                    category=%s,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
                 """,
                 (
-                    chat_id,
-                    SYSTEM_SEED_VERSION
+                    content,
+                    content,
+                    content,
+                    key,
+                    source,
+                    status,
+                    category,
+                    row["id"]
                 )
             )
 
-        db_transaction(transaction)
+            return row["id"]
 
-        log(
-            f"SYSTEM FACTS SEEDED chat={chat_id}"
-        )
-
-    except Exception as e:
-        log(
-            f"SEED ERROR chat={chat_id}: {repr(e)}"
-        )
-
-
-# ============================================================
-# MESSAGE STORAGE
-# ============================================================
-
-def save_message(
-    chat_id,
-    role,
-    text
-):
-    if not text:
-        return
-
-    try:
-        db_execute(
+        # Normal insert.
+        row = db_execute(
             """
-            INSERT INTO messages (
+            INSERT INTO facts
+            (
                 chat_id,
-                role,
-                message,
-                text,
-                created_at
+                fact_key,
+                value,
+                fact,
+                content,
+                source,
+                status,
+                category,
+                memory_type,
+                created_at,
+                updated_at
             )
-            VALUES (
-                %s,
-                %s,
-                %s,
-                %s,
+            VALUES
+            (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,
+                CURRENT_TIMESTAMP,
                 CURRENT_TIMESTAMP
             )
+            RETURNING id
             """,
             (
                 chat_id,
-                role,
-                text,
-                text
-            )
-        )
-
-    except Exception as e:
-        log(
-            f"save_message ERROR: {repr(e)}"
-        )
-
-
-def get_recent_messages(
-    chat_id,
-    limit=MAX_CONTEXT_MESSAGES
-):
-    try:
-        rows = db_execute(
-            """
-            SELECT
-                role,
-                COALESCE(message, text) AS message,
-                created_at
-            FROM messages
-            WHERE chat_id = %s
-              AND COALESCE(message, text) IS NOT NULL
-            ORDER BY id DESC
-            LIMIT %s
-            """,
-            (
-                chat_id,
-                limit
+                key,
+                content,
+                content,
+                content,
+                source,
+                status,
+                category,
+                "fact"
             ),
-            fetch=True
+            fetchone=True
         )
 
-        return list(reversed(rows or []))
+        return row["id"] if row else None
 
     except Exception as e:
-        log(
-            f"get_recent_messages ERROR: {repr(e)}"
-        )
-        return []
+        log(f"create_fact ERROR: {repr(e)}")
+        return None
 
 
 # ============================================================
 # MEMORY
 # ============================================================
 
-def save_memory(
+def create_memory(
     chat_id,
     content,
     memory_type="general",
     importance=7,
     source="user"
 ):
-    if not content:
-        return False
-
-    content = content.strip()
+    content = str(content or "").strip()
 
     if not content:
-        return False
+        return None
 
     try:
 
-        def transaction(cur):
+        row = db_execute(
+            """
+            SELECT id
+            FROM memories
+            WHERE chat_id=%s
+              AND LOWER(COALESCE(content,memory,''))=LOWER(%s)
+            LIMIT 1
+            """,
+            (chat_id, content),
+            fetchone=True
+        )
 
-            cur.execute(
+        if row:
+            db_execute(
                 """
-                SELECT id
-                FROM memories
-                WHERE chat_id = %s
-                  AND content IS NOT NULL
-                  AND LOWER(TRIM(content))
-                      = LOWER(TRIM(%s))
-                LIMIT 1
+                UPDATE memories
+                SET
+                    content=%s,
+                    memory=%s,
+                    memory_type=%s,
+                    importance=%s,
+                    source=%s,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
                 """,
                 (
-                    chat_id,
-                    content
-                )
-            )
-
-            existing = cur.fetchone()
-
-            if existing:
-                cur.execute(
-                    """
-                    UPDATE memories
-                    SET importance = GREATEST(
-                            COALESCE(importance, 0),
-                            %s
-                        ),
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (
-                        importance,
-                        existing["id"]
-                    )
-                )
-
-                return False
-
-            cur.execute(
-                """
-                INSERT INTO memories (
-                    chat_id,
+                    content,
                     content,
                     memory_type,
                     importance,
                     source,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    CURRENT_TIMESTAMP,
-                    CURRENT_TIMESTAMP
-                )
-                RETURNING id
-                """,
-                (
-                    chat_id,
-                    content,
-                    memory_type,
-                    importance,
-                    source
+                    row["id"]
                 )
             )
 
-            inserted = cur.fetchone()
+            return row["id"]
 
-            if inserted:
-
-                cur.execute(
-                    """
-                    INSERT INTO memory_events (
-                        chat_id,
-                        event_type,
-                        content,
-                        created_at
-                    )
-                    VALUES (
-                        %s,
-                        'memory_created',
-                        %s,
-                        CURRENT_TIMESTAMP
-                    )
-                    """,
-                    (
-                        chat_id,
-                        content
-                    )
-                )
-
-                return True
-
-            return False
-
-        return bool(
-            db_transaction(transaction)
+        row = db_execute(
+            """
+            INSERT INTO memories
+            (
+                chat_id,
+                content,
+                memory,
+                memory_type,
+                importance,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES
+            (
+                %s,%s,%s,%s,%s,%s,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            )
+            RETURNING id
+            """,
+            (
+                chat_id,
+                content,
+                content,
+                memory_type,
+                importance,
+                source
+            ),
+            fetchone=True
         )
+
+        return row["id"] if row else None
 
     except Exception as e:
-        log(
-            f"save_memory ERROR: {repr(e)}"
-        )
-        return False
+        log(f"create_memory ERROR: {repr(e)}")
+        return None
 
 
-def get_memories(
-    chat_id,
-    limit=MAX_CONTEXT_MEMORIES
-):
+# ============================================================
+# SYSTEM SEED
+# ============================================================
+
+def seed_system_facts(chat_id):
+    """
+    Seeds known company/project facts once per version.
+    Existing user data is never deleted.
+    """
+
     try:
-        rows = db_execute(
+        row = db_execute(
+            """
+            SELECT seed_version
+            FROM system_seed_meta
+            WHERE chat_id=%s
+            """,
+            (chat_id,),
+            fetchone=True
+        )
+
+        if row and row["seed_version"] == SEED_VERSION:
+            return
+
+        log(f"SEED START chat={chat_id}")
+
+        for fact_key, content, category in SYSTEM_FACTS:
+
+            create_fact(
+                chat_id=chat_id,
+                content=content,
+                category=category,
+                source="system",
+                status="CONFIRMED",
+                fact_key=fact_key
+            )
+
+        db_execute(
+            """
+            INSERT INTO system_seed_meta
+            (
+                chat_id,
+                seed_version,
+                seeded_at
+            )
+            VALUES
+            (%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id)
+            DO UPDATE SET
+                seed_version=EXCLUDED.seed_version,
+                seeded_at=CURRENT_TIMESTAMP
+            """,
+            (
+                chat_id,
+                SEED_VERSION
+            )
+        )
+
+        log(f"SEED COMPLETE chat={chat_id}")
+
+    except Exception as e:
+        log(f"SEED ERROR chat={chat_id}: {repr(e)}")
+
+
+# ============================================================
+# GET FACTS
+# ============================================================
+
+def get_facts(chat_id, limit=60):
+    try:
+        return db_execute(
             """
             SELECT
                 id,
-                content,
+                fact_key,
+                COALESCE(
+                    NULLIF(content,''),
+                    NULLIF(fact,''),
+                    NULLIF(value,'')
+                ) AS content,
+                source,
+                status,
+                category,
+                created_at
+            FROM facts
+            WHERE chat_id=%s
+              AND UPPER(COALESCE(status,'CONFIRMED'))
+                  = 'CONFIRMED'
+            ORDER BY
+                CASE
+                    WHEN source='system' THEN 0
+                    ELSE 1
+                END,
+                id ASC
+            LIMIT %s
+            """,
+            (chat_id, limit),
+            fetch=True
+        ) or []
+
+    except Exception as e:
+        log(f"get_facts ERROR: {repr(e)}")
+        return []
+
+
+# ============================================================
+# GET MEMORIES
+# ============================================================
+
+def get_memories(chat_id, limit=30):
+    try:
+        return db_execute(
+            """
+            SELECT
+                id,
+                COALESCE(
+                    NULLIF(content,''),
+                    NULLIF(memory,'')
+                ) AS content,
                 memory_type,
                 importance,
                 source,
                 created_at
             FROM memories
-            WHERE chat_id = %s
-              AND content IS NOT NULL
-              AND TRIM(content) <> ''
-            ORDER BY
-                importance DESC NULLS LAST,
-                id DESC
+            WHERE chat_id=%s
+            ORDER BY importance DESC, id DESC
             LIMIT %s
+            """,
+            (chat_id, limit),
+            fetch=True
+        ) or []
+
+    except Exception as e:
+        log(f"get_memories ERROR: {repr(e)}")
+        return []
+
+
+# ============================================================
+# RECENT MESSAGES
+# ============================================================
+
+def get_recent_messages(chat_id, limit=12):
+    try:
+        rows = db_execute(
+            """
+            SELECT
+                role,
+                COALESCE(message,text) AS message,
+                created_at
+            FROM messages
+            WHERE chat_id=%s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (chat_id, limit),
+            fetch=True
+        ) or []
+
+        return list(reversed(rows))
+
+    except Exception as e:
+        log(f"get_recent_messages ERROR: {repr(e)}")
+        return []
+
+
+# ============================================================
+# SAVE MESSAGE
+# ============================================================
+
+def save_message(chat_id, role, message):
+    message = str(message or "")
+
+    if not message:
+        return
+
+    try:
+        db_execute(
+            """
+            INSERT INTO messages
+            (
+                chat_id,
+                role,
+                message,
+                text,
+                created_at
+            )
+            VALUES
+            (
+                %s,%s,%s,%s,CURRENT_TIMESTAMP
+            )
             """,
             (
                 chat_id,
-                limit
-            ),
-            fetch=True
+                role,
+                message,
+                message
+            )
         )
-
-        return rows or []
 
     except Exception as e:
-        log(
-            f"get_memories ERROR: {repr(e)}"
-        )
-        return []
+        log(f"save_message ERROR: {repr(e)}")
 
 
 # ============================================================
-# FACTS
+# EXPLICIT MEMORY DETECTION
 # ============================================================
 
-VALID_FACT_STATUSES = {
-    "CONFIRMED",
-    "PENDING",
-    "CONFLICT",
-    "REJECTED"
-}
-
-
-def create_fact(
-    chat_id,
-    content,
-    status="PENDING",
-    source="user",
-    category="general"
-):
-    if not content:
-        return None
-
-    content = content.strip()
-
-    if not content:
-        return None
-
-    status = str(status).upper().strip()
-
-    if status not in VALID_FACT_STATUSES:
-        status = "PENDING"
-
-    try:
-
-        def transaction(cur):
-
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    status
-                FROM facts
-                WHERE chat_id = %s
-                  AND content IS NOT NULL
-                  AND LOWER(TRIM(content))
-                      = LOWER(TRIM(%s))
-                LIMIT 1
-                """,
-                (
-                    chat_id,
-                    content
-                )
-            )
-
-            existing = cur.fetchone()
-
-            if existing:
-
-                if status == "CONFIRMED":
-
-                    cur.execute(
-                        """
-                        UPDATE facts
-                        SET status = 'CONFIRMED',
-                            source = %s,
-                            category = %s,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s
-                        """,
-                        (
-                            source,
-                            category,
-                            existing["id"]
-                        )
-                    )
-
-                return existing["id"]
-
-            cur.execute(
-                """
-                INSERT INTO facts (
-                    chat_id,
-                    content,
-                    status,
-                    source,
-                    category,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    CURRENT_TIMESTAMP,
-                    CURRENT_TIMESTAMP
-                )
-                RETURNING id
-                """,
-                (
-                    chat_id,
-                    content,
-                    status,
-                    source,
-                    category
-                )
-            )
-
-            row = cur.fetchone()
-
-            return row["id"] if row else None
-
-        return db_transaction(transaction)
-
-    except Exception as e:
-        log(
-            f"create_fact ERROR: {repr(e)}"
-        )
-        return None
-
-
-def get_facts(
-    chat_id,
-    status="CONFIRMED",
-    limit=MAX_CONTEXT_FACTS
-):
-    try:
-
-        if status:
-            rows = db_execute(
-                """
-                SELECT
-                    id,
-                    content,
-                    status,
-                    source,
-                    category,
-                    created_at,
-                    updated_at
-                FROM facts
-                WHERE chat_id = %s
-                  AND status = %s
-                  AND content IS NOT NULL
-                  AND TRIM(content) <> ''
-                ORDER BY
-                    CASE
-                        WHEN source = 'system'
-                        THEN 1
-                        ELSE 2
-                    END,
-                    id DESC
-                LIMIT %s
-                """,
-                (
-                    chat_id,
-                    status,
-                    limit
-                ),
-                fetch=True
-            )
-
-        else:
-
-            rows = db_execute(
-                """
-                SELECT
-                    id,
-                    content,
-                    status,
-                    source,
-                    category,
-                    created_at,
-                    updated_at
-                FROM facts
-                WHERE chat_id = %s
-                  AND content IS NOT NULL
-                  AND TRIM(content) <> ''
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (
-                    chat_id,
-                    limit
-                ),
-                fetch=True
-            )
-
-        return rows or []
-
-    except Exception as e:
-        log(
-            f"get_facts ERROR: {repr(e)}"
-        )
-        return []
-
-
-# ============================================================
-# FACT STATUS CONTROL
-# ============================================================
-
-def confirm_fact(
-    chat_id,
-    fact_id
-):
-    try:
-
-        def transaction(cur):
-
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    status
-                FROM facts
-                WHERE id = %s
-                  AND chat_id = %s
-                FOR UPDATE
-                """,
-                (
-                    fact_id,
-                    chat_id
-                )
-            )
-
-            row = cur.fetchone()
-
-            if not row:
-                return False
-
-            old_status = row["status"]
-
-            cur.execute(
-                """
-                UPDATE facts
-                SET status = 'CONFIRMED',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                """,
-                (fact_id,)
-            )
-
-            cur.execute(
-                """
-                INSERT INTO fact_history (
-                    fact_id,
-                    old_status,
-                    new_status,
-                    reason,
-                    created_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    'CONFIRMED',
-                    'confirmed by user',
-                    CURRENT_TIMESTAMP
-                )
-                """,
-                (
-                    fact_id,
-                    old_status
-                )
-            )
-
-            return True
-
-        return db_transaction(transaction)
-
-    except Exception as e:
-        log(
-            f"confirm_fact ERROR: {repr(e)}"
-        )
-        return False
-
-
-def reject_fact(
-    chat_id,
-    fact_id
-):
-    try:
-
-        def transaction(cur):
-
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    status
-                FROM facts
-                WHERE id = %s
-                  AND chat_id = %s
-                FOR UPDATE
-                """,
-                (
-                    fact_id,
-                    chat_id
-                )
-            )
-
-            row = cur.fetchone()
-
-            if not row:
-                return False
-
-            old_status = row["status"]
-
-            cur.execute(
-                """
-                UPDATE facts
-                SET status = 'REJECTED',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                """,
-                (fact_id,)
-            )
-
-            cur.execute(
-                """
-                INSERT INTO fact_history (
-                    fact_id,
-                    old_status,
-                    new_status,
-                    reason,
-                    created_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    'REJECTED',
-                    'rejected by user',
-                    CURRENT_TIMESTAMP
-                )
-                """,
-                (
-                    fact_id,
-                    old_status
-                )
-            )
-
-            return True
-
-        return db_transaction(transaction)
-
-    except Exception as e:
-        log(
-            f"reject_fact ERROR: {repr(e)}"
-        )
-        return False
-
-
-# ============================================================
-# MEMORY / FACT DETECTION
-# ============================================================
-
-MEMORY_WORDS = [
+MEMORY_PHRASES = [
     "დაიმახსოვრე",
-    "დამიმახსოვრე",
-    "დაიმახსოვროს",
-    "ჩაიწერე",
-    "შეინახე",
-    "დაიტოვე მეხსიერებაში",
-    "გახსოვდეს",
-    "remember",
-    "memorize",
+    "შეინახე მეხსიერებაში",
+    "დაიმახსოვრეთ",
+    "remember this",
+    "remember that",
     "save this",
-    "keep this in memory"
+    "store this",
+    "memorize",
 ]
 
 
-CONFIRM_WORDS = [
-    "დაადასტურე",
-    "ვადასტურებ",
-    "ეს ფაქტია",
-    "დადასტურებულია",
-    "confirm",
-    "confirmed"
-]
-
-
-def contains_memory_request(text):
-    lower = text.lower()
+def should_save_memory(text):
+    low = text.lower()
 
     return any(
-        phrase in lower
-        for phrase in MEMORY_WORDS
+        phrase in low
+        for phrase in MEMORY_PHRASES
     )
 
 
-def contains_confirmation(text):
-    lower = text.lower()
+def capture_explicit_memory(chat_id, text):
 
-    return any(
-        phrase in lower
-        for phrase in CONFIRM_WORDS
+    if not should_save_memory(text):
+        return
+
+    memory_id = create_memory(
+        chat_id=chat_id,
+        content=text,
+        memory_type="explicit_user_memory",
+        importance=9,
+        source="user"
     )
 
+    if memory_id:
+        create_fact(
+            chat_id=chat_id,
+            content=text,
+            category="user_memory",
+            source="user",
+            status="CONFIRMED",
+            fact_key=f"user_memory_{memory_id}"
+        )
 
-def is_confirmed_fact_request(text):
-    return (
-        contains_memory_request(text)
-        or contains_confirmation(text)
-    )
+        log(
+            f"MEMORY SAVED chat={chat_id} id={memory_id}"
+        )
 
 
-def capture_direct_company_fact(
-    chat_id,
-    text
-):
-    """
-    Lightweight local detection.
-    Does not call Gemini.
-    """
+# ============================================================
+# DIRECT FACT CAPTURE
+# ============================================================
+
+def capture_direct_company_fact(chat_id, text):
 
     patterns = [
-        r"(?:კომპანიის\s+სახელია|company\s+name\s+is)\s*[:\-]?\s*(.+)",
-        r"(?:ჩვენი\s+კომპანიაა|our\s+company\s+is)\s*[:\-]?\s*(.+)"
+        r"კომპანია არის (.+)",
+        r"კომპანიის სახელია (.+)",
+        r"ჩემი კომპანიაა (.+)",
+        r"my company is (.+)",
     ]
 
     for pattern in patterns:
@@ -2084,26 +1486,15 @@ def capture_direct_company_fact(
 
             value = match.group(1).strip()
 
-            if value:
-
-                content = (
-                    f"კომპანიის სახელი: {value}"
-                )
+            if len(value) > 2:
 
                 create_fact(
-                    chat_id,
-                    content,
-                    status="CONFIRMED",
+                    chat_id=chat_id,
+                    content=f"კომპანიის შესახებ: {value}",
+                    category="company",
                     source="user",
-                    category="company"
-                )
-
-                save_memory(
-                    chat_id,
-                    content,
-                    memory_type="company",
-                    importance=10,
-                    source="user"
+                    status="CONFIRMED",
+                    fact_key="user_company_statement"
                 )
 
                 return True
@@ -2111,328 +1502,68 @@ def capture_direct_company_fact(
     return False
 
 
-def extract_simple_memory_text(text):
-    """
-    For explicit memory commands we normally store the
-    user's statement itself.
-
-    This avoids an additional Gemini call and makes memory
-    much faster.
-    """
-
-    cleaned = text.strip()
-
-    # Remove common memory prefixes.
-    prefixes = [
-        "დაიმახსოვრე:",
-        "დაიმახსოვრე",
-        "დამიმახსოვრე:",
-        "დამიმახსოვრე",
-        "ჩაიწერე:",
-        "ჩაიწერე",
-        "შეინახე:",
-        "შეინახე",
-        "remember:",
-        "remember",
-        "save this:",
-        "save this"
-    ]
-
-    lower = cleaned.lower()
-
-    for prefix in prefixes:
-
-        if lower.startswith(prefix.lower()):
-
-            result = cleaned[len(prefix):].strip(
-                " :,-"
-            )
-
-            if result:
-                return result
-
-    return cleaned
-
-
-def capture_memory(
-    chat_id,
-    user_text
-):
-    """
-    IMPORTANT PERFORMANCE RULE:
-
-    Gemini is NOT called here for normal messages.
-
-    Memory extraction happens only when:
-    - user explicitly asks to remember/save something
-    - user confirms a fact
-    - direct company fact is detected
-    """
-
-    try:
-
-        direct = capture_direct_company_fact(
-            chat_id,
-            user_text
-        )
-
-        if direct:
-            return
-
-        if not is_confirmed_fact_request(
-            user_text
-        ):
-            return
-
-        memory_text = extract_simple_memory_text(
-            user_text
-        )
-
-        if not memory_text:
-            return
-
-        fact_id = create_fact(
-            chat_id,
-            memory_text,
-            status="CONFIRMED",
-            source="user",
-            category="user_memory"
-        )
-
-        save_memory(
-            chat_id,
-            memory_text,
-            memory_type="user_memory",
-            importance=9,
-            source="user"
-        )
-
-        log(
-            f"MEMORY CAPTURED chat={chat_id} "
-            f"fact_id={fact_id}"
-        )
-
-    except Exception as e:
-        log(
-            f"capture_memory ERROR: {repr(e)}"
-        )
-
-
 # ============================================================
-# CONTEXT
+# FORMAT MEMORY
 # ============================================================
 
-def format_context(
-    chat_id,
-    user_text
-):
-    confirmed = get_facts(
-        chat_id,
-        status="CONFIRMED",
-        limit=MAX_CONTEXT_FACTS
-    )
+def format_facts(facts):
+    if not facts:
+        return "ფაქტები ვერ მოიძებნა."
 
-    memories = get_memories(
-        chat_id,
-        limit=MAX_CONTEXT_MEMORIES
-    )
+    lines = []
 
-    pending = get_facts(
-        chat_id,
-        status="PENDING",
-        limit=MAX_PENDING_FACTS
-    )
+    for index, row in enumerate(facts, 1):
 
-    conflicts = get_facts(
-        chat_id,
-        status="CONFLICT",
-        limit=MAX_CONFLICT_FACTS
-    )
+        content = row.get("content") or ""
 
-    recent = get_recent_messages(
-        chat_id,
-        limit=MAX_CONTEXT_MESSAGES
-    )
+        if not content:
+            continue
 
-    parts = []
+        category = row.get("category") or "general"
 
-    # --------------------------------------------------------
-    # CONFIRMED FACTS
-    # --------------------------------------------------------
-
-    parts.append(
-        "CONFIRMED FACTS:"
-    )
-
-    for row in confirmed:
-
-        parts.append(
-            f"- [{row.get('category', 'general')}] "
-            f"{row.get('content', '')}"
+        lines.append(
+            f"{index}. [{category}] {content}"
         )
 
-    # --------------------------------------------------------
-    # MEMORIES
-    # --------------------------------------------------------
+    return "\n".join(lines) if lines else "ფაქტები ვერ მოიძებნა."
 
-    parts.append(
-        "\nUSER MEMORIES:"
-    )
 
-    for row in memories:
+def format_memories(memories):
+    if not memories:
+        return "ამ ჩატისთვის მეხსიერებაში ჩანაწერები არ მოიძებნა."
 
-        parts.append(
-            f"- {row.get('content', '')}"
-        )
+    lines = []
 
-    # --------------------------------------------------------
-    # PENDING
-    # --------------------------------------------------------
+    for index, row in enumerate(memories, 1):
 
-    if pending:
+        content = row.get("content") or ""
 
-        parts.append(
-            "\nPENDING FACTS:"
-        )
-
-        for row in pending:
-
-            parts.append(
-                f"- {row.get('content', '')}"
+        if content:
+            lines.append(
+                f"{index}. {content}"
             )
 
-    # --------------------------------------------------------
-    # CONFLICTS
-    # --------------------------------------------------------
-
-    if conflicts:
-
-        parts.append(
-            "\nCONFLICTING FACTS:"
-        )
-
-        for row in conflicts:
-
-            parts.append(
-                f"- {row.get('content', '')}"
-            )
-
-    # --------------------------------------------------------
-    # RECENT CONVERSATION
-    # --------------------------------------------------------
-
-    parts.append(
-        "\nRECENT CONVERSATION:"
-    )
-
-    for row in recent:
-
-        role = row.get(
-            "role",
-            "unknown"
-        )
-
-        message = row.get(
-            "message",
-            ""
-        )
-
-        if message:
-
-            parts.append(
-                f"{role.upper()}: {message}"
-            )
-
-    return "\n".join(parts)
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-def build_system_prompt(
-    chat_id,
-    user_text
-):
-
-    context = format_context(
-        chat_id,
-        user_text
-    )
-
-    return f"""
-You are GENIOSA 4.9.
-
-You are the personal business advisor and assistant
-of the founder of SAMTISI CONSTRUCTION LLC.
-
-Your main functions:
-
-1. Business advisory
-2. Construction and development analysis
-3. Project financial analysis
-4. Investment analysis
-5. Investor communication
-6. Project management support
-7. Research assistance
-8. Strategic decision support
-9. Memory and knowledge management
-10. Technical assistance
-
-IMPORTANT RULES:
-
-- Always distinguish confirmed facts from assumptions.
-- Never invent financial numbers.
-- Never invent legal facts.
-- Never present an assumption as a confirmed fact.
-- If information is missing, say that it is missing.
-- If you are uncertain, clearly say so.
-- When current market, legal, regulatory or other external
-  information is required, state that current verification
-  is necessary.
-- Do not silently change confirmed project numbers.
-- When the user provides a new explicit fact and asks you
-  to remember it, it should be treated as persistent memory.
-- Existing confirmed facts have priority over guesses.
-- If two facts conflict, point out the conflict rather than
-  choosing silently.
-- Answer in the language used by the user unless another
-  language is requested.
-- Be practical and business-oriented.
-- For financial calculations, show the logic and assumptions.
-- Do not claim that you performed an external action if you
-  did not actually perform it.
-
-GENIOSA DATABASE CONTEXT:
-
-{context}
-
-CURRENT USER MESSAGE:
-
-{user_text}
-"""
+    return "\n".join(lines) if lines else \
+        "ამ ჩატისთვის მეხსიერებაში ჩანაწერები არ მოიძებნა."
 
 
 # ============================================================
 # GEMINI
 # ============================================================
 
-def gemini_generate(
-    prompt,
-    temperature=0.2,
-    max_output_tokens=2048
-):
-    global gemini_ok
+def gemini_generate(prompt):
 
     if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured"
+        return (
+            "Gemini API Key კონფიგურირებული არ არის. "
+            "გთხოვ Render-ის Environment-ში შეამოწმე GEMINI_API_KEY."
         )
 
     url = (
         "https://generativelanguage.googleapis.com/"
         "v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
     )
 
     payload = {
@@ -2447,126 +1578,237 @@ def gemini_generate(
             }
         ],
         "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens
+            "temperature": 0.25,
+            "maxOutputTokens": 1800
         }
     }
 
-    response = requests.post(
-        url,
-        params={
-            "key": GEMINI_API_KEY
-        },
-        json=payload,
-        timeout=GEMINI_TIMEOUT
-    )
+    try:
 
-    if response.status_code != 200:
-
-        gemini_ok = False
-
-        raise RuntimeError(
-            "Gemini API error "
-            f"{response.status_code}: "
-            f"{response.text[:1000]}"
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=60
         )
 
-    data = response.json()
+        if response.status_code != 200:
 
-    candidates = data.get(
-        "candidates",
-        []
-    )
+            log(
+                "GEMINI ERROR "
+                f"{response.status_code}: "
+                f"{response.text[:1000]}"
+            )
 
-    if not candidates:
-        raise RuntimeError(
-            "Gemini returned no candidates"
+            return (
+                "Gemini-სთან დაკავშირებისას ტექნიკური "
+                f"შეცდომა მოხდა ({response.status_code})."
+            )
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
         )
 
-    parts = (
-        candidates[0]
-        .get("content", {})
-        .get("parts", [])
-    )
+        if not candidates:
+            return "Gemini-მ პასუხი ვერ დააბრუნა."
 
-    answer_parts = []
-
-    for part in parts:
-
-        text = part.get(
-            "text"
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
         )
 
-        if text:
-            answer_parts.append(text)
+        answer = ""
 
-    answer = "".join(
-        answer_parts
-    ).strip()
+        for part in parts:
 
-    if not answer:
-        raise RuntimeError(
-            "Gemini returned empty answer"
+            if "text" in part:
+                answer += part["text"]
+
+        answer = answer.strip()
+
+        if not answer:
+            return "პასუხის ტექსტი ვერ მივიღე Gemini-სგან."
+
+        return answer
+
+    except requests.RequestException as e:
+
+        log(
+            f"GEMINI REQUEST ERROR: {repr(e)}"
         )
 
-    gemini_ok = True
+        return (
+            "Gemini-სთან კავშირისას დროებითი "
+            "ტექნიკური პრობლემა მოხდა."
+        )
 
-    return answer
+    except Exception as e:
+
+        log(
+            f"GEMINI UNKNOWN ERROR: {repr(e)}"
+        )
+
+        return (
+            "პასუხის დამუშავებისას ტექნიკური "
+            "შეცდომა მოხდა."
+        )
 
 
 # ============================================================
-# ANSWER GENERATION
+# AI CONTEXT
 # ============================================================
 
-def generate_answer(
-    chat_id,
-    user_text
-):
+SYSTEM_PROMPT = """
+შენ ხარ GENIOSA 5.0 — მომხმარებლის პერსონალური
+ბიზნეს-მრჩეველი და ასისტენტი.
 
-    prompt = build_system_prompt(
+მომხმარებელი არის SAMTISI CONSTRUCTION LLC-ის
+დამფუძნებელი/ხელმძღვანელი.
+
+შენი მთავარი წესებია:
+
+1. არ გამოიგონო ფაქტები, ფინანსური ციფრები ან იურიდიული ინფორმაცია.
+2. თუ ინფორმაცია არ გაქვს, პირდაპირ თქვი, რომ არ იცი.
+3. დადასტურებული ფაქტები გამოიყენე როგორც სამუშაო ცოდნა.
+4. მომხმარებლის ახალი ინფორმაცია არ ჩათვალო ავტომატურად
+   დადასტურებულ ფაქტად, თუ მისი ბუნება გაურკვეველია.
+5. ფინანსურ ან საინვესტიციო ანალიზში მკაფიოდ გამოყავი:
+   - დადასტურებული მონაცემი
+   - მომხმარებლის დაშვება
+   - შენი შეფასება
+   - საჭირო დამატებითი ინფორმაცია.
+6. არასოდეს შეცვალო ან წაშალო ძველი ინფორმაცია თვითნებურად.
+7. თუ ორი ფაქტი ეწინააღმდეგება ერთმანეთს, მიუთითე კონფლიქტი.
+8. პასუხი იყოს პრაქტიკული, საქმიანი და გასაგები.
+9. მომხმარებელს არ უთხრა, რომ რაღაც გახსოვს, თუ მონაცემი
+   რეალურად მოწოდებულ კონტექსტში არ არის.
+10. თუ კითხვა ეხება მიმდინარე ბაზრის, კანონის, ფასების,
+    კომპანიების ან სხვა სწრაფად ცვალებად ინფორმაციას,
+    არ წარმოადგინო მოძველებული ინფორმაცია როგორც მიმდინარე ფაქტი.
+"""
+
+
+def build_context(chat_id):
+
+    facts = get_facts(
         chat_id,
-        user_text
+        limit=60
     )
 
-    return gemini_generate(
-        prompt,
-        temperature=0.2,
-        max_output_tokens=2048
+    memories = get_memories(
+        chat_id,
+        limit=25
     )
+
+    messages = get_recent_messages(
+        chat_id,
+        limit=12
+    )
+
+    context_parts = []
+
+    context_parts.append(
+        "=== CONFIRMED FACTS ==="
+    )
+
+    for row in facts:
+
+        content = row.get("content") or ""
+
+        if content:
+            context_parts.append(
+                f"- {content}"
+            )
+
+    context_parts.append(
+        "\n=== SAVED MEMORIES ==="
+    )
+
+    for row in memories:
+
+        content = row.get("content") or ""
+
+        if content:
+            context_parts.append(
+                f"- {content}"
+            )
+
+    context_parts.append(
+        "\n=== RECENT CONVERSATION ==="
+    )
+
+    for row in messages:
+
+        role = row.get("role") or "user"
+        message = row.get("message") or ""
+
+        if message:
+            context_parts.append(
+                f"{role}: {message}"
+            )
+
+    return "\n".join(context_parts)
+
+
+# ============================================================
+# ANSWER
+# ============================================================
+
+def answer_user(chat_id, user_text):
+
+    context = build_context(chat_id)
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+ქვემოთ მოცემულია GENIOSA-ს არსებული კონტექსტი.
+
+{context}
+
+=== CURRENT USER MESSAGE ===
+
+{user_text}
+
+უპასუხე მომხმარებლის კითხვას ზუსტად და პრაქტიკულად.
+
+თუ არსებული ფაქტები საკმარისი არ არის,
+არ გამოიგონო ინფორმაცია.
+
+თუ მომხმარებელი კითხულობს:
+„რა გახსოვს?“ ან მსგავს რამეს,
+გამოიყენე ზემოთ მოცემული CONFIRMED FACTS
+და SAVED MEMORIES.
+"""
+
+    return gemini_generate(prompt)
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_url(method):
-    return (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
-    )
-
-
-def telegram_call(
-    method,
-    payload=None,
-    timeout=TELEGRAM_TIMEOUT
-):
-    global telegram_ok
+def telegram_call(method, params=None):
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is not configured"
         )
 
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/{method}"
+    )
+
     response = requests.post(
-        telegram_url(method),
-        json=payload or {},
-        timeout=timeout
+        url,
+        json=params or {},
+        timeout=TELEGRAM_TIMEOUT
     )
 
     if response.status_code != 200:
-
-        telegram_ok = False
 
         raise RuntimeError(
             f"Telegram HTTP {response.status_code}: "
@@ -2576,44 +1818,39 @@ def telegram_call(
     data = response.json()
 
     if not data.get("ok"):
-
-        telegram_ok = False
-
         raise RuntimeError(
             f"Telegram API error: {data}"
         )
 
-    telegram_ok = True
-
-    return data
+    return data.get("result")
 
 
-def send_message(
-    chat_id,
-    text
-):
+def telegram_send_message(chat_id, text):
+
+    text = str(text or "").strip()
+
     if not text:
         return
 
-    # Telegram has a message-size limit.
+    # Telegram message limit protection.
     chunks = []
 
-    while len(text) > MAX_TELEGRAM_MESSAGE:
+    while len(text) > MAX_MESSAGE_LENGTH:
 
-        cut = text.rfind(
+        split_at = text.rfind(
             "\n",
             0,
-            MAX_TELEGRAM_MESSAGE
+            MAX_MESSAGE_LENGTH
         )
 
-        if cut < 1000:
-            cut = MAX_TELEGRAM_MESSAGE
+        if split_at < 500:
+            split_at = MAX_MESSAGE_LENGTH
 
         chunks.append(
-            text[:cut]
+            text[:split_at]
         )
 
-        text = text[cut:].lstrip()
+        text = text[split_at:].lstrip()
 
     if text:
         chunks.append(text)
@@ -2625,8 +1862,27 @@ def send_message(
             {
                 "chat_id": chat_id,
                 "text": chunk
-            },
-            timeout=TELEGRAM_SEND_TIMEOUT
+            }
+        )
+
+
+def telegram_clear_webhook():
+
+    try:
+
+        telegram_call(
+            "deleteWebhook",
+            {
+                "drop_pending_updates": False
+            }
+        )
+
+        log("Telegram webhook cleared")
+
+    except Exception as e:
+
+        log(
+            f"Telegram webhook warning: {repr(e)}"
         )
 
 
@@ -2634,400 +1890,324 @@ def send_message(
 # TELEGRAM COMMANDS
 # ============================================================
 
-def help_text():
-    return """
-GENIOSA 4.9
+def handle_command(chat_id, text):
 
-ძირითადი ბრძანებები:
+    command = text.strip().split()[0].lower()
 
-/health
-/summary
-/memory
-/facts
-/tasks
-/projects
-/help
+    if command == "/start":
 
-ფაქტები:
-
-/confirm_fact ID
-/reject_fact ID
-
-GENIOSA ინარჩუნებს:
-• დადასტურებულ ფაქტებს
-• მეხსიერებას
-• პროექტებს
-• გადაწყვეტილებებს
-• ამოცანებს
-• საუბრის ისტორიას
-
-თუ გინდა რამე დავიმახსოვრო, დაწერე მაგალითად:
-
-„დაიმახსოვრე: ეს არის ახალი პროექტის ძირითადი პირობა.“
-"""
-
-
-def health_text():
-    return f"""
-GENIOSA {APP_VERSION}
-
-Telegram: {"OK" if telegram_ok else "CONFIGURED"}
-Gemini: {"OK" if gemini_ok else "CONFIGURED"}
-Database: {"READY" if database_ready else "NOT READY"}
-Model: {GEMINI_MODEL}
-Polling: {"RUNNING" if polling_started else "STOPPED"}
-Startup: {"COMPLETE" if startup_completed else "IN PROGRESS"}
-"""
-
-
-def memory_report(chat_id):
-    memories = get_memories(
-        chat_id,
-        limit=50
-    )
-
-    if not memories:
-        return "GENIOSA-ს მეხსიერებაში ამ ჩატისთვის ჩანაწერები არ მოიძებნა."
-
-    lines = [
-        "GENIOSA MEMORY"
-    ]
-
-    for index, row in enumerate(
-        memories,
-        start=1
-    ):
-
-        lines.append(
-            f"{index}. "
-            f"{row.get('content', '')}"
-        )
-
-    return "\n".join(lines)
-
-
-def facts_report(chat_id):
-    facts = get_facts(
-        chat_id,
-        status=None,
-        limit=100
-    )
-
-    if not facts:
-        return "ფაქტები ვერ მოიძებნა."
-
-    lines = [
-        "GENIOSA FACTS"
-    ]
-
-    for row in facts:
-
-        lines.append(
-            f"[{row.get('id')}] "
-            f"{row.get('status')} | "
-            f"{row.get('category')} | "
-            f"{row.get('content')}"
-        )
-
-    return "\n".join(lines)
-
-
-def tasks_report(chat_id):
-    try:
-        rows = db_execute(
+        telegram_send_message(
+            chat_id,
             """
-            SELECT
-                id,
-                title,
-                description,
-                status,
-                priority,
-                due_date
-            FROM tasks
-            WHERE chat_id = %s
-            ORDER BY id DESC
-            LIMIT 100
-            """,
-            (chat_id,),
-            fetch=True
+გამარჯობა. მე ვარ GENIOSA 5.0 — შენი პერსონალური
+ბიზნეს-მრჩეველი და ასისტენტი.
+
+მე შემიძლია დაგეხმარო:
+• ბიზნესისა და საინვესტიციო ანალიზში
+• სამშენებლო/დეველოპერულ პროექტებში
+• ფინანსურ მოდელებში
+• პროექტების მართვაში
+• დოკუმენტების/იდეების სტრუქტურირებაში
+• შენახული ფაქტებისა და მეხსიერების მართვაში
+
+მომწერე ჩვეულებრივი შეტყობინება და დავიწყოთ.
+"""
         )
 
-        if not rows:
-            return "ამოცანები არ მოიძებნა."
+        return True
 
-        lines = [
-            "GENIOSA TASKS"
-        ]
+    if command == "/help":
 
-        for row in rows:
-
-            lines.append(
-                f"[{row.get('id')}] "
-                f"{row.get('status')} | "
-                f"{row.get('priority')} | "
-                f"{row.get('title')}"
-            )
-
-        return "\n".join(lines)
-
-    except Exception as e:
-
-        log(
-            f"tasks_report ERROR: {repr(e)}"
-        )
-
-        return "ამოცანების წაკითხვა ვერ მოხერხდა."
-
-
-def projects_report(chat_id):
-    try:
-        rows = db_execute(
+        telegram_send_message(
+            chat_id,
             """
-            SELECT
-                id,
-                name,
-                description,
-                status
-            FROM projects
-            WHERE chat_id = %s
-            ORDER BY id DESC
-            LIMIT 100
-            """,
-            (chat_id,),
-            fetch=True
+GENIOSA 5.0 ბრძანებები:
+
+/health — სისტემის სტატუსი
+/facts — დადასტურებული ფაქტები
+/memory — შენახული მეხსიერება
+/projects — პროექტების სია
+/tasks — დავალებები
+/summary — მოკლე შეჯამება
+
+მეხსიერებისთვის:
+„დაიმახსოვრე, რომ ...“
+"""
         )
 
-        if not rows:
-            return "პროექტები არ მოიძებნა."
+        return True
 
-        lines = [
-            "GENIOSA PROJECTS"
-        ]
+    if command == "/health":
 
-        for row in rows:
+        status = config_status()
 
-            lines.append(
-                f"[{row.get('id')}] "
-                f"{row.get('status')} | "
-                f"{row.get('name')}"
+        db_ok = False
+
+        try:
+            db_execute(
+                "SELECT 1",
+                fetchone=True
             )
+            db_ok = True
+        except Exception:
+            db_ok = False
 
-        return "\n".join(lines)
-
-    except Exception as e:
-
-        log(
-            f"projects_report ERROR: {repr(e)}"
-        )
-
-        return "პროექტების წაკითხვა ვერ მოხერხდა."
-
-
-# ============================================================
-# COMMAND PROCESSING
-# ============================================================
-
-def process_command(
-    chat_id,
-    text
-):
-    stripped = text.strip()
-
-    if stripped == "/start":
-        ensure_system_facts(chat_id)
-
-        return (
-            "გამარჯობა. მე GENIOSA 4.9 ვარ.\n\n"
-            "მეხსიერება და მონაცემთა ბაზა მზად არის.\n"
-            "გამოიყენე /help ბრძანებების სანახავად."
-        )
-
-    if stripped == "/help":
-        return help_text()
-
-    if stripped == "/health":
-        return health_text()
-
-    if stripped == "/memory":
-        return memory_report(chat_id)
-
-    if stripped == "/facts":
-        return facts_report(chat_id)
-
-    if stripped == "/tasks":
-        return tasks_report(chat_id)
-
-    if stripped == "/projects":
-        return projects_report(chat_id)
-
-    if stripped == "/summary":
-
-        recent = get_recent_messages(
+        telegram_send_message(
             chat_id,
-            limit=20
+            "\n".join([
+                "GENIOSA 5.0",
+                "",
+                f"Telegram: {'OK' if TELEGRAM_BOT_TOKEN else 'NOT CONFIGURED'}",
+                f"Gemini: {'CONFIGURED' if status['gemini'] else 'NOT CONFIGURED'}",
+                f"Database: {'READY' if db_ok else 'ERROR'}",
+                f"Model: {GEMINI_MODEL}",
+                "Polling: RUNNING",
+            ])
         )
 
-        if not recent:
-            return "საუბრის ისტორია ჯერ არ არის."
+        return True
 
-        lines = [
-            "ბოლო საუბრის მოკლე ისტორია:"
-        ]
+    if command == "/facts":
 
-        for row in recent:
+        seed_system_facts(chat_id)
 
-            lines.append(
-                f"{row.get('role', '').upper()}: "
-                f"{row.get('message', '')}"
-            )
-
-        return "\n".join(lines)
-
-    confirm_match = re.match(
-        r"^/confirm_fact\s+(\d+)$",
-        stripped,
-        re.IGNORECASE
-    )
-
-    if confirm_match:
-
-        fact_id = int(
-            confirm_match.group(1)
-        )
-
-        if confirm_fact(
+        facts = get_facts(
             chat_id,
-            fact_id
-        ):
-            return (
-                f"ფაქტი #{fact_id} დადასტურებულია."
-            )
-
-        return (
-            f"ფაქტი #{fact_id} ვერ მოიძებნა."
+            limit=100
         )
 
-    reject_match = re.match(
-        r"^/reject_fact\s+(\d+)$",
-        stripped,
-        re.IGNORECASE
-    )
-
-    if reject_match:
-
-        fact_id = int(
-            reject_match.group(1)
-        )
-
-        if reject_fact(
+        telegram_send_message(
             chat_id,
-            fact_id
-        ):
-            return (
-                f"ფაქტი #{fact_id} უარყოფილია."
-            )
-
-        return (
-            f"ფაქტი #{fact_id} ვერ მოიძებნა."
+            "📋 დადასტურებული ფაქტები:\n\n"
+            + format_facts(facts)
         )
 
-    return None
+        return True
+
+    if command == "/memory":
+
+        seed_system_facts(chat_id)
+
+        memories = get_memories(
+            chat_id,
+            limit=50
+        )
+
+        telegram_send_message(
+            chat_id,
+            "🧠 შენახული მეხსიერება:\n\n"
+            + format_memories(memories)
+        )
+
+        return True
+
+    if command == "/projects":
+
+        try:
+
+            rows = db_execute(
+                """
+                SELECT name, description, status
+                FROM projects
+                WHERE chat_id=%s
+                ORDER BY id DESC
+                LIMIT 30
+                """,
+                (chat_id,),
+                fetch=True
+            ) or []
+
+            if not rows:
+                telegram_send_message(
+                    chat_id,
+                    "პროექტების ცალკე ჩანაწერები ჯერ არ მოიძებნა.\n\n"
+                    "თუმცა პროექტების დადასტურებული ფაქტები "
+                    "ხელმისაწვდომია /facts-ში."
+                )
+
+            else:
+
+                lines = []
+
+                for row in rows:
+
+                    lines.append(
+                        f"• {row.get('name') or 'Unnamed'}"
+                        f" — {row.get('status') or 'active'}"
+                    )
+
+                    if row.get("description"):
+                        lines.append(
+                            f"  {row['description']}"
+                        )
+
+                telegram_send_message(
+                    chat_id,
+                    "📁 პროექტები:\n\n"
+                    + "\n".join(lines)
+                )
+
+        except Exception as e:
+
+            log(
+                f"PROJECTS ERROR: {repr(e)}"
+            )
+
+            telegram_send_message(
+                chat_id,
+                "პროექტების მონაცემების წაკითხვა ვერ მოხერხდა."
+            )
+
+        return True
+
+    if command == "/tasks":
+
+        try:
+
+            rows = db_execute(
+                """
+                SELECT id, title, description, status, priority
+                FROM tasks
+                WHERE chat_id=%s
+                ORDER BY id DESC
+                LIMIT 30
+                """,
+                (chat_id,),
+                fetch=True
+            ) or []
+
+            if not rows:
+
+                telegram_send_message(
+                    chat_id,
+                    "დავალებები ჯერ არ არის შენახული."
+                )
+
+            else:
+
+                lines = []
+
+                for row in rows:
+
+                    lines.append(
+                        f"#{row['id']} "
+                        f"{row.get('title') or 'Untitled'} "
+                        f"[{row.get('status') or 'open'}]"
+                    )
+
+                telegram_send_message(
+                    chat_id,
+                    "📝 დავალებები:\n\n"
+                    + "\n".join(lines)
+                )
+
+        except Exception as e:
+
+            log(
+                f"TASKS ERROR: {repr(e)}"
+            )
+
+            telegram_send_message(
+                chat_id,
+                "დავალებების წაკითხვა ვერ მოხერხდა."
+            )
+
+        return True
+
+    if command == "/summary":
+
+        answer = answer_user(
+            chat_id,
+            "მომეცი ჩემი ბიზნესის, კომპანიისა და პროექტების მოკლე მიმდინარე შეჯამება მხოლოდ შენახული დადასტურებული ინფორმაციის მიხედვით."
+        )
+
+        telegram_send_message(
+            chat_id,
+            answer
+        )
+
+        return True
+
+    return False
 
 
 # ============================================================
-# USER MESSAGE PROCESSING
+# UPDATE PROCESSING
 # ============================================================
 
-def process_user_message(
-    chat_id,
-    user_text
-):
+def process_update(update):
+
     try:
 
+        message = update.get("message")
+
+        if not message:
+            return
+
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        if chat_id is None:
+            return
+
+        user = message.get("from") or {}
+
+        text = message.get("text")
+
+        if not text:
+            return
+
+        text = str(text).strip()
+
         log(
-            f"USER MESSAGE chat={chat_id}: "
-            f"{user_text[:500]}"
+            f"USER MESSAGE chat={chat_id}: {text[:500]}"
         )
 
-        # ----------------------------------------------------
-        # Make sure this chat has system knowledge.
-        #
-        # On already initialized chats this function performs
-        # one very cheap metadata query and immediately returns.
-        # ----------------------------------------------------
+        # Make sure system knowledge exists.
+        seed_system_facts(chat_id)
 
-        ensure_system_facts(chat_id)
+        # Commands.
+        if text.startswith("/"):
 
-        # ----------------------------------------------------
-        # SAVE USER MESSAGE
-        # ----------------------------------------------------
+            if handle_command(
+                chat_id,
+                text
+            ):
+                return
 
+        # Save user message.
         save_message(
             chat_id,
             "user",
-            user_text
+            text
         )
 
-        # ----------------------------------------------------
-        # MEMORY
-        #
-        # Only explicit memory requests are processed.
-        # Normal messages do NOT trigger Gemini extraction.
-        # ----------------------------------------------------
-
-        capture_memory(
+        # Explicit memory.
+        capture_explicit_memory(
             chat_id,
-            user_text
+            text
         )
 
-        # ----------------------------------------------------
-        # COMMAND
-        # ----------------------------------------------------
-
-        command_result = process_command(
+        # Lightweight direct fact capture.
+        capture_direct_company_fact(
             chat_id,
-            user_text
+            text
         )
 
-        if command_result is not None:
-
-            save_message(
-                chat_id,
-                "assistant",
-                command_result
-            )
-
-            send_message(
-                chat_id,
-                command_result
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # GEMINI
-        # ----------------------------------------------------
-
-        answer = generate_answer(
+        # Generate one answer.
+        answer = answer_user(
             chat_id,
-            user_text
+            text
         )
 
-        # ----------------------------------------------------
-        # SAVE ANSWER
-        # ----------------------------------------------------
-
+        # Save assistant answer.
         save_message(
             chat_id,
             "assistant",
             answer
         )
 
-        # ----------------------------------------------------
-        # SEND TELEGRAM
-        # ----------------------------------------------------
-
-        send_message(
+        telegram_send_message(
             chat_id,
             answer
         )
@@ -3039,271 +2219,167 @@ def process_user_message(
     except Exception as e:
 
         log(
-            f"PROCESS MESSAGE ERROR chat={chat_id}: "
-            f"{repr(e)}"
+            f"PROCESS UPDATE ERROR: {repr(e)}"
         )
 
         traceback.print_exc()
 
-        fallback = (
-            "ბოდიში, ტექნიკური შეცდომა დაფიქსირდა. "
-            "მონაცემები არ წაშლილა. "
-            "გთხოვ, იგივე კითხვა კიდევ ერთხელ გამომიგზავნე."
-        )
-
         try:
-            save_message(
-                chat_id,
-                "assistant",
-                fallback
-            )
 
-            send_message(
-                chat_id,
-                fallback
-            )
+            message = update.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
 
-        except Exception as send_error:
+            if chat_id:
 
-            log(
-                f"FALLBACK SEND ERROR: "
-                f"{repr(send_error)}"
-            )
+                telegram_send_message(
+                    chat_id,
+                    "დამუშვებისას ტექნიკური შეცდომა მოხდა. "
+                    "გთხოვ იგივე შეტყობინება კიდევ ერთხელ გამომიგზავნე."
+                )
+
+        except Exception:
+            pass
 
 
 # ============================================================
-# TELEGRAM UPDATE PROCESSING
+# POSTGRESQL POLLING LOCK
 # ============================================================
 
-def process_update(update):
+POLLING_LOCK_KEY = 735050
+
+
+def acquire_polling_lock():
+
+    conn = None
 
     try:
 
-        message = update.get(
-            "message"
+        conn = db_connection()
+
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT pg_try_advisory_lock(%s)",
+            (POLLING_LOCK_KEY,)
         )
 
-        if not message:
-            return
+        row = cur.fetchone()
 
-        chat = message.get(
-            "chat"
+        acquired = bool(
+            row and row[0]
         )
 
-        if not chat:
-            return
+        if acquired:
 
-        chat_id = chat.get(
-            "id"
+            log(
+                "POSTGRES POLLING LOCK ACQUIRED"
+            )
+
+            # IMPORTANT:
+            # Keep this connection open.
+            return conn
+
+        cur.close()
+        release_connection(conn)
+
+        log(
+            "ANOTHER GENIOSA INSTANCE OWNS "
+            "THE POLLING LOCK"
         )
 
-        if chat_id is None:
-            return
-
-        text = message.get(
-            "text"
-        )
-
-        if not text:
-            return
-
-        process_user_message(
-            chat_id,
-            text
-        )
+        return None
 
     except Exception as e:
 
         log(
-            f"UPDATE ERROR: {repr(e)}"
+            f"POLLING LOCK ERROR: {repr(e)}"
         )
+
+        if conn:
+            release_connection(conn)
+
+        return None
 
 
 # ============================================================
 # TELEGRAM POLLING
 # ============================================================
 
-def telegram_delete_webhook():
+def telegram_polling():
 
-    try:
+    log("GENIOSA 5.0 polling loop starting...")
 
-        telegram_call(
-            "deleteWebhook",
-            {
-                "drop_pending_updates": False
-            },
-            timeout=20
-        )
+    if not TELEGRAM_BOT_TOKEN:
 
         log(
-            "Telegram webhook cleared"
+            "POLLING DISABLED: TELEGRAM_BOT_TOKEN missing"
         )
 
-    except Exception as e:
+        return
 
-        log(
-            f"Webhook clear warning: {repr(e)}"
-        )
+    # Clear webhook before polling.
+    telegram_clear_webhook()
 
+    lock_connection = None
 
-def telegram_polling_loop():
+    # Wait until DB lock is available.
+    while lock_connection is None:
 
-    global last_update_id
-    global last_poll_error
+        lock_connection = acquire_polling_lock()
 
-    log(
-        f"GENIOSA {APP_VERSION} polling loop starting..."
-    )
+        if lock_connection is None:
+            time.sleep(10)
 
-    telegram_delete_webhook()
+    offset = 0
 
     while True:
 
         try:
 
-            payload = {
-                "timeout": TELEGRAM_TIMEOUT,
-                "allowed_updates": [
-                    "message"
-                ]
-            }
-
-            if last_update_id is not None:
-
-                payload["offset"] = (
-                    last_update_id + 1
-                )
-
-            result = telegram_call(
+            updates = telegram_call(
                 "getUpdates",
-                payload,
-                timeout=TELEGRAM_TIMEOUT + 10
+                {
+                    "offset": offset,
+                    "timeout": 30,
+                    "allowed_updates": [
+                        "message"
+                    ]
+                }
             )
 
-            updates = result.get(
-                "result",
-                []
-            )
-
-            last_poll_error = None
-
-            for update in updates:
+            for update in updates or []:
 
                 update_id = update.get(
                     "update_id"
                 )
 
                 if update_id is not None:
-                    last_update_id = update_id
+                    offset = update_id + 1
 
-                process_update(
-                    update
-                )
+                process_update(update)
 
         except Exception as e:
 
-            last_poll_error = repr(e)
+            message = str(e)
+
+            # Telegram 409 should never kill the application.
+            if "409" in message:
+
+                log(
+                    "TELEGRAM 409 CONFLICT — "
+                    "waiting before retry"
+                )
+
+                time.sleep(10)
+
+                continue
 
             log(
-                f"TELEGRAM POLLING ERROR: "
-                f"{repr(e)}"
+                f"POLLING LOOP ERROR: {repr(e)}"
             )
 
-            time.sleep(
-                min(
-                    10,
-                    POLL_SLEEP * 3
-                )
-            )
-
-        time.sleep(
-            POLL_SLEEP
-        )
-
-
-# ============================================================
-# GET KNOWN CHATS
-# ============================================================
-
-def get_known_chat_ids():
-
-    chat_ids = set()
-
-    try:
-
-        rows = db_execute(
-            """
-            SELECT DISTINCT chat_id
-            FROM messages
-            WHERE chat_id IS NOT NULL
-            """,
-            fetch=True
-        )
-
-        for row in rows or []:
-
-            if row["chat_id"] is not None:
-                chat_ids.add(
-                    int(row["chat_id"])
-                )
-
-    except Exception as e:
-
-        log(
-            f"KNOWN CHATS messages error: {repr(e)}"
-        )
-
-    try:
-
-        rows = db_execute(
-            """
-            SELECT DISTINCT chat_id
-            FROM facts
-            WHERE chat_id IS NOT NULL
-            """,
-            fetch=True
-        )
-
-        for row in rows or []:
-
-            if row["chat_id"] is not None:
-                chat_ids.add(
-                    int(row["chat_id"])
-                )
-
-    except Exception as e:
-
-        log(
-            f"KNOWN CHATS facts error: {repr(e)}"
-        )
-
-    try:
-
-        rows = db_execute(
-            """
-            SELECT DISTINCT chat_id
-            FROM memories
-            WHERE chat_id IS NOT NULL
-            """,
-            fetch=True
-        )
-
-        for row in rows or []:
-
-            if row["chat_id"] is not None:
-                chat_ids.add(
-                    int(row["chat_id"])
-                )
-
-    except Exception as e:
-
-        log(
-            f"KNOWN CHATS memories error: {repr(e)}"
-        )
-
-    return sorted(
-        chat_ids
-    )
+            time.sleep(5)
 
 
 # ============================================================
@@ -3312,9 +2388,6 @@ def get_known_chat_ids():
 
 def startup_worker():
 
-    global startup_completed
-    global polling_started
-
     try:
 
         log(
@@ -3322,80 +2395,53 @@ def startup_worker():
         )
 
         log(
-            "CONFIG: "
-            f"telegram={bool(TELEGRAM_BOT_TOKEN)}, "
-            f"gemini={bool(GEMINI_API_KEY)}, "
-            f"database={bool(DATABASE_URL)}, "
-            f"model={GEMINI_MODEL}"
+            f"CONFIG: {config_status()}"
         )
 
-        # ----------------------------------------------------
-        # DATABASE
-        # ----------------------------------------------------
+        migrate_database()
 
-        init_db()
+        # Seed all known existing chat IDs.
+        try:
 
-        log(
-            "DATABASE READY"
-        )
+            rows = db_execute(
+                """
+                SELECT DISTINCT chat_id
+                FROM messages
+                WHERE chat_id IS NOT NULL
+                ORDER BY chat_id
+                """,
+                fetch=True
+            ) or []
 
-        # ----------------------------------------------------
-        # EXISTING CHATS
-        # ----------------------------------------------------
-
-        chat_ids = get_known_chat_ids()
-
-        log(
-            f"KNOWN CHAT IDS: {chat_ids}"
-        )
-
-        # Seed only once/version.
-        for chat_id in chat_ids:
-
-            try:
-
-                ensure_system_facts(
-                    chat_id
-                )
-
-            except Exception as e:
-
-                log(
-                    f"SEED EXISTING CHAT ERROR "
-                    f"{chat_id}: {repr(e)}"
-                )
-
-        # ----------------------------------------------------
-        # TELEGRAM POLLING
-        # ----------------------------------------------------
-
-        if not TELEGRAM_BOT_TOKEN:
+            chat_ids = [
+                int(row["chat_id"])
+                for row in rows
+            ]
 
             log(
-                "TELEGRAM TOKEN NOT SET"
+                f"KNOWN CHAT IDS: {chat_ids}"
             )
 
-        else:
+            for chat_id in chat_ids:
+                seed_system_facts(chat_id)
 
-            with polling_lock:
+        except Exception as e:
 
-                if not polling_started:
+            log(
+                f"EXISTING CHAT SEED WARNING: {repr(e)}"
+            )
 
-                    thread = threading.Thread(
-                        target=telegram_polling_loop,
-                        daemon=True,
-                        name="geniosa-telegram-polling"
-                    )
+        thread = threading.Thread(
+            target=telegram_polling,
+            daemon=True,
+            name="geniosa-telegram-polling"
+        )
 
-                    thread.start()
+        thread.start()
 
-                    polling_started = True
-
-                    log(
-                        "Telegram polling thread started."
-                    )
-
-        startup_completed = True
+        log(
+            "Telegram polling thread started."
+        )
 
         log(
             f"GENIOSA {APP_VERSION} STARTUP COMPLETE"
@@ -3410,12 +2456,8 @@ def startup_worker():
         traceback.print_exc()
 
 
-# ============================================================
-# FASTAPI STARTUP
-# ============================================================
-
 @app.on_event("startup")
-def startup_event():
+def on_startup():
 
     thread = threading.Thread(
         target=startup_worker,
@@ -3427,32 +2469,20 @@ def startup_event():
 
 
 # ============================================================
-# FASTAPI SHUTDOWN
-# ============================================================
-
-@app.on_event("shutdown")
-def shutdown_event():
-
-    log(
-        "GENIOSA SHUTDOWN"
-    )
-
-    close_db_pool()
-
-
-# ============================================================
-# HTTP ROUTES
+# HTTP ENDPOINTS
 # ============================================================
 
 @app.get("/")
 def root():
 
     return {
-        "service": "GENIOSA",
+        "name": "GENIOSA",
         "version": APP_VERSION,
         "status": "online",
-        "database": database_ready,
-        "polling": polling_started
+        "telegram": bool(TELEGRAM_BOT_TOKEN),
+        "gemini": bool(GEMINI_API_KEY),
+        "database": bool(DATABASE_URL),
+        "model": GEMINI_MODEL
     }
 
 
@@ -3463,46 +2493,36 @@ def root_head():
 
 
 @app.get("/health")
-def http_health():
+def health():
 
-    database_status = False
+    database = False
 
-    if database_ready:
+    try:
 
-        try:
+        db_execute(
+            "SELECT 1",
+            fetchone=True
+        )
 
-            row = db_execute(
-                "SELECT 1 AS ok",
-                fetchone=True
-            )
+        database = True
 
-            database_status = bool(
-                row and row["ok"] == 1
-            )
-
-        except Exception:
-            database_status = False
+    except Exception:
+        database = False
 
     return {
-        "service": "GENIOSA",
+        "name": "GENIOSA",
         "version": APP_VERSION,
-        "status": "online",
-        "database": database_status,
-        "telegram_configured": bool(
-            TELEGRAM_BOT_TOKEN
-        ),
-        "gemini_configured": bool(
-            GEMINI_API_KEY
-        ),
+        "telegram": bool(TELEGRAM_BOT_TOKEN),
+        "gemini": bool(GEMINI_API_KEY),
+        "database": database,
         "model": GEMINI_MODEL,
-        "polling_started": polling_started,
-        "startup_completed": startup_completed,
-        "last_poll_error": last_poll_error
+        "polling": True,
+        "startup": True
     }
 
 
 # ============================================================
-# LOCAL RUN
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
