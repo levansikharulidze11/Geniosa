@@ -1,25 +1,7 @@
-
 # ============================================================
 # GENIOSA 6.0
 # Personal Business Advisor
 # Telegram + Gemini + PostgreSQL + FastAPI
-#
-# Features:
-# - Persistent PostgreSQL storage
-# - Additive-only schema migration
-# - Legacy database compatibility
-# - Fix for required memories.category column
-# - Conversation history
-# - Facts, memories, projects, decisions, tasks
-# - Financial conflict records
-# - Gemini AI responses
-# - Optional Google Search grounding
-# - Telegram polling
-# - Health endpoint
-#
-# IMPORTANT:
-# Existing PostgreSQL records are preserved.
-# No DROP TABLE, TRUNCATE, or destructive migration.
 # ============================================================
 
 import os
@@ -27,7 +9,8 @@ import re
 import json
 import time
 import threading
-import traceback
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
@@ -36,31 +19,26 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 APP_VERSION = "GENIOSA 6.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
 GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
+    "GEMINI_MODEL", "gemini-3.5-flash-lite"
 ).strip()
-
-GENIOSA_OWNER_ID = os.getenv(
-    "GENIOSA_OWNER_ID",
-    ""
-).strip()
+GENIOSA_OWNER_ID = os.getenv("GENIOSA_OWNER_ID", "").strip()
 
 ENABLE_GOOGLE_SEARCH = os.getenv(
-    "ENABLE_GOOGLE_SEARCH",
-    "true"
+    "ENABLE_GOOGLE_SEARCH", "true"
 ).lower() in ("1", "true", "yes", "on")
+
+HTTP_TIMEOUT = 45
+POLL_TIMEOUT = 25
+MAX_TELEGRAM_LENGTH = 3900
+
+POLL_LOCK_KEY_1 = 621047
+POLL_LOCK_KEY_2 = 603006
 
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -72,10 +50,6 @@ GEMINI_API = (
     f"models/{GEMINI_MODEL}:generateContent"
 )
 
-HTTP_TIMEOUT = 45
-TELEGRAM_POLL_TIMEOUT = 25
-MAX_TELEGRAM_LENGTH = 3900
-
 app = FastAPI(
     title=APP_VERSION,
     description="Personal Business Advisor",
@@ -83,75 +57,58 @@ app = FastAPI(
 )
 
 stop_event = threading.Event()
-polling_thread = None
 polling_lock = threading.Lock()
+polling_thread = None
 
 LAST_ERROR = ""
 LAST_GEMINI_OK = False
 LAST_WEB_SEARCH_USED = False
 LAST_GEMINI_CHECK = None
 LAST_TELEGRAM_UPDATE = None
+
 BOT_USERNAME = ""
 BOT_ID = None
 
-
-# ============================================================
-# SYSTEM INSTRUCTIONS
-# ============================================================
-
 SYSTEM_INSTRUCTIONS = """
-You are GENIOSA 6.0, a personal business advisor and economic
-analyst for the owner of SAMTISI CONSTRUCTION LLC.
+You are GENIOSA 6.0, the personal business advisor and economic
+analyst for SAMTISI CONSTRUCTION LLC.
 
-CORE RULES:
-
-1. Be accurate, factual, and transparent.
-2. Never invent facts, financial results, sources, legal rules,
-   investor commitments, market prices, or completed actions.
-3. Clearly distinguish:
-   - facts supplied by the user;
-   - information verified using external sources;
-   - estimates and assumptions;
-   - unknown or unverified information.
-4. If you do not know something, say so directly.
-5. Never present an estimate as a confirmed fact.
-6. Check financial calculations carefully and show the formula
-   when it helps the user.
-7. For development projects, consider construction costs,
-   financing, taxes, timelines, cash flow, sales, rental income,
-   risk, and investor returns when relevant.
-8. Do not claim to have saved a memory unless the application
-   confirms that the database write succeeded.
-9. Do not claim that a web search occurred unless search was
-   actually used successfully and source information is available.
-10. For legal, tax, regulatory, or investment matters, explain
-    uncertainty and recommend verification against current
-    authoritative sources where appropriate.
-11. User-provided project figures are not automatically verified
-    market facts.
-12. Reply in the user's language. If the user writes in Georgian,
-    answer in Georgian.
-13. Preserve the distinction between project facts, decisions,
-    tasks, and tentative proposals.
-14. Do not disclose API keys, passwords, or environment variables.
-15. Never claim you executed an external action unless it actually
-    succeeded.
+RULES:
+1. Be accurate, factual and transparent.
+2. Never invent facts, prices, financial results, sources or actions.
+3. Distinguish user-provided facts, verified information, estimates,
+   assumptions and unknown information.
+4. Check financial calculations and show formulas where useful.
+5. Consider construction costs, financing, taxes, timelines, cash flow,
+   sales, rental income, risks and investor returns when relevant.
+6. Never claim information was saved unless the database write succeeded.
+7. Never claim a web search occurred unless grounding metadata confirms it.
+8. For legal, tax and regulatory matters, recommend checking current
+   authoritative sources where appropriate.
+9. Treat stored user information as context, not independently verified fact.
+10. Reply in the user's language. Georgian questions require Georgian answers.
+11. Keep facts, decisions, tasks and tentative proposals distinct.
+12. Never disclose API keys, passwords or environment variables.
+13. Never claim an external action succeeded unless it actually did.
 """
 
 
 # ============================================================
-# GENERAL UTILITIES
+# UTILITIES
 # ============================================================
 
 def log(message):
-    timestamp = datetime.now(timezone.utc).isoformat()
-    print(f"[{APP_VERSION} {timestamp}] {message}", flush=True)
+    print(
+        f"[{APP_VERSION} "
+        f"{datetime.now(timezone.utc).isoformat()}] {message}",
+        flush=True
+    )
 
 
 def record_error(message):
     global LAST_ERROR
     LAST_ERROR = str(message)[:3000]
-    log(f"ERROR: {LAST_ERROR}")
+    log("ERROR: " + LAST_ERROR)
 
 
 def now_utc():
@@ -177,30 +134,35 @@ def parse_chat_id(value):
 
 
 def is_owner(chat_id):
-    if not GENIOSA_OWNER_ID:
-        return True
-
-    return str(chat_id) == GENIOSA_OWNER_ID
+    # Set GENIOSA_OWNER_ID in Render for private access.
+    return (
+        not GENIOSA_OWNER_ID
+        or str(chat_id) == GENIOSA_OWNER_ID
+    )
 
 
 # ============================================================
-# DATABASE CONNECTION
+# POSTGRESQL
 # ============================================================
 
 def db_connect():
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is missing"
-        )
+        raise RuntimeError("DATABASE_URL is missing")
 
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=15,
-        cursor_factory=RealDictCursor
+        cursor_factory=RealDictCursor,
+        application_name="geniosa-6.0"
     )
 
 
-def db_execute(query, params=None, fetchone=False, fetchall=False):
+def db_execute(
+    query,
+    params=None,
+    fetchone=False,
+    fetchall=False
+):
     conn = None
 
     try:
@@ -224,20 +186,16 @@ def db_execute(query, params=None, fetchone=False, fetchall=False):
 
 
 def get_table_columns(table_name):
-    """
-    Return metadata for a table that exists in the current schema.
+    if not re.fullmatch(
+        r"[a-zA-Z_][a-zA-Z0-9_]*",
+        table_name
+    ):
+        raise ValueError("Invalid table name")
 
-    Metadata is used to support older database schemas without
-    assuming every installation has identical column names.
-    """
     rows = db_execute(
         """
-        SELECT
-            column_name,
-            is_nullable,
-            column_default,
-            data_type,
-            udt_name
+        SELECT column_name, is_nullable, column_default,
+               data_type, udt_name, is_identity, is_generated
         FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND table_name = %s
@@ -247,37 +205,16 @@ def get_table_columns(table_name):
         fetchall=True
     )
 
-    return {row["column_name"]: row for row in rows}
+    return {
+        row["column_name"]: row
+        for row in rows
+    }
 
-
-def table_exists(table_name):
-    row = db_execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-        ) AS present
-        """,
-        (table_name,),
-        fetchone=True
-    )
-
-    return bool(row and row["present"])
-
-
-# ============================================================
-# ADDITIVE DATABASE MIGRATION
-# ============================================================
 
 def migrate_database():
-    """
-    Creates missing tables and adds missing columns only.
-    It does not delete or truncate existing records.
-    """
+    # Additive-only migration. No DROP, TRUNCATE or DELETE.
 
-    statements = [
+    create_statements = [
         """
         CREATE TABLE IF NOT EXISTS messages (
             id BIGSERIAL PRIMARY KEY,
@@ -370,11 +307,8 @@ def migrate_database():
         """
     ]
 
-    for statement in statements:
+    for statement in create_statements:
         db_execute(statement)
-
-    # Additive migrations for older tables.
-    # IF NOT EXISTS ensures existing columns are not overwritten.
 
     additions = {
         "messages": {
@@ -443,67 +377,65 @@ def migrate_database():
     }
 
     for table_name, columns in additions.items():
-        for column_name, column_type in columns.items():
-            # Names/types here come from this static dictionary,
-            # not from user input.
+        for column_name, definition in columns.items():
             db_execute(
-                f"""
-                ALTER TABLE "{table_name}"
-                ADD COLUMN IF NOT EXISTS "{column_name}" {column_type}
-                """
+                f'ALTER TABLE "{table_name}" '
+                f'ADD COLUMN IF NOT EXISTS "{column_name}" '
+                f'{definition}'
             )
 
-    log("Schema migration completed (additive only)")
+    log("Additive database migration completed")
 
 
 # ============================================================
-# LEGACY-COMPATIBLE INSERT
+# LEGACY DATABASE INSERTS
 # ============================================================
 
-def infer_required_value(column_name, values, table_name):
-    """
-    Supplies a safe value for known legacy required columns.
-    Unknown required columns are reported rather than silently
-    inserting fabricated business data.
-    """
+ALIASES = {
+    "chat_id": ("chat_id", "user_id", "telegram_id"),
+    "user_id": ("user_id", "chat_id", "telegram_id"),
+    "telegram_id": ("telegram_id", "chat_id", "user_id"),
+    "content": ("content", "text", "memory", "message", "details"),
+    "text": ("text", "content", "memory", "message", "details"),
+    "memory": ("memory", "content", "text", "message", "details"),
+    "message": ("message", "text", "content"),
+    "category": ("category", "memory_type", "type"),
+    "memory_type": ("memory_type", "category", "type"),
+    "type": ("type", "memory_type", "category"),
+    "role": ("role",),
+    "importance": ("importance",),
+    "status": ("status",),
+    "name": ("name", "project_name", "subject"),
+    "project_name": ("project_name", "name", "subject"),
+    "subject": ("subject", "name"),
+    "key": ("key",),
+    "value": ("value", "content", "text"),
+    "old_value": ("old_value",),
+    "new_value": ("new_value",),
+    "details": ("details", "content", "text"),
+    "event_type": ("event_type", "type"),
+    "due_date": ("due_date",),
+}
 
+
+def infer_required_value(column_name, values):
     name = column_name.lower()
 
-    aliases = {
-        "chat_id": ("chat_id", "user_id", "telegram_id"),
-        "user_id": ("user_id", "chat_id", "telegram_id"),
-        "telegram_id": ("telegram_id", "chat_id", "user_id"),
-        "content": ("content", "text", "memory", "message", "details"),
-        "text": ("text", "content", "memory", "message", "details"),
-        "memory": ("memory", "content", "text", "message", "details"),
-        "message": ("message", "text", "content"),
-        "category": ("category", "memory_type", "type"),
-        "memory_type": ("memory_type", "category", "type"),
-        "type": ("type", "memory_type", "category"),
-        "role": ("role",),
-        "importance": ("importance",),
-        "status": ("status",),
-        "name": ("name", "project_name", "subject"),
-        "project_name": ("project_name", "name", "subject"),
-        "subject": ("subject", "name"),
-        "key": ("key",),
-        "value": ("value", "content", "text"),
-        "old_value": ("old_value",),
-        "new_value": ("new_value",),
-        "details": ("details", "content", "text"),
-        "event_type": ("event_type", "type"),
-        "due_date": ("due_date",),
-    }
-
-    for candidate in aliases.get(name, ()):
+    for candidate in ALIASES.get(name, ()):
         if candidate in values and values[candidate] is not None:
             return values[candidate]
 
-    if name in ("created_at", "updated_at", "timestamp", "date"):
+    if name in (
+        "created_at", "updated_at", "timestamp", "date"
+    ):
         return now_utc()
 
     if name in ("category", "memory_type", "type"):
-        return values.get("memory_type", "general")
+        return (
+            values.get("memory_type")
+            or values.get("category")
+            or "general"
+        )
 
     if name == "importance":
         return 5
@@ -512,7 +444,7 @@ def infer_required_value(column_name, values, table_name):
         return values.get("role", "system")
 
     if name == "status":
-        return "recorded"
+        return values.get("status", "recorded")
 
     if name in ("chat_id", "user_id", "telegram_id"):
         return values.get("chat_id") or values.get("user_id")
@@ -526,43 +458,37 @@ def infer_required_value(column_name, values, table_name):
             or values.get("details")
         )
 
-    # Never invent a value for an unknown required legacy field.
     return None
 
 
 def dynamic_insert(table_name, values):
-    """
-    Insert values using only columns that actually exist.
-
-    Required legacy columns are detected from PostgreSQL metadata.
-    The memories.category issue is explicitly supported.
-    """
-
-    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", table_name):
+    if not re.fullmatch(
+        r"[a-zA-Z_][a-zA-Z0-9_]*",
+        table_name
+    ):
         raise ValueError("Invalid table name")
 
     metadata = get_table_columns(table_name)
 
     if not metadata:
         raise RuntimeError(
-            f"Table '{table_name}' does not exist or has no visible columns"
+            f"Table '{table_name}' does not exist"
         )
 
-    payload = {}
+    payload = {
+        key: value
+        for key, value in values.items()
+        if key in metadata and value is not None
+    }
 
-    # Keep only supplied columns that exist in the actual table.
-    for key, value in values.items():
-        if key in metadata and value is not None:
-            payload[key] = value
-
-    # Compatibility fix for the confirmed GENIOSA 5.9 error.
     if table_name == "memories" and "category" in metadata:
         payload.setdefault(
             "category",
-            values.get("memory_type") or values.get("category") or "general"
+            values.get("memory_type")
+            or values.get("category")
+            or "general"
         )
 
-    # Populate all known non-nullable legacy columns that lack defaults.
     for column_name, info in metadata.items():
         if column_name in payload:
             continue
@@ -573,50 +499,55 @@ def dynamic_insert(table_name, values):
         if info["column_default"] is not None:
             continue
 
+        if info.get("is_identity") == "YES":
+            continue
+
+        if info.get("is_generated") == "ALWAYS":
+            continue
+
         value = infer_required_value(
             column_name,
-            {**values, **payload},
-            table_name
+            {**values, **payload}
         )
 
         if value is not None:
             payload[column_name] = value
-            continue
-
-        # Serial/identity columns should normally have defaults.
-        if column_name.lower() in ("id", "pk"):
-            continue
-
-        raise RuntimeError(
-            f"Required legacy column {table_name}.{column_name} "
-            "has no supplied value"
-        )
+        else:
+            raise RuntimeError(
+                f"Required legacy column {table_name}."
+                f"{column_name} has no compatible value"
+            )
 
     if not payload:
         raise RuntimeError(
-            f"No compatible values supplied for table '{table_name}'"
+            f"No compatible values for table '{table_name}'"
         )
 
     columns = list(payload.keys())
 
-    for col in columns:
-        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", col):
+    for column in columns:
+        if not re.fullmatch(
+            r"[a-zA-Z_][a-zA-Z0-9_]*",
+            column
+        ):
             raise ValueError("Invalid column name")
 
-    quoted_columns = ", ".join(f'"{col}"' for col in columns)
-    placeholders = ", ".join(["%s"] * len(columns))
-    params = [payload[col] for col in columns]
-
-    query = (
-        f'INSERT INTO "{table_name}" ({quoted_columns}) '
-        f'VALUES ({placeholders}) RETURNING *'
+    column_sql = ", ".join(
+        f'"{column}"' for column in columns
     )
+    placeholders = ", ".join(["%s"] * len(columns))
+    params = [payload[column] for column in columns]
 
-    return db_execute(query, params, fetchone=True)
+    return db_execute(
+        f'INSERT INTO "{table_name}" '
+        f'({column_sql}) VALUES ({placeholders}) RETURNING *',
+        params,
+        fetchone=True
+    )
 
 
 # ============================================================
-# CONVERSATION HISTORY
+# MESSAGES AND MEMORY
 # ============================================================
 
 def save_message(chat_id, role, content):
@@ -629,6 +560,7 @@ def save_message(chat_id, role, content):
             {
                 "chat_id": chat_id,
                 "user_id": chat_id,
+                "telegram_id": chat_id,
                 "role": role,
                 "message": content,
                 "text": content,
@@ -639,14 +571,14 @@ def save_message(chat_id, role, content):
         return True
 
     except Exception as exc:
-        record_error(f"save_message: {type(exc).__name__}: {exc}")
+        record_error(f"save_message: {exc}")
         return False
 
 
 def get_recent_messages(chat_id, limit=12):
     metadata = get_table_columns("messages")
 
-    if "chat_id" not in metadata:
+    if "chat_id" not in metadata or "role" not in metadata:
         return []
 
     content_column = next(
@@ -657,7 +589,7 @@ def get_recent_messages(chat_id, limit=12):
         None
     )
 
-    if not content_column or "role" not in metadata:
+    if not content_column:
         return []
 
     order_column = (
@@ -666,39 +598,41 @@ def get_recent_messages(chat_id, limit=12):
         else None
     )
 
-    order_sql = f'"{order_column}" DESC' if order_column else "1 DESC"
+    order_sql = (
+        f'"{order_column}" DESC'
+        if order_column else "1 DESC"
+    )
 
     rows = db_execute(
-        f"""
-        SELECT role, "{content_column}" AS content
-        FROM messages
-        WHERE chat_id = %s
-        ORDER BY {order_sql}
-        LIMIT %s
-        """,
+        f'SELECT role, "{content_column}" AS content '
+        f'FROM messages WHERE chat_id = %s '
+        f'ORDER BY {order_sql} LIMIT %s',
         (chat_id, limit),
         fetchall=True
     )
 
     rows.reverse()
+    result = []
 
-    return [
-        {
-            "role": (
-                "model" if row.get("role") in ("assistant", "model")
-                else "user" if row.get("role") == "user"
-                else "model"
-            ),
-            "parts": [{"text": str(row.get("content") or "")}]
-        }
-        for row in rows
-        if row.get("content")
-    ]
+    for row in rows:
+        content = str(row.get("content") or "").strip()
 
+        if not content:
+            continue
 
-# ============================================================
-# PERSISTENT MEMORIES
-# ============================================================
+        role = (
+            "model"
+            if row.get("role") in ("assistant", "model", "system")
+            else "user"
+        )
+
+        result.append({
+            "role": role,
+            "parts": [{"text": content}]
+        })
+
+    return result
+
 
 def save_memory(
     chat_id,
@@ -706,15 +640,11 @@ def save_memory(
     memory_type="general",
     importance=5
 ):
-    """
-    Saves memory and explicitly supplies category for legacy schemas.
-    Returns True only if the memory insert succeeded.
-    """
+    content = str(content or "").strip()
 
-    if not content or not str(content).strip():
+    if not content:
         return False
 
-    content = str(content).strip()
     memory_type = str(memory_type or "general")[:100]
 
     try:
@@ -730,7 +660,9 @@ def save_memory(
                 "content": content,
                 "text": content,
                 "memory": content,
-                "importance": max(1, min(10, int(importance))),
+                "importance": max(
+                    1, min(10, int(importance))
+                ),
                 "created_at": now_utc(),
             }
         )
@@ -749,18 +681,14 @@ def save_memory(
                     "created_at": now_utc(),
                 }
             )
-        except Exception as event_exc:
-            # The memory itself was saved. An event-log failure must
-            # not falsely report that the memory insert failed.
-            log(f"memory_events warning: {event_exc}")
+        except Exception as exc:
+            log(f"memory_events warning: {exc}")
 
-        log(f"Memory saved successfully for chat_id={chat_id}")
+        log(f"Memory saved for chat_id={chat_id}")
         return True
 
     except Exception as exc:
-        record_error(
-            f"save_memory: {type(exc).__name__}: {exc}"
-        )
+        record_error(f"save_memory: {exc}")
         return False
 
 
@@ -787,16 +715,15 @@ def get_memories(chat_id, limit=25):
         else None
     )
 
-    order_sql = f'"{order_column}" DESC' if order_column else "1 DESC"
+    order_sql = (
+        f'"{order_column}" DESC'
+        if order_column else "1 DESC"
+    )
 
     rows = db_execute(
-        f"""
-        SELECT "{content_column}" AS content
-        FROM memories
-        WHERE chat_id = %s
-        ORDER BY {order_sql}
-        LIMIT %s
-        """,
+        f'SELECT "{content_column}" AS content '
+        f'FROM memories WHERE chat_id = %s '
+        f'ORDER BY {order_sql} LIMIT %s',
         (chat_id, limit),
         fetchall=True
     )
@@ -828,14 +755,20 @@ def get_facts(chat_id, limit=50):
     if "chat_id" not in metadata:
         return []
 
+    order_column = (
+        "created_at" if "created_at" in metadata
+        else "id" if "id" in metadata
+        else None
+    )
+
+    order_sql = (
+        f'"{order_column}" DESC'
+        if order_column else "1 DESC"
+    )
+
     rows = db_execute(
-        """
-        SELECT *
-        FROM facts
-        WHERE chat_id = %s
-        ORDER BY id DESC
-        LIMIT %s
-        """,
+        f'SELECT * FROM facts WHERE chat_id = %s '
+        f'ORDER BY {order_sql} LIMIT %s',
         (chat_id, limit),
         fetchall=True
     )
@@ -853,10 +786,6 @@ def get_facts(chat_id, limit=50):
 
     return result
 
-
-# ============================================================
-# PROJECTS, DECISIONS, TASKS
-# ============================================================
 
 def save_project(chat_id, name, content, status="active"):
     return dynamic_insert(
@@ -900,10 +829,6 @@ def save_task(chat_id, content, due_date=None):
     )
 
 
-# ============================================================
-# FINANCIAL CONFLICT RECORDS
-# ============================================================
-
 def save_financial_conflict(
     chat_id,
     subject,
@@ -926,10 +851,6 @@ def save_financial_conflict(
     )
 
 
-# ============================================================
-# GEMINI AI
-# ============================================================
-
 def build_context(chat_id):
     sections = []
 
@@ -937,10 +858,10 @@ def build_context(chat_id):
         facts = get_facts(chat_id)
         if facts:
             sections.append(
-                "SAVED FACTS:\n" + "\n".join(facts[-40:])
+                "SAVED FACTS:\n" + "\n".join(facts[-35:])
             )
     except Exception as exc:
-        log(f"Could not load facts: {exc}")
+        log(f"Load facts warning: {exc}")
 
     try:
         memories = get_memories(chat_id)
@@ -949,13 +870,48 @@ def build_context(chat_id):
                 "SAVED MEMORIES:\n" + "\n".join(memories[-20:])
             )
     except Exception as exc:
-        log(f"Could not load memories: {exc}")
+        log(f"Load memories warning: {exc}")
 
     return "\n\n".join(sections)
 
 
+# ============================================================
+# GEMINI AI AND GOOGLE SEARCH GROUNDING
+# ============================================================
+
+def extract_gemini_text(data):
+    candidates = data.get("candidates") or []
+
+    if not candidates:
+        return ""
+
+    parts = (
+        (candidates[0].get("content") or {}).get("parts") or []
+    )
+
+    return "\n".join(
+        part["text"]
+        for part in parts
+        if part.get("text")
+    ).strip()
+
+
+def response_has_grounding(data):
+    for candidate in data.get("candidates") or []:
+        metadata = candidate.get("groundingMetadata") or {}
+
+        if (
+            metadata.get("groundingChunks")
+            or metadata.get("webSearchQueries")
+        ):
+            return True
+
+    return False
+
+
 def call_gemini(chat_id, user_text):
-    global LAST_GEMINI_OK, LAST_WEB_SEARCH_USED
+    global LAST_GEMINI_OK
+    global LAST_WEB_SEARCH_USED
     global LAST_GEMINI_CHECK
 
     if not GEMINI_API_KEY:
@@ -963,21 +919,22 @@ def call_gemini(chat_id, user_text):
 
     contents = get_recent_messages(chat_id)
 
-    # The current message is saved before the AI call.
-    # Avoid duplicating it in the conversation history.
-    while contents and contents[-1]["parts"][0]["text"] == user_text:
+    # Current user message was already saved.
+    if (
+        contents
+        and contents[-1]["role"] == "user"
+        and contents[-1]["parts"][0]["text"] == user_text
+    ):
         contents.pop()
 
     context = build_context(chat_id)
-
     system_text = SYSTEM_INSTRUCTIONS
 
     if context:
         system_text += (
-            "\n\nRELEVANT STORED INFORMATION:\n"
+            "\n\nSAVED USER CONTEXT "
+            "(not independently verified):\n"
             + context
-            + "\n\nUse these records as user-provided context, "
-              "not automatically as independently verified facts."
         )
 
     contents.append({
@@ -1003,8 +960,6 @@ def call_gemini(chat_id, user_text):
 
     LAST_WEB_SEARCH_USED = False
 
-    # Try Google Search grounding first if enabled.
-    # If the model/API rejects the tool, retry without it.
     if ENABLE_GOOGLE_SEARCH:
         search_payload = dict(payload)
         search_payload["tools"] = [{"google_search": {}}]
@@ -1027,10 +982,11 @@ def call_gemini(chat_id, user_text):
                     LAST_WEB_SEARCH_USED = response_has_grounding(data)
                     return answer
 
-            log(
-                "Gemini Search attempt did not succeed; "
-                "retrying without Search."
-            )
+            else:
+                log(
+                    f"Gemini Search HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
 
         except Exception as exc:
             log(f"Gemini Search attempt failed: {exc}")
@@ -1045,7 +1001,7 @@ def call_gemini(chat_id, user_text):
     if not response.ok:
         raise RuntimeError(
             f"Gemini HTTP {response.status_code}: "
-            f"{response.text[:1500]}"
+            f"{response.text[:1200]}"
         )
 
     data = response.json()
@@ -1053,7 +1009,7 @@ def call_gemini(chat_id, user_text):
 
     if not answer:
         raise RuntimeError(
-            "Gemini returned no text: " + safe_json(data)[:1200]
+            "Gemini returned no text: " + safe_json(data)[:1000]
         )
 
     LAST_GEMINI_OK = True
@@ -1061,38 +1017,6 @@ def call_gemini(chat_id, user_text):
     LAST_WEB_SEARCH_USED = response_has_grounding(data)
 
     return answer
-
-
-def extract_gemini_text(data):
-    candidates = data.get("candidates") or []
-
-    if not candidates:
-        return ""
-
-    candidate = candidates[0]
-    content = candidate.get("content") or {}
-    parts = content.get("parts") or []
-
-    chunks = []
-
-    for part in parts:
-        text_value = part.get("text")
-        if text_value:
-            chunks.append(text_value)
-
-    return "\n".join(chunks).strip()
-
-
-def response_has_grounding(data):
-    for candidate in data.get("candidates") or []:
-        metadata = candidate.get("groundingMetadata") or {}
-        if (
-            metadata.get("groundingChunks")
-            or metadata.get("webSearchQueries")
-        ):
-            return True
-
-    return False
 
 
 # ============================================================
@@ -1131,7 +1055,6 @@ def send_message(chat_id, text):
     if not text:
         text = "პასუხის ტექსტი ვერ შეიქმნა. სცადე ხელახლა."
 
-    # Telegram messages have a maximum length.
     chunks = [
         text[i:i + MAX_TELEGRAM_LENGTH]
         for i in range(0, len(text), MAX_TELEGRAM_LENGTH)
@@ -1150,6 +1073,35 @@ def send_message(chat_id, text):
     return True
 
 
+def send_document(chat_id, path, caption=""):
+    with open(path, "rb") as handle:
+        response = requests.post(
+            f"{TELEGRAM_API}/sendDocument",
+            data={
+                "chat_id": str(chat_id),
+                "caption": str(caption)[:900]
+            },
+            files={
+                "document": (Path(path).name, handle)
+            },
+            timeout=HTTP_TIMEOUT
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise RuntimeError(
+            f"Telegram sendDocument HTTP {response.status_code}"
+        )
+
+    if not response.ok or not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram sendDocument failed: {safe_json(data)[:1000]}"
+        )
+
+    return True
+
+
 def get_bot_info():
     global BOT_USERNAME, BOT_ID
 
@@ -1161,7 +1113,131 @@ def get_bot_info():
 
 
 # ============================================================
-# BOT COMMANDS
+# DOCUMENT GENERATION
+# ============================================================
+
+def create_document(file_type, title, body):
+    file_type = file_type.lower().strip()
+
+    safe_title = re.sub(
+        r"[^a-zA-Z0-9ა-ჰ_-]+",
+        "_",
+        title
+    ).strip("_")[:60] or "geniosa_document"
+
+    temp_dir = tempfile.mkdtemp(prefix="geniosa_")
+    path = os.path.join(
+        temp_dir,
+        f"{safe_title}.{file_type}"
+    )
+
+    lines = body.splitlines() or [body]
+
+    if file_type == "docx":
+        from docx import Document
+
+        document = Document()
+        document.add_heading(title, 0)
+
+        for line in lines:
+            document.add_paragraph(line)
+
+        document.save(path)
+
+    elif file_type == "xlsx":
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Geniosa"
+
+        sheet.append([title])
+        sheet.append(["Content"])
+
+        for line in lines:
+            sheet.append([line])
+
+        sheet.column_dimensions["A"].width = 100
+        workbook.save(path)
+
+    elif file_type == "pdf":
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer
+        )
+        from reportlab.lib.units import cm
+        from xml.sax.saxutils import escape
+
+        pdf = SimpleDocTemplate(
+            path,
+            pagesize=A4,
+            rightMargin=2 * cm,
+            leftMargin=2 * cm
+        )
+
+        styles = getSampleStyleSheet()
+        story = [
+            Paragraph(escape(title), styles["Title"]),
+            Spacer(1, 12)
+        ]
+
+        for line in lines:
+            story.append(
+                Paragraph(escape(line) or " ", styles["BodyText"])
+            )
+            story.append(Spacer(1, 6))
+
+        pdf.build(story)
+
+    elif file_type == "pptx":
+        from pptx import Presentation
+        from pptx.util import Pt
+
+        presentation = Presentation()
+
+        first = presentation.slides.add_slide(
+            presentation.slide_layouts[0]
+        )
+        first.shapes.title.text = title
+        first.placeholders[1].text = "Prepared by GENIOSA 6.0"
+
+        chunks = [
+            lines[i:i + 8]
+            for i in range(0, len(lines), 8)
+        ] or [[""]]
+
+        for index, chunk in enumerate(chunks, start=1):
+            slide = presentation.slides.add_slide(
+                presentation.slide_layouts[1]
+            )
+            slide.shapes.title.text = f"{title} — {index}"
+
+            frame = slide.placeholders[1].text_frame
+            frame.clear()
+
+            for j, line in enumerate(chunk):
+                paragraph = (
+                    frame.paragraphs[0]
+                    if j == 0 else frame.add_paragraph()
+                )
+                paragraph.text = line[:500]
+                paragraph.font.size = Pt(18)
+
+        presentation.save(path)
+
+    else:
+        raise ValueError(
+            "ფორმატი უნდა იყოს docx, xlsx, pdf ან pptx"
+        )
+
+    return path
+
+
+# ============================================================
+# COMMANDS
 # ============================================================
 
 def handle_command(chat_id, text):
@@ -1172,17 +1248,15 @@ def handle_command(chat_id, text):
     if command == "/start":
         send_message(
             chat_id,
-            "გამარჯობა! მე ვარ GENIOSA 6.0 — შენი პირადი "
-            "ბიზნეს-მრჩეველი.\n\n"
-            "შემიძლია დაგეხმარო ფინანსურ ანალიზში, პროექტების "
-            "დაგეგმვაში, ინვესტორებთან მუშაობასა და გადაწყვეტილებების "
-            "შეფასებაში.\n\n"
-            "კომანდები:\n"
+            "გამარჯობა! მე ვარ GENIOSA 6.0.\n\n"
+            "ბიზნესის, ფინანსების, პროექტებისა და ინვესტორების "
+            "შესახებ კითხვებზე შემიძლია დაგეხმარო.\n\n"
             "/health — სისტემის სტატუსი\n"
-            "/remember ტექსტი — მეხსიერებაში შენახვა\n"
-            "/memories — შენახული მეხსიერებების ნახვა\n"
-            "/memory_test — მონაცემთა ბაზის მეხსიერების ტესტი\n"
-            "/conflicts_test — ფინანსური კონფლიქტის ტესტი\n"
+            "/remember ტექსტი — ინფორმაციის შენახვა\n"
+            "/memories — მეხსიერებების ნახვა\n"
+            "/memory_test — მონაცემთა ბაზის ტესტი\n"
+            "/conflicts_test — სატესტო ჩანაწერი\n"
+            "/make_doc ფორმატი | სათაური | ტექსტი\n"
             "/help — დახმარება"
         )
         return True
@@ -1190,58 +1264,54 @@ def handle_command(chat_id, text):
     if command == "/help":
         send_message(
             chat_id,
-            "GENIOSA 6.0 კომანდები:\n"
-            "/start\n"
-            "/health\n"
-            "/remember ტექსტი\n"
-            "/memories\n"
-            "/memory_test\n"
-            "/conflicts_test\n\n"
-            "ჩვეულებრივად მომწერე კითხვა ან დავალება."
+            "კომანდები:\n"
+            "/start\n/health\n/remember ტექსტი\n/memories\n"
+            "/memory_test\n/conflicts_test\n"
+            "/make_doc docx | სათაური | ტექსტი\n\n"
+            "ფორმატები: docx, xlsx, pdf, pptx"
         )
         return True
 
     if command == "/health":
-        health = {
+        data = {
             "version": APP_VERSION,
             "database": False,
-            "telegram_polling": polling_thread is not None
-                and polling_thread.is_alive(),
+            "telegram_polling": bool(
+                polling_thread and polling_thread.is_alive()
+            ),
             "gemini_last_request_ok": LAST_GEMINI_OK,
             "web_search_grounding_last_request": LAST_WEB_SEARCH_USED,
             "last_gemini_check": LAST_GEMINI_CHECK,
-            "last_error": LAST_ERROR or "არ არის",
+            "last_telegram_update": LAST_TELEGRAM_UPDATE,
+            "last_error": LAST_ERROR or None
         }
 
         try:
             db_execute("SELECT 1")
-            health["database"] = True
+            data["database"] = True
         except Exception as exc:
-            health["database_error"] = str(exc)[:300]
+            data["database_error"] = str(exc)[:300]
 
-        send_message(chat_id, safe_json(health))
+        send_message(chat_id, safe_json(data))
         return True
 
     if command == "/remember":
         if not argument:
             send_message(
                 chat_id,
-                "გამოყენება: /remember ტექსტი\n"
-                "მაგალითი: /remember SAMTISI-ს პროექტის "
-                "მიმდინარე ვადაა 30 თვე."
+                "გამოყენება: /remember ტექსტი"
             )
-            return True
-
-        if save_memory(chat_id, argument, "user_saved", 8):
+        elif save_memory(
+            chat_id, argument, "user_saved", 8
+        ):
             send_message(
                 chat_id,
-                "✅ ინფორმაცია წარმატებით შეინახა PostgreSQL-ში."
+                "ინფორმაცია წარმატებით შეინახა PostgreSQL-ში."
             )
         else:
             send_message(
                 chat_id,
-                "❌ ინფორმაციის შენახვა ვერ დადასტურდა. "
-                "შეამოწმე Render Logs."
+                "შენახვა ვერ დადასტურდა. შეამოწმე Render Logs."
             )
 
         return True
@@ -1250,20 +1320,22 @@ def handle_command(chat_id, text):
         try:
             memories = get_memories(chat_id)
 
-            if not memories:
-                send_message(chat_id, "შენახული მეხსიერებები ვერ მოიძებნა.")
-            else:
-                send_message(
-                    chat_id,
-                    "შენახული მეხსიერებები:\n\n"
-                    + "\n\n".join(
-                        f"{i + 1}. {item}"
-                        for i, item in enumerate(memories[-15:])
-                    )
+            if memories:
+                answer = "შენახული მეხსიერებები:\n\n" + "\n\n".join(
+                    f"{i + 1}. {value}"
+                    for i, value in enumerate(memories[-15:])
                 )
+            else:
+                answer = "შენახული მეხსიერებები ვერ მოიძებნა."
+
+            send_message(chat_id, answer)
+
         except Exception as exc:
             record_error(f"/memories: {exc}")
-            send_message(chat_id, "მეხსიერებების წაკითხვა ვერ მოხერხდა.")
+            send_message(
+                chat_id,
+                "მეხსიერებების წაკითხვა ვერ მოხერხდა."
+            )
 
         return True
 
@@ -1272,57 +1344,90 @@ def handle_command(chat_id, text):
         value = "BLUE_ORCHID_2026"
 
         try:
-            # Use a unique key per chat, without overwriting another
-            # chat's test record.
             save_fact(chat_id, key, value)
-
-            rows = get_facts(chat_id)
             success = any(
                 row == f"{key}: {value}"
-                for row in rows
+                for row in get_facts(chat_id)
             )
 
-            if success:
-                send_message(
-                    chat_id,
-                    "✅ PostgreSQL memory test successful: "
-                    "ჩაწერა და ხელახლა წაკითხვა დადასტურდა."
-                )
-            else:
-                send_message(
-                    chat_id,
-                    "❌ ფაქტის ჩაწერა ან ხელახლა წაკითხვა ვერ "
-                    "დადასტურდა. შეამოწმე Logs."
-                )
+            send_message(
+                chat_id,
+                "PostgreSQL ჩაწერა/წაკითხვა დადასტურდა."
+                if success
+                else "ტესტი ვერ დადასტურდა. შეამოწმე Logs."
+            )
 
         except Exception as exc:
             record_error(f"/memory_test: {exc}")
-            send_message(chat_id, f"❌ მეხსიერების ტესტი ჩავარდა: {exc}")
+            send_message(
+                chat_id,
+                f"ტესტი ჩავარდა: {str(exc)[:300]}"
+            )
 
         return True
 
     if command == "/conflicts_test":
         try:
             row = save_financial_conflict(
-                chat_id=chat_id,
-                subject="GENIOSA_TEST_CONFLICT",
-                old_value="100",
-                new_value="200",
-                details="Automated test record; not a real financial conflict."
+                chat_id,
+                "GENIOSA_TEST_CONFLICT",
+                "100",
+                "200",
+                "Automated test record; not a real financial conflict."
             )
 
             send_message(
                 chat_id,
-                "✅ Financial conflict test successful; "
-                f"record ID {row.get('id', 'saved')}. "
-                "ეს სატესტო ჩანაწერია."
+                f"სატესტო ჩანაწერი შეიქმნა. "
+                f"ID: {row.get('id', 'saved')}"
             )
 
         except Exception as exc:
             record_error(f"/conflicts_test: {exc}")
             send_message(
                 chat_id,
-                f"❌ ფინანსური კონფლიქტის ტესტი ჩავარდა: {exc}"
+                f"ტესტი ჩავარდა: {str(exc)[:300]}"
+            )
+
+        return True
+
+    if command == "/make_doc":
+        fields = [
+            item.strip()
+            for item in argument.split("|", 2)
+        ]
+
+        if len(fields) != 3:
+            send_message(
+                chat_id,
+                "გამოყენება:\n"
+                "/make_doc docx | სათაური | ტექსტი"
+            )
+            return True
+
+        file_type, title, body = fields
+
+        try:
+            path = create_document(file_type, title, body)
+
+            send_document(
+                chat_id,
+                path,
+                f"შექმნილია GENIOSA 6.0-ის მიერ: {title}"
+            )
+
+            save_message(
+                chat_id,
+                "assistant",
+                f"დოკუმენტი შეიქმნა და გაიგზავნა: {Path(path).name}"
+            )
+
+        except Exception as exc:
+            record_error(f"/make_doc: {type(exc).__name__}: {exc}")
+            send_message(
+                chat_id,
+                "დოკუმენტის შექმნა ვერ მოხერხდა. "
+                "შეამოწმე requirements.txt და Render Logs."
             )
 
         return True
@@ -1331,26 +1436,32 @@ def handle_command(chat_id, text):
 
 
 # ============================================================
-# MESSAGE PROCESSING
+# PROCESS USER MESSAGE
 # ============================================================
 
 def process_message(message):
-    chat = message.get("chat") or {}
-    chat_id = parse_chat_id(chat.get("id"))
+    chat_id = parse_chat_id(
+        (message.get("chat") or {}).get("id")
+    )
     text_value = (message.get("text") or "").strip()
 
     if chat_id is None or not text_value:
         return
 
-    user = message.get("from") or {}
+    if not is_owner(chat_id):
+        send_message(
+            chat_id,
+            "წვდომა შეზღუდულია. შეამოწმე GENIOSA_OWNER_ID."
+        )
+        return
 
-    # Commands that do not require AI are processed separately.
     if text_value.startswith("/"):
         try:
             if handle_command(chat_id, text_value):
                 return
         except Exception as exc:
             record_error(f"Command handler: {exc}")
+
             try:
                 send_message(
                     chat_id,
@@ -1359,28 +1470,29 @@ def process_message(message):
                 )
             except Exception:
                 pass
+
             return
 
-    # Save the user's message before generating an answer.
     save_message(chat_id, "user", text_value)
 
-    # Optional direct memory-saving phrasing.
-    memory_match = re.match(
-        r"^(დაიმახსოვრე|შეინახე მეხსიერებაში)\s*[:,-]?\s*(.+)$",
+    match = re.match(
+        r"^(დაიმახსოვრე|შეინახე მეხსიერებაში)"
+        r"\s*[:,-]?\s*(.+)$",
         text_value,
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    if memory_match:
-        memory_content = memory_match.group(2).strip()
+    if match:
+        content = match.group(2).strip()
+        success = save_memory(
+            chat_id, content, "user_saved", 8
+        )
 
-        if save_memory(chat_id, memory_content, "user_saved", 8):
-            answer = "✅ ინფორმაცია წარმატებით შევინახე მეხსიერებაში."
-        else:
-            answer = (
-                "❌ მეხსიერების შენახვა ვერ დადასტურდა. "
-                "შეამოწმე Render Logs."
-            )
+        answer = (
+            "ინფორმაცია წარმატებით შევინახე მეხსიერებაში."
+            if success
+            else "შენახვა ვერ დადასტურდა. შეამოწმე Render Logs."
+        )
 
         save_message(chat_id, "assistant", answer)
         send_message(chat_id, answer)
@@ -1398,70 +1510,125 @@ def process_message(message):
         )
 
         answer = (
-            "ბოდიში, პასუხის გენერირებისას ტექნიკური შეცდომა მოხდა. "
-            "შეამოწმე Render Logs და API-ის სტატუსი."
+            "პასუხის გენერირებისას ტექნიკური შეცდომა მოხდა. "
+            "შეამოწმე Render Logs და Gemini API-ის სტატუსი."
         )
 
         save_message(chat_id, "assistant", answer)
 
         try:
             send_message(chat_id, answer)
-        except Exception as telegram_exc:
-            record_error(f"Failed to send error reply: {telegram_exc}")
+        except Exception as send_exc:
+            record_error(f"Failed to send error reply: {send_exc}")
 
 
 # ============================================================
-# TELEGRAM LONG POLLING
+# TELEGRAM POLLING — POSTGRESQL ADVISORY LOCK
 # ============================================================
+
+def acquire_polling_lock():
+    conn = db_connect()
+    conn.autocommit = True
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(%s, %s) AS acquired",
+            (POLL_LOCK_KEY_1, POLL_LOCK_KEY_2)
+        )
+        result = cursor.fetchone()
+
+    if not result or not result["acquired"]:
+        conn.close()
+        log("Another instance owns the Telegram polling lock.")
+        return None
+
+    return conn
+
 
 def polling_loop():
     global LAST_TELEGRAM_UPDATE
 
-    offset = 0
+    lock_conn = None
 
-    # Continue after temporary errors; do not terminate the service.
-    while not stop_event.is_set():
+    try:
+        lock_conn = acquire_polling_lock()
+
+        if lock_conn is None:
+            return
+
         try:
-            updates = telegram_request(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": TELEGRAM_POLL_TIMEOUT,
-                    "allowed_updates": ["message"]
-                },
-                timeout=TELEGRAM_POLL_TIMEOUT + 10
+            telegram_request(
+                "deleteWebhook",
+                {"drop_pending_updates": False}
             )
-
-            for update in updates or []:
-                update_id = update.get("update_id")
-
-                if update_id is not None:
-                    offset = update_id + 1
-                    LAST_TELEGRAM_UPDATE = update_id
-
-                message = update.get("message")
-
-                if message:
-                    try:
-                        process_message(message)
-                    except Exception as exc:
-                        record_error(
-                            f"process_message: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-
         except Exception as exc:
-            record_error(
-                f"Telegram polling: {type(exc).__name__}: {exc}"
-            )
-            stop_event.wait(5)
+            log(f"deleteWebhook warning: {exc}")
+
+        offset = 0
+
+        while not stop_event.is_set():
+            try:
+                updates = telegram_request(
+                    "getUpdates",
+                    {
+                        "offset": offset,
+                        "timeout": POLL_TIMEOUT,
+                        "allowed_updates": ["message"]
+                    },
+                    timeout=POLL_TIMEOUT + 10
+                )
+
+                for update in updates or []:
+                    update_id = update.get("update_id")
+
+                    if update_id is not None:
+                        offset = update_id + 1
+                        LAST_TELEGRAM_UPDATE = update_id
+
+                    message = update.get("message")
+
+                    if message:
+                        try:
+                            process_message(message)
+                        except Exception as exc:
+                            record_error(
+                                f"process_message: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+
+            except Exception as exc:
+                record_error(
+                    f"Telegram polling: {type(exc).__name__}: {exc}"
+                )
+                stop_event.wait(5)
+
+    except Exception as exc:
+        record_error(
+            f"Polling lock/start failed: {type(exc).__name__}: {exc}"
+        )
+
+    finally:
+        if lock_conn is not None:
+            try:
+                with lock_conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(%s, %s)",
+                        (POLL_LOCK_KEY_1, POLL_LOCK_KEY_2)
+                    )
+            except Exception:
+                pass
+
+            try:
+                lock_conn.close()
+            except Exception:
+                pass
 
 
 def start_polling():
     global polling_thread
 
     with polling_lock:
-        if polling_thread is not None and polling_thread.is_alive():
+        if polling_thread and polling_thread.is_alive():
             return
 
         stop_event.clear()
@@ -1488,6 +1655,7 @@ def on_startup():
         migrate_database()
         db_execute("SELECT 1")
         log("PostgreSQL connection verified")
+
     except Exception as exc:
         record_error(
             f"Startup database check: {type(exc).__name__}: {exc}"
@@ -1497,12 +1665,19 @@ def on_startup():
         try:
             get_bot_info()
             start_polling()
+
         except Exception as exc:
             record_error(
                 f"Telegram startup: {type(exc).__name__}: {exc}"
             )
     else:
         record_error("TELEGRAM_BOT_TOKEN is missing")
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_event.set()
+    log("Shutdown requested")
 
 
 @app.get("/")
@@ -1519,32 +1694,30 @@ def home():
 
 @app.get("/health")
 def health():
-    db_ok = False
-    db_error = None
+    database_ok = False
+    database_error = None
 
     try:
         db_execute("SELECT 1")
-        db_ok = True
+        database_ok = True
     except Exception as exc:
-        db_error = str(exc)[:500]
+        database_error = str(exc)[:500]
 
-    polling_ok = (
-        polling_thread is not None
-        and polling_thread.is_alive()
+    polling_ok = bool(
+        polling_thread and polling_thread.is_alive()
     )
 
     return JSONResponse({
         "version": APP_VERSION,
         "status": (
-            "healthy"
-            if db_ok and polling_ok
+            "healthy" if database_ok and polling_ok
             else "degraded"
         ),
-        "database_ok": db_ok,
-        "database_error": db_error,
+        "database_ok": database_ok,
+        "database_error": database_error,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "telegram_bot": BOT_USERNAME or None,
-        "telegram_polling": polling_ok,
+        "telegram_polling_thread_alive": polling_ok,
         "gemini_configured": bool(GEMINI_API_KEY),
         "gemini_last_request_ok": LAST_GEMINI_OK,
         "gemini_last_check": LAST_GEMINI_CHECK,
@@ -1560,24 +1733,17 @@ def version():
     return {
         "version": APP_VERSION,
         "database_migration": "additive_only",
-        "legacy_memory_category_fix": True
+        "legacy_memory_category_fix": True,
+        "postgres_advisory_polling_lock": True,
+        "document_generation": ["docx", "xlsx", "pdf", "pptx"]
     }
 
-
-# ============================================================
-# LOCAL ENTRY POINT
-# Render may use its configured start command instead.
-# Example: uvicorn app:app --host 0.0.0.0 --port $PORT
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=int(os.getenv("PORT", "8000"))
     )
-
