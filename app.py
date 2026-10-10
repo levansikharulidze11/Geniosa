@@ -1,15 +1,22 @@
+
 # ============================================================
-# GENIOSA 6.0
+# GENIOSA 6.0 — PATCHED FULL VERSION
 # Personal Business Advisor
 # Telegram + Gemini + PostgreSQL + FastAPI
+#
+# Existing PostgreSQL data is preserved.
+# Migrations are additive only.
+# No DROP, TRUNCATE or mass DELETE.
 # ============================================================
 
 import os
 import re
 import json
 import time
+import uuid
 import threading
 import tempfile
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -83,8 +90,8 @@ RULES:
    sales, rental income, risks and investor returns when relevant.
 6. Never claim information was saved unless the database write succeeded.
 7. Never claim a web search occurred unless grounding metadata confirms it.
-8. For legal, tax and regulatory matters, recommend checking current
-   authoritative sources where appropriate.
+8. For legal, tax and regulatory matters, recommend current authoritative
+   sources where appropriate.
 9. Treat stored user information as context, not independently verified fact.
 10. Reply in the user's language. Georgian questions require Georgian answers.
 11. Keep facts, decisions, tasks and tentative proposals distinct.
@@ -134,7 +141,6 @@ def parse_chat_id(value):
 
 
 def is_owner(chat_id):
-    # Set GENIOSA_OWNER_ID in Render for private access.
     return (
         not GENIOSA_OWNER_ID
         or str(chat_id) == GENIOSA_OWNER_ID
@@ -195,7 +201,8 @@ def get_table_columns(table_name):
     rows = db_execute(
         """
         SELECT column_name, is_nullable, column_default,
-               data_type, udt_name, is_identity, is_generated
+               data_type, udt_name, is_identity, is_generated,
+               character_maximum_length
         FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND table_name = %s
@@ -212,7 +219,7 @@ def get_table_columns(table_name):
 
 
 def migrate_database():
-    # Additive-only migration. No DROP, TRUNCATE or DELETE.
+    # Additive-only migration. Never delete existing data.
 
     create_statements = [
         """
@@ -409,6 +416,7 @@ ALIASES = {
     "project_name": ("project_name", "name", "subject"),
     "subject": ("subject", "name"),
     "key": ("key",),
+    "memory_key": ("memory_key",),
     "value": ("value", "content", "text"),
     "old_value": ("old_value",),
     "new_value": ("new_value",),
@@ -418,12 +426,37 @@ ALIASES = {
 }
 
 
-def infer_required_value(column_name, values):
+def generate_memory_key(column_info=None):
+    """
+    Generate a value compatible with common legacy memory_key types.
+    UUID columns receive a UUID string; integer columns receive an
+    integer; text columns receive a compact unique key.
+    """
+    info = column_info or {}
+    udt = str(info.get("udt_name") or "").lower()
+    data_type = str(info.get("data_type") or "").lower()
+
+    if udt == "uuid":
+        return str(uuid.uuid4())
+
+    if data_type in (
+        "smallint", "integer", "bigint"
+    ) or udt in ("int2", "int4", "int8"):
+        return uuid.uuid4().int & 9223372036854775807
+
+    # 32 characters: compatible with common VARCHAR(32) columns.
+    return uuid.uuid4().hex
+
+
+def infer_required_value(column_name, values, column_info=None):
     name = column_name.lower()
 
     for candidate in ALIASES.get(name, ()):
         if candidate in values and values[candidate] is not None:
             return values[candidate]
+
+    if name == "memory_key":
+        return generate_memory_key(column_info)
 
     if name in (
         "created_at", "updated_at", "timestamp", "date"
@@ -449,7 +482,9 @@ def infer_required_value(column_name, values):
     if name in ("chat_id", "user_id", "telegram_id"):
         return values.get("chat_id") or values.get("user_id")
 
-    if name in ("content", "text", "memory", "message", "details"):
+    if name in (
+        "content", "text", "memory", "message", "details"
+    ):
         return (
             values.get("content")
             or values.get("text")
@@ -475,6 +510,19 @@ def dynamic_insert(table_name, values):
             f"Table '{table_name}' does not exist"
         )
 
+    # Work on a copy; do not mutate the caller's dictionary.
+    values = dict(values)
+
+    # FIX: old memories tables may require memory_key without a default.
+    if (
+        table_name == "memories"
+        and "memory_key" in metadata
+        and values.get("memory_key") is None
+    ):
+        values["memory_key"] = generate_memory_key(
+            metadata["memory_key"]
+        )
+
     payload = {
         key: value
         for key, value in values.items()
@@ -489,6 +537,7 @@ def dynamic_insert(table_name, values):
             or "general"
         )
 
+    # Supply compatible values for legacy NOT NULL columns.
     for column_name, info in metadata.items():
         if column_name in payload:
             continue
@@ -507,7 +556,8 @@ def dynamic_insert(table_name, values):
 
         value = infer_required_value(
             column_name,
-            {**values, **payload}
+            {**values, **payload},
+            info
         )
 
         if value is not None:
@@ -648,27 +698,53 @@ def save_memory(
     memory_type = str(memory_type or "general")[:100]
 
     try:
+        importance = max(1, min(10, int(importance)))
+    except (TypeError, ValueError):
+        importance = 5
+
+    try:
+        metadata = get_table_columns("memories")
+        memory_key = None
+
+        if "memory_key" in metadata:
+            memory_key = generate_memory_key(
+                metadata["memory_key"]
+            )
+
         row = dynamic_insert(
             "memories",
             {
                 "chat_id": chat_id,
                 "user_id": chat_id,
                 "telegram_id": chat_id,
+                "memory_key": memory_key,
                 "category": memory_type,
                 "memory_type": memory_type,
                 "type": memory_type,
                 "content": content,
                 "text": content,
                 "memory": content,
-                "importance": max(
-                    1, min(10, int(importance))
-                ),
+                "importance": importance,
                 "created_at": now_utc(),
             }
         )
 
         if not row:
-            raise RuntimeError("Memory insert returned no record")
+            raise RuntimeError(
+                "Memory insert returned no record"
+            )
+
+        # Verify that the inserted row is readable before claiming success.
+        if "id" in row and "id" in metadata:
+            verify = db_execute(
+                'SELECT id FROM memories WHERE id = %s LIMIT 1',
+                (row["id"],),
+                fetchone=True
+            )
+            if not verify:
+                raise RuntimeError(
+                    "Memory insert could not be verified"
+                )
 
         try:
             dynamic_insert(
@@ -684,11 +760,13 @@ def save_memory(
         except Exception as exc:
             log(f"memory_events warning: {exc}")
 
-        log(f"Memory saved for chat_id={chat_id}")
+        log(
+            f"Memory saved and verified for chat_id={chat_id}"
+        )
         return True
 
     except Exception as exc:
-        record_error(f"save_memory: {exc}")
+        record_error(f"save_memory: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -1311,7 +1389,8 @@ def handle_command(chat_id, text):
         else:
             send_message(
                 chat_id,
-                "შენახვა ვერ დადასტურდა. შეამოწმე Render Logs."
+                "მეხსიერების შენახვა ვერ დადასტურდა. "
+                "შეამოწმე Render Logs."
             )
 
         return True
@@ -1733,6 +1812,7 @@ def version():
     return {
         "version": APP_VERSION,
         "database_migration": "additive_only",
+        "legacy_memory_key_compatibility": True,
         "legacy_memory_category_fix": True,
         "postgres_advisory_polling_lock": True,
         "document_generation": ["docx", "xlsx", "pdf", "pptx"]
